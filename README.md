@@ -53,7 +53,7 @@ This starts both the check loop and the dashboard (single process, per the proje
 ## Testing
 
 ```bash
-pytest
+pytest -q
 ```
 
 `monitor/state.py` is a pure function and is unit tested independently of everything
