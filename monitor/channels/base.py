@@ -2,9 +2,9 @@
 (e.g. the SMS PR) code against — see CONTRIBUTING.md."""
 from abc import ABC, abstractmethod
 
-from monitor.state import DownEvent, RecoveryEvent
+from monitor.state import ConfigErrorEvent, DownEvent, RecoveryEvent
 
-AlertEvent = DownEvent | RecoveryEvent
+AlertEvent = DownEvent | RecoveryEvent | ConfigErrorEvent
 
 
 class AlertChannel(ABC):

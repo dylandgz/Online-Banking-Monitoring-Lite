@@ -1,21 +1,65 @@
-"""Pure state machine: (previous_state, check_result) -> (new_state, events). No I/O."""
-from dataclasses import dataclass
+"""Pure state machine: (previous_state, probe_result) -> (new_state, events). No I/O.
+
+Stage 5 rework: replaces the old "N consecutive fails" rule with a confirmation-burst /
+confidence-score model (CLAUDE.md Rule 2, Stage 5). Each failing probe is weighted by how
+strong its evidence is; DOWN fires once the accumulated score within a burst reaches
+DOWN_CONFIDENCE. A passing probe at any point clears the burst with no alert (a flap).
+Config-class reasons (auth_rejected, bot_challenge, mfa_failed, rate_limited) bypass
+scoring entirely and route straight to CONFIG_ERROR — see Rule 10.
+
+[v3.1] DOWN additionally requires at least MIN_FAILED_PROBES distinct failed probes in
+the burst, not just a high enough score — a burst of two hard failures (score 4) no
+longer pages on its own; it needs a third failed probe. This stops a single pair of
+severe-but-brief probes from paging as fast as a slower, better-corroborated outage.
+"""
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Optional
+
+# Rule: only bad_status/api_bad_status in the 5xx range count as Hard evidence; other
+# non-5xx status codes aren't explicitly classified in CLAUDE.md's table, so they're
+# treated as Soft (ambiguous evidence stays cautious) rather than assumed to be Hard.
+_HARD_REASONS = {"conn_refused", "dns", "auth_unavailable"}
+_SOFT_REASONS = {"timeout", "element_missing", "nav_error", "data_plane_missing", "api_shape_mismatch"}
+_CONFIG_REASONS = {"auth_rejected", "bot_challenge", "mfa_failed", "rate_limited"}
+
+HARD_WEIGHT = 2
+SOFT_WEIGHT = 1
+CONFIG_WEIGHT = 0
+
+
+def classify(fail_reason: str) -> tuple[str, int]:
+    """Returns (class_name, weight) for a fail_reason: 'hard' (2), 'soft' (1), or 'config' (0)."""
+    if fail_reason in _CONFIG_REASONS:
+        return "config", CONFIG_WEIGHT
+    if fail_reason.startswith("bad_status:") or fail_reason.startswith("api_bad_status:"):
+        code = fail_reason.rsplit(":", 1)[-1]
+        if code.isdigit() and 500 <= int(code) <= 599:
+            return "hard", HARD_WEIGHT
+        return "soft", SOFT_WEIGHT
+    if fail_reason in _HARD_REASONS:
+        return "hard", HARD_WEIGHT
+    if fail_reason in _SOFT_REASONS:
+        return "soft", SOFT_WEIGHT
+    # Unrecognized reason: fail safe as ambiguous evidence rather than paging on it.
+    return "soft", SOFT_WEIGHT
 
 
 @dataclass(frozen=True)
 class MonitorState:
-    status: str  # "UP" or "DOWN"
-    consecutive_fails: int
+    status: str  # "UP" | "DOWN" | "CONFIG_ERROR"
     since_ts: Optional[str]  # UTC ISO-8601; when the current status began
+    burst_started_ts: Optional[str] = None  # None when no burst is in progress
+    confidence: int = 0  # accumulated score of the in-progress (or most recently resolved) burst
+    fail_reasons: tuple[str, ...] = ()  # fail reasons seen so far in the current burst/incident
 
 
 @dataclass(frozen=True)
 class DownEvent:
     since_ts: str
-    consecutive_fails: int
-    fail_reason: Optional[str]
+    confidence: int
+    fail_reasons: tuple[str, ...]
+    trigger_layer: str  # layer of the probe that pushed confidence over the threshold
 
 
 @dataclass(frozen=True)
@@ -23,7 +67,17 @@ class RecoveryEvent:
     since_ts: str
     ended_at: str
     duration_s: int
-    checks_failed: int
+    confidence: int
+    fail_reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ConfigErrorEvent:
+    ts: str
+    fail_reason: str
+
+
+Event = DownEvent | RecoveryEvent | ConfigErrorEvent
 
 
 def apply_check(
@@ -31,25 +85,63 @@ def apply_check(
     ok: bool,
     fail_reason: Optional[str],
     ts: str,
-    fails_to_down: int,
-) -> tuple[MonitorState, list]:
-    """Advances the state machine by one check result. Emits an event only on a
-    status transition (UP->DOWN or DOWN->UP) — never re-emits during an ongoing incident.
-    """
+    layer: str,
+    down_confidence: int,
+    burst_window_s: int,
+    min_failed_probes: int,
+) -> tuple[MonitorState, list[Event]]:
+    """Advances the state machine by one probe result. Emits an event only on a status
+    transition — never re-emits while an incident (DOWN or CONFIG_ERROR) is ongoing, and
+    never mid-burst before the confidence threshold is crossed."""
     if ok:
-        if state.status == "DOWN":
+        if state.status in ("DOWN", "CONFIG_ERROR"):
             duration_s = round((datetime.fromisoformat(ts) - datetime.fromisoformat(state.since_ts)).total_seconds())
             event = RecoveryEvent(
                 since_ts=state.since_ts,
                 ended_at=ts,
                 duration_s=duration_s,
-                checks_failed=state.consecutive_fails,
+                confidence=state.confidence,
+                fail_reasons=state.fail_reasons,
             )
-            return MonitorState(status="UP", consecutive_fails=0, since_ts=ts), [event]
-        return MonitorState(status="UP", consecutive_fails=0, since_ts=state.since_ts), []
+            return MonitorState(status="UP", since_ts=ts), [event]
+        # UP and passing: clears any in-progress burst (a flap) -- logged via the check
+        # row itself, no event/alert.
+        return MonitorState(status="UP", since_ts=state.since_ts), []
 
-    new_fails = state.consecutive_fails + 1
-    if state.status == "UP" and new_fails >= fails_to_down:
-        event = DownEvent(since_ts=ts, consecutive_fails=new_fails, fail_reason=fail_reason)
-        return MonitorState(status="DOWN", consecutive_fails=new_fails, since_ts=ts), [event]
-    return MonitorState(status=state.status, consecutive_fails=new_fails, since_ts=state.since_ts), []
+    # Failure path.
+    cls, weight = classify(fail_reason)
+
+    if cls == "config":
+        if state.status == "CONFIG_ERROR":
+            return state, []  # already alerted; needs a human, never re-alerts
+        event = ConfigErrorEvent(ts=ts, fail_reason=fail_reason)
+        return MonitorState(status="CONFIG_ERROR", since_ts=ts, confidence=0, fail_reasons=(fail_reason,)), [event]
+
+    if state.status == "CONFIG_ERROR":
+        return state, []  # a human must clear this; ordinary failures don't override it
+
+    if state.status == "DOWN":
+        # Keep tallying total evidence for the incident record; never re-alert mid-incident.
+        return replace(state, confidence=state.confidence + weight, fail_reasons=state.fail_reasons + (fail_reason,)), []
+
+    # status == UP, failing: burst scoring.
+    burst_active = state.burst_started_ts is not None and (
+        (datetime.fromisoformat(ts) - datetime.fromisoformat(state.burst_started_ts)).total_seconds() <= burst_window_s
+    )
+    if burst_active:
+        new_confidence = state.confidence + weight
+        new_reasons = state.fail_reasons + (fail_reason,)
+        burst_started_ts = state.burst_started_ts
+    else:
+        new_confidence = weight
+        new_reasons = (fail_reason,)
+        burst_started_ts = ts
+
+    if new_confidence >= down_confidence and len(new_reasons) >= min_failed_probes:
+        event = DownEvent(since_ts=ts, confidence=new_confidence, fail_reasons=new_reasons, trigger_layer=layer)
+        return MonitorState(status="DOWN", since_ts=ts, confidence=new_confidence, fail_reasons=new_reasons), [event]
+
+    return MonitorState(
+        status="UP", since_ts=state.since_ts,
+        burst_started_ts=burst_started_ts, confidence=new_confidence, fail_reasons=new_reasons,
+    ), []

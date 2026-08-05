@@ -17,6 +17,7 @@ class CheckResult:
     latency_ms: float
     fail_reason: Optional[str]
     screenshot_path: Optional[str] = None
+    layer: str = "render"  # "pulse" | "render" -- the strongest layer this probe actually evaluated
 
 
 async def pulse_check(url: str, timeout_s: float = 10.0) -> tuple[bool, Optional[int], float, Optional[str]]:
@@ -99,10 +100,12 @@ async def perform_check(
     pulse_timeout_s: float = 10.0,
     headless: bool = True,
 ) -> CheckResult:
-    """Runs the pulse check first; skips the browser check if the pulse already failed."""
+    """Full check: pulse first, then browser render -- skips the browser check if the pulse
+    already failed. This is the normal 60s-cadence probe and also burst probe index 0 (the
+    failure that starts a burst is always this combined check)."""
     pulse_ok, http_status, latency_ms, fail_reason = await pulse_check(url, pulse_timeout_s)
     if not pulse_ok:
-        return CheckResult(ok=False, http_status=http_status, latency_ms=latency_ms, fail_reason=fail_reason)
+        return CheckResult(ok=False, http_status=http_status, latency_ms=latency_ms, fail_reason=fail_reason, layer="pulse")
 
     browser_ok, browser_fail_reason, screenshot_path = await browser_check(
         url, required_text, required_role, required_name, browser_timeout_ms, artifacts_dir, headless=headless
@@ -114,6 +117,31 @@ async def perform_check(
             latency_ms=latency_ms,
             fail_reason=browser_fail_reason,
             screenshot_path=screenshot_path,
+            layer="render",
         )
 
-    return CheckResult(ok=True, http_status=http_status, latency_ms=latency_ms, fail_reason=None)
+    return CheckResult(ok=True, http_status=http_status, latency_ms=latency_ms, fail_reason=None, layer="render")
+
+
+async def pulse_only_probe(url: str, pulse_timeout_s: float = 10.0) -> CheckResult:
+    """A burst re-probe that only re-checks network reachability -- independent evidence
+    from a render probe, per Stage 5's 'vary the probe' rule."""
+    ok, http_status, latency_ms, fail_reason = await pulse_check(url, pulse_timeout_s)
+    return CheckResult(ok=ok, http_status=http_status, latency_ms=latency_ms, fail_reason=fail_reason, layer="pulse")
+
+
+async def render_only_probe(
+    url: str,
+    required_text: Optional[str],
+    required_role: Optional[str],
+    required_name: Optional[str],
+    browser_timeout_ms: int,
+    artifacts_dir: str,
+    headless: bool = True,
+) -> CheckResult:
+    """A burst re-probe that only re-checks the page render, in a fresh browser context --
+    independent evidence from a pulse probe, per Stage 5's 'vary the probe' rule."""
+    ok, fail_reason, screenshot_path = await browser_check(
+        url, required_text, required_role, required_name, browser_timeout_ms, artifacts_dir, headless=headless
+    )
+    return CheckResult(ok=ok, http_status=None, latency_ms=0.0, fail_reason=fail_reason, screenshot_path=screenshot_path, layer="render")

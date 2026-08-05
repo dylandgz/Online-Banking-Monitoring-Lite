@@ -1,6 +1,8 @@
 # CLAUDE.md — Monitor Lite
 
 > **Amendment v3 — 2026-08-03.** Supersedes the v2 amendment. Sessions 1–3 remain **complete and signed off — do not rebuild.** v3 re-sequences everything after them, adds a contribution seam for an external SMS PR, codifies the browser-mode decision, confirms TOTP as the MFA factor, and introduces a **sanctioned login-stress experiment** during the cloud soak (test account + test site provided by the security team — approved usage). Changes vs v2 are marked **[v3]**. Read "What changed in v3" before touching anything.
+>
+> **Amendment v3.1 — 2026-08-04.** Supersedes nothing built so far — Stage 5 already shipped and is **not** being reopened by this amendment; it updates the *spec* for confirmation-burst confidence scoring (a floor on distinct failed probes, not just weighted score) for whenever that logic is next touched, adds a dashboard requirement that burst probes stay visible as first-class audit rows, and moves all *presentation* timestamps (dashboard, email, API responses that feed the UI, CSV) to `America/New_York` while storage stays UTC. Changes vs v3 are marked **[v3.1]**. This amendment also authorizes one immediate bugfix-scale retrofit: applying the Eastern-time presentation change to the already-built dashboard/email/CSV output (not a new stage).
 
 ## What this is
 A quick-and-dirty uptime monitor for a banking web platform. Plain Python process (no Docker — Docker is post-soak backlog). Every 60s: httpx pulse + Playwright page check, extended to a full **authenticated sign-in journey** (Stage 6) proving the platform is up *past the login wall*. Results in SQLite. Email alert on state transitions only (SMS arrives later via a colleague's PR against the channels seam). FastAPI dashboard with uptime %, incidents, an audit-grade check log, and CSV export. Screenshot on failure only. It replaces a Selenium tool that false-positived on minor DOM changes — **low false positives outrank every other concern, including speed.**
@@ -16,6 +18,13 @@ A quick-and-dirty uptime monitor for a banking web platform. Plain Python proces
 8. Self-health/BLIND, maintenance windows, Docker, cross-browser, and the diagnostic runner move to an **ad hoc post-soak backlog** with explicit return conditions.
 9. **Deferred on purpose:** a supportability/code-optimization session (structure, logging, second-maintainer onboarding) happens **after the soak**. Claude Code must not proactively refactor for it. (Standing reminder — see end of file.)
 
+## What changed in v3.1 (orientation for Claude Code)
+1. **[v3.1] Confirmation-burst decision rule tightened:** DOWN now requires BOTH the weighted score reaching `DOWN_CONFIDENCE` **and** at least `MIN_FAILED_PROBES` distinct failed probes within the burst window, with no intervening pass. This is a spec update for the next time `state.py`'s burst logic is touched — it does **not** retroactively reopen Stage 5, which is already built and signed off against the old (score-only) rule.
+2. **[v3.1] New burst defaults:** `DOWN_CONFIDENCE=4`, `MIN_FAILED_PROBES=3`, `BURST_DELAYS_S=0,15,35,55` (four probes), `BURST_WINDOW_S=90`. Weights unchanged (Hard=2, Soft=1, Config=0; config-class still never contributes to score or the probe floor).
+3. **[v3.1] Dashboard must surface bursts as audit evidence:** burst probes are first-class rows in the check log, visually grouped/badged by `burst_id`, filterable, newest first — they can never be hidden from the UI.
+4. **[v3.1] Presentation timestamps move to Eastern:** storage stays UTC ISO-8601 (Rule 6 unchanged) everywhere in SQLite. Everything a human reads — dashboard, email alert bodies, `/api` responses that feed the UI, CSV exports — renders in `America/New_York` (not fixed EST/EDT, so DST is handled automatically) via Python's `zoneinfo`, no new dependency. CSV's timestamp column is renamed `ts_eastern` and every value embeds its UTC offset so an auditor is never ambiguous about which wall-clock moment a row means. **Flag to the human:** if they actually want a fixed offset (e.g. always EST, never adjusting for DST) rather than the real Eastern civil time, that's a different, smaller change — confirm before assuming `America/New_York` is wrong.
+5. **This session's retrofit is a bugfix, not a stage.** The Eastern-time presentation change was applied immediately to Sessions 1–3's existing dashboard/email/CSV output — it did not wait for a future stage, since it touches already-shipped display code, not new monitoring capability.
+
 ## How we work
 - Build in the stages below, **in order, one feature per stage**. Each has an acceptance test; it passes and the human signs off before the next stage starts. Do not build ahead, do not bundle stages.
 - The human is learning: explain what you're building and why *before* writing it; after each stage, append to `PROGRESS.md` (date, what was built, decisions, open issues).
@@ -23,7 +32,7 @@ A quick-and-dirty uptime monitor for a banking web platform. Plain Python proces
 
 ## Rules (non-negotiable)
 1. `state.py` is a pure function of (previous_state, check_result) → (new_state, events). No I/O. Real unit tests before wiring. Includes burst evaluation, confidence scoring, and suppression — all pure.
-2. Alert ONLY on transitions. DOWN is declared when a confirmation burst's confidence reaches `DOWN_CONFIDENCE` within `BURST_WINDOW_S` (Stage 5). First success after an incident → one RECOVERY email. Never re-email during an incident.
+2. Alert ONLY on transitions. DOWN is declared when a confirmation burst's confidence reaches `DOWN_CONFIDENCE` within `BURST_WINDOW_S` (Stage 5). **[v3.1]** AND at least `MIN_FAILED_PROBES` distinct failed probes have occurred in that burst, no intervening pass — see "Confidence scoring" below for the updated defaults and outcome table. First success after an incident → one RECOVERY email. Never re-email during an incident.
 3. Playwright locators: `get_by_role` / `get_by_text` / `get_by_label` ONLY. No structural CSS/XPath — that brittleness is the disease this project cures. Applies to authenticated pages and screenshot-mask targets.
 4. The alert body names the failed layer: unreachable · loads-but-content-missing · login rejected · logged-in-but-data-plane-dead. The operator must distinguish "bank down" from "page changed" without opening a browser.
 5. Screenshots on failure only → `./data/artifacts/`. Post-login screenshots **must** use Playwright `mask=[...]` over balance/account/PII locators. An unmasked authenticated screenshot is a data-leak bug.
@@ -74,18 +83,30 @@ Governing rule (Stage 9): DOM fails AND API fails → DOWN. DOM fails but API pa
 ### fail_reason
 `timeout | dns | conn_refused | bad_status:<code> | element_missing | nav_error | auth_rejected | auth_unavailable | mfa_failed | bot_challenge | rate_limited | session_expired | data_plane_missing | api_bad_status:<code> | api_shape_mismatch | logout_failed` **[v3: adds `rate_limited` (429/throttle signatures) — first-class for the stress experiment]**
 
-### Confidence scoring (Stage 5)
+### Confidence scoring (Stage 5) **[v3.1: updated decision rule and defaults]**
 | Class | Reasons | Weight |
 |---|---|---|
 | Hard | `conn_refused`, `dns`, `bad_status:5xx`, `api_bad_status:5xx`, `auth_unavailable` | 2 |
 | Soft | `timeout`, `element_missing`, `nav_error`, `data_plane_missing`, `api_shape_mismatch` | 1 |
-| Config | `auth_rejected`, `bot_challenge`, `mfa_failed`, `rate_limited` | 0 → CONFIG_ERROR routing |
+| Config | `auth_rejected`, `bot_challenge`, `mfa_failed`, `rate_limited` | 0 → CONFIG_ERROR routing; never contributes to score or the probe floor |
 
-DOWN at score ≥ `DOWN_CONFIDENCE` (default 3) inside `BURST_WINDOW_S`. Two hard failures ⇒ ~15s. Three soft ⇒ ~40s. Any passing probe clears the burst, logs a flap, no alert.
+**[v3.1]** DOWN requires BOTH: weighted score ≥ `DOWN_CONFIDENCE` (default **4**) AND at least `MIN_FAILED_PROBES` (default **3**) distinct failed probes within `BURST_WINDOW_S` (default **90**), with no intervening passing probe. A passing probe still clears the burst at any point (flap logged, no alert).
 
-### Confirmation burst (Stage 5)
-On first failure, re-probe at `BURST_DELAYS_S` (default `0,15,35`) ± jitter, **varying the probe** (pulse → fresh browser context render → [post-Stage 6] journey). Diverse probes are independent evidence; identical retries can share one glitch. Pre-auth (Stages 5–7) bursts use pulse+render only. Post-Stage 8, bursts run on the cached session — zero logins.
-Timing budget: first failure t=0 → resolution ≈t=40s → email dispatched ≤t=50s → delivered ≤60s; delivery latency measured, not assumed.
+Outcome table (defaults: `DOWN_CONFIDENCE=4`, `MIN_FAILED_PROBES=3`, `BURST_DELAYS_S=0,15,35,55`):
+| Sequence | Score | Probes failed | Pages? | Decision time | Email by |
+|---|---|---|---|---|---|
+| hard+hard+hard | 6 | 3 | yes | ~40s | <60s |
+| hard+hard+soft | 5 | 3 | yes | ~40s | <60s |
+| hard+soft+soft | 4 | 3 | yes | ~40s | <60s |
+| soft+soft+soft | 3 | 3 | **no** — score short of 4, needs a 4th soft failure (score 4, 4 probes) | ~55–60s | ~70–75s |
+| hard+hard (2 probes only) | 4 | 2 | **no** — probe floor not met even though score already hit 4 | — | — |
+| any sequence with a passing probe | — | — | no — flap logged | — | — |
+
+Nothing ever pages on fewer than 3 failed probes, regardless of score.
+
+### Confirmation burst (Stage 5) **[v3.1: updated defaults and timing budget]**
+On first failure, re-probe at `BURST_DELAYS_S` (default `0,15,35,55`) ± jitter, **varying the probe** (pulse → fresh browser context render → [post-Stage 6] journey). Diverse probes are independent evidence; identical retries can share one glitch. Pre-auth (Stages 5–7) bursts use pulse+render only. Post-Stage 8, bursts run on the cached session — zero logins.
+Timing budget: **typical alert <60s** (hard-weighted evidence resolves on the 3rd failed probe, ~40s); **worst case ≤90s** (all-soft evidence needs a 4th failed probe, ~55–60s decision, email by ~70–75s). Delivery latency is measured, not assumed.
 
 ### The login-stress experiment [v3] (Stages 6–7 only)
 Purpose: measure the platform's true tolerance before engineering around it. With `LOGIN_STRESS_MODE=true`: full sign-in every `CHECK_INTERVAL_S` (~1,440/day), each attempt logged to `login_events` (ts, ok, latency_ms, fail_reason, http_status). The monitor watches for limit signatures: `auth_rejected` after previously-good creds (lockout), `rate_limited`, `bot_challenge`, CAPTCHA appearance, or sustained login-latency degradation. First signature ⇒ experiment result: record exact time-to-limit and attempt count, send one `[MONITOR-CONFIG]` notice (never an outage page), halt logins cleanly per Rule 10. Dashboard gets a stress-report panel (attempts/hour, failure onset, latency trend) — exportable for the security-team soak report. Stress mode and its flag are **deleted at Stage 8**.
@@ -101,10 +122,13 @@ Purpose: measure the platform's true tolerance before engineering around it. Wit
 `GET /` dashboard · `GET /api/status` · `GET /api/history?from&to&page` · `GET /api/export?from&to` (streamed CSV) · `GET /api/artifact/{incident_id}` · `GET /healthz` (no auth) · `GET /api/logins` (Stage 6: budget/stress status).
 
 ### Dashboard
-UP/DEGRADED/DOWN banner (+ masked screenshot link), uptime % 24h/7d/30d, incidents table, paged+filterable check log, Download CSV, 30s auto-refresh, layer badges per check. **[v3]** Stress-report panel (Stage 6, removed with stress mode) → replaced by login-budget gauge (Stage 8). Plain HTML/JS.
+UP/DEGRADED/DOWN banner (+ masked screenshot link), uptime % 24h/7d/30d, incidents table, paged+filterable check log, Download CSV, 30s auto-refresh, layer badges per check. **[v3]** Stress-report panel (Stage 6, removed with stress mode) → replaced by login-budget gauge (Stage 8). **[v3.1]** Burst probes are first-class rows in the check log — visually grouped/badged by `burst_id`, filterable, newest first; bursts are audit evidence and cannot be hidden from the UI. Plain HTML/JS.
+
+### Timestamps **[v3.1]**
+Storage stays UTC ISO-8601 in SQLite (Rule 6 unchanged) — this is the audit source of truth. All *presentation* — dashboard, email alert bodies, `/api` responses that feed the UI, CSV exports — renders in `America/New_York` via Python's `zoneinfo` (no new dependency), not a fixed UTC offset, so DST transitions (EST/EDT) are handled automatically. The CSV timestamp column is labeled `ts_eastern` and every value includes its UTC offset so auditors are never ambiguous about which instant a row records. If the human actually wants a fixed EST-year-round display instead of true Eastern civil time, that's a different, smaller change — confirm before assuming otherwise.
 
 ### Email copy
-- `[MONITOR] {name} DOWN since {utc} — {trigger_layer} failed (confidence {n}: {reasons}). {layer_hint} Dashboard: {url}`
+- `[MONITOR] {name} DOWN since {eastern_ts_with_offset} — {trigger_layer} failed (confidence {n}: {reasons}). {layer_hint} Dashboard: {url}` **[v3.1: since-time now Eastern with UTC offset, was UTC]**
 - `[MONITOR] {name} RECOVERED after {duration}.`
 - `[MONITOR-INFO] {name} DEGRADED — {reason}. Serving normally; verify before escalating.` (max once per 24h per distinct reason)
 - `[MONITOR-CONFIG] {name} needs attention — {reason}. Checks paused.` (includes stress-experiment limit findings)
@@ -122,9 +146,9 @@ BROWSER_CHANNEL=chrome HEADLESS=true               # [v3] Rule 14: headless only
 ALERT_CHANNELS=email                                # colleague PR adds: email,sms
 # SMS_* vars are defined by the SMS PR in .env.example; core never reads them directly
 
-# --- Stage 5: fast detection ---
-BURST_DELAYS_S=0,15,35 BURST_JITTER_S=5
-BURST_WINDOW_S=60 DOWN_CONFIDENCE=3
+# --- Stage 5: fast detection --- # [v3.1] defaults updated: was 0,15,35 / 60 / 3
+BURST_DELAYS_S=0,15,35,55 BURST_JITTER_S=5
+BURST_WINDOW_S=90 DOWN_CONFIDENCE=4 MIN_FAILED_PROBES=3
 
 # --- Stage 6: sign-in + MFA (TOTP confirmed) ---
 LOGIN_URL= LOGIN_USER= LOGIN_PASSWORD=
@@ -155,8 +179,8 @@ Validate at startup; fail fast listing what's missing (only for enabled stages).
 Refactor `alert.py` → `monitor/channels/` (base contract `send(event)`, `email_gmail.py` moved in unchanged, fan-out with per-channel try/except per Rule 15). Add `channels/sms_stub.py` demonstrating the contract + a mock-based test template. Write `CONTRIBUTING.md`: which files an SMS PR may touch (`channels/sms_*.py`, its tests, `.env.example` additions), test expectations, and the no-blocking rule. Hygiene gate before push: `.gitignore` covers `.env`/`data/`/session state; history scanned for secrets; no bank URLs or credentials in committed files or PROGRESS.md. DB migration: add `browser_mode` to `checks` (backfill `headless`).
 *Accept:* all existing tests pass post-refactor; a deliberately-crashing fake channel doesn't stop email or the loop; fresh clone + `.env.example` boots; repo pushed; colleague can explain their task from CONTRIBUTING.md alone.
 
-**5. It's fast.** Confirmation bursts + confidence scoring in `state.py` (pure, exhaustively tested), pre-auth probe set (pulse, fresh-context render).
-*Accept:* simulated outage → DOWN email dispatched within 60s of first failure; two hard failures page in ~15s; flap sequences (F,S,F,F,S) still never alert; every Session-2 state test still passes.
+**5. It's fast.** Confirmation bursts + confidence scoring in `state.py` (pure, exhaustively tested), pre-auth probe set (pulse, fresh-context render). **[v3.1: acceptance criteria updated for the score-AND-probe-floor rule — see CLAUDE.md's amendment note before re-touching this stage's already-shipped code.]**
+*Accept:* (a) a hard-mixed outage pages on exactly 3 failed probes within 60s; (b) an all-soft outage pages only after a 4th failed probe, email within 90s; (c) two failures then a pass never alerts; (d) no code path can declare DOWN with fewer than 3 failed probes — explicit unit test for hard+hard (score 4, only 2 probes: must NOT page until a 3rd fails); (e) config-class failures never count toward score or the probe floor; every Session-2 state test still passes.
 
 **6. It signs in.** `journey.py`: login → TOTP via `pyotp` → authed-only element visible AND error banner absent → logout. New fail_reasons wired (`auth_rejected`, `auth_unavailable`, `mfa_failed`, `bot_challenge`, `rate_limited`, `logout_failed`). Screenshot masking live. `login_events` table + `/api/logins`. `LOGIN_STRESS_MODE` logic + dashboard stress panel built (off by default).
 *Accept:* real sign-in against the security-team test site succeeds and logs out cleanly; wrong-password drill → `auth_rejected`, CONFIG alert, zero retries, logins halt; masked failure screenshot contains no PII; TOTP codes verified against the phone app's output.

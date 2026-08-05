@@ -10,6 +10,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 import config
 from monitor import db
+from monitor.timeutil import to_eastern
 
 app = FastAPI()
 security = HTTPBasic()
@@ -51,6 +52,8 @@ def healthz():
 def api_status(conn=Depends(get_conn)):
     state = db.get_state(conn)
     last_check = db.get_last_check(conn)
+    if last_check is not None:
+        last_check["ts"] = to_eastern(last_check["ts"])
 
     screenshot_path = None
     if state.status == "DOWN":
@@ -64,14 +67,22 @@ def api_status(conn=Depends(get_conn)):
         "30d": db.uptime_pct(conn, (now - timedelta(days=30)).isoformat()),
     }
 
+    incidents = db.get_recent_incidents(conn, limit=20)
+    for inc in incidents:
+        if inc.get("started_at"):
+            inc["started_at"] = to_eastern(inc["started_at"])
+        if inc.get("ended_at"):
+            inc["ended_at"] = to_eastern(inc["ended_at"])
+
     return {
         "target_name": config.TARGET_NAME,
+        "target_url": config.TARGET_URL,
         "status": state.status,
-        "since_ts": state.since_ts,
+        "since_ts": to_eastern(state.since_ts) if state.since_ts else None,
         "last_check": last_check,
         "screenshot_path": screenshot_path,
         "uptime_pct": uptime,
-        "incidents": db.get_recent_incidents(conn, limit=20),
+        "incidents": incidents,
     }
 
 
@@ -84,6 +95,8 @@ def api_history(
     conn=Depends(get_conn),
 ):
     rows, total = db.query_checks(conn, from_, to, page, page_size)
+    for row in rows:
+        row["ts"] = to_eastern(row["ts"])
     return {"rows": rows, "total": total, "page": page, "page_size": page_size}
 
 
@@ -99,14 +112,14 @@ def api_export(
     def generate():
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(["id", "ts", "ok", "http_status", "latency_ms", "fail_reason", "browser_mode"])
+        writer.writerow(["id", "ts_eastern", "ok", "http_status", "latency_ms", "fail_reason", "browser_mode", "layer", "burst_id"])
         yield buf.getvalue()
         for row in rows:
             buf.seek(0)
             buf.truncate(0)
             writer.writerow([
-                row["id"], row["ts"], row["ok"], row["http_status"], row["latency_ms"],
-                row["fail_reason"], row["browser_mode"],
+                row["id"], to_eastern(row["ts"]), row["ok"], row["http_status"], row["latency_ms"],
+                row["fail_reason"], row["browser_mode"], row["layer"], row["burst_id"],
             ])
             yield buf.getvalue()
 
@@ -150,10 +163,14 @@ DASHBOARD_HTML = """
   .ok { color: #146c2e; }
   .controls { margin-bottom: 0.5rem; display: flex; gap: 0.5rem; align-items: center; }
   a.button, button { padding: 0.4rem 0.8rem; border-radius: 6px; border: 1px solid #ccc; background: #fff; cursor: pointer; text-decoration: none; color: #222; }
+  tr.burst-row { background: #fff7e0; }
+  .badge-burst { display: inline-block; background: #f5a623; color: #5b3b00; border-radius: 4px; padding: 0.05rem 0.4rem; font-size: 0.75rem; font-weight: 600; }
+  .burst-id { color: #888; font-size: 0.75rem; margin-left: 0.3rem; }
 </style>
 </head>
 <body>
   <h1 id="title">Monitor Lite</h1>
+  <p id="target-url" style="color:#666; font-size:0.9rem;"></p>
   <div id="banner" class="banner">Loading…</div>
 
   <h2>Uptime</h2>
@@ -173,7 +190,7 @@ DASHBOARD_HTML = """
     <a class="button" id="csv-link" href="/api/export">Download CSV</a>
   </div>
   <table id="history-table">
-    <thead><tr><th>Timestamp (UTC)</th><th>OK</th><th>HTTP</th><th>Latency (ms)</th><th>Fail Reason</th></tr></thead>
+    <thead><tr><th>Timestamp (Eastern)</th><th>OK</th><th>HTTP</th><th>Latency (ms)</th><th>Fail Reason</th><th>Layer</th><th>Burst</th></tr></thead>
     <tbody></tbody>
   </table>
   <div class="controls">
@@ -197,6 +214,7 @@ async function loadStatus() {
   const res = await fetch("/api/status");
   const data = await res.json();
   document.getElementById("title").textContent = "Monitor Lite — " + data.target_name;
+  document.getElementById("target-url").textContent = "Watching: " + data.target_url;
 
   const banner = document.getElementById("banner");
   if (data.status === "UP") {
@@ -204,8 +222,7 @@ async function loadStatus() {
     banner.textContent = "UP";
   } else {
     banner.className = "banner down";
-    let text = "DOWN since " + data.since_ts;
-    banner.innerHTML = text;
+    banner.textContent = data.status + " since " + data.since_ts;
   }
 
   const uptimeEl = document.getElementById("uptime");
@@ -239,12 +256,14 @@ async function loadHistory() {
 
   const tbody = document.querySelector("#history-table tbody");
   tbody.innerHTML = data.rows.map(r => `
-    <tr>
+    <tr class="${r.burst_id ? 'burst-row' : ''}">
       <td>${r.ts}</td>
       <td class="${r.ok ? 'ok' : 'fail'}">${r.ok ? "OK" : "FAIL"}</td>
       <td>${r.http_status ?? "-"}</td>
       <td>${r.latency_ms ? r.latency_ms.toFixed(0) : "-"}</td>
       <td>${r.fail_reason ?? "-"}</td>
+      <td>${r.layer ?? "-"}</td>
+      <td>${r.burst_id ? `<span class="badge-burst">burst</span><span class="burst-id">${r.burst_id.slice(0, 8)}</span>` : "-"}</td>
     </tr>
   `).join("");
 
