@@ -37,7 +37,8 @@ cp .env.example .env
 # fill in .env: TARGET_URL, REQUIRED_TEXT (or REQUIRED_ROLE+REQUIRED_NAME),
 # DASHBOARD_USER/PASSWORD are required at minimum. Email alerting needs
 # GMAIL_USER/GMAIL_APP_PASSWORD/RECIPIENTS_EMAIL — the loop runs fine without them,
-# it just logs and skips sending.
+# it just logs and skips sending. SMS (Twilio) needs TWILIO_ACCOUNT_SID/
+# TWILIO_AUTH_TOKEN/TWILIO_FROM_NUMBER/SMS_TO_NUMBER plus ALERT_CHANNELS=email,sms.
 ```
 
 ## Running
@@ -64,7 +65,7 @@ else — no network, no DB, no browser.
 ```
 monitor/check.py       # pulse + browser check -> CheckResult
 monitor/state.py       # pure state machine: (previous_state, check_result) -> (new_state, events)
-monitor/channels/      # alert channels (email live; sms is an open contribution seam — see CONTRIBUTING.md)
+monitor/channels/      # alert channels: email (Gmail), sms (Twilio) — see CONTRIBUTING.md to add another
 monitor/db.py          # SQLite schema, migrations, reads/writes
 monitor/web.py         # FastAPI routes + dashboard
 monitor/main.py        # composition root: check loop + uvicorn in one asyncio process
@@ -74,7 +75,8 @@ tests/                  # pytest suite
 
 ## Contributing
 
-The SMS alert channel is an open contribution seam — see [CONTRIBUTING.md](CONTRIBUTING.md)
-for the contract and what files a PR may touch. Everything else in this repo is being
-built stage-by-stage against CLAUDE.md's plan; please open an issue before sending an
-unsolicited PR against the core check/alert/state path.
+Alert channels are plug-ins (`email` and `sms` are both live) — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for the contract and what files a PR may touch to add
+another one. Everything else in this repo is being built stage-by-stage against CLAUDE.md's
+plan; please open an issue before sending an unsolicited PR against the core
+check/alert/state path.

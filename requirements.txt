@@ -3,5 +3,6 @@ uvicorn[standard]
 curl_cffi
 playwright
 python-dotenv
+twilio
 pytest
 pytest-asyncio
