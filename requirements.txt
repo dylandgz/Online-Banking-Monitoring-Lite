@@ -2,6 +2,8 @@ fastapi
 uvicorn[standard]
 curl_cffi
 playwright
+patchright
+pyotp
 python-dotenv
 twilio
 pytest

@@ -21,11 +21,14 @@ BTS = [
 UP_INITIAL = MonitorState(status="UP", since_ts=None)
 
 
-def run(state, results):
+def run(state, results, precursor_down=False):
     """results: list of (ok, fail_reason, ts, layer). Returns (final_state, all_events)."""
     all_events = []
     for ok, fail_reason, ts, layer in results:
-        state, events = apply_check(state, ok, fail_reason, ts, layer, DOWN_CONFIDENCE, BURST_WINDOW_S, MIN_FAILED_PROBES)
+        state, events = apply_check(
+            state, ok, fail_reason, ts, layer, DOWN_CONFIDENCE, BURST_WINDOW_S, MIN_FAILED_PROBES,
+            precursor_down=precursor_down,
+        )
         all_events.extend(events)
     return state, all_events
 
@@ -304,6 +307,97 @@ def test_config_error_recovers_on_first_pass_like_down_does():
     assert len(events) == 1
     assert isinstance(events[0], RecoveryEvent)
     assert state.status == "UP"
+
+
+# --- [v3.8 / Stage R] session_expired never scores (Rule 17) ---
+
+def test_classify_session_expired_is_its_own_zero_weight_class():
+    assert classify("session_expired") == ("session", 0)
+
+
+def test_session_expired_from_up_leaves_state_and_burst_untouched():
+    state, _ = run(UP_INITIAL, [(False, "timeout", BTS[0], "authed")])
+    assert state.confidence == 1
+    state2, events = run(state, [(False, "session_expired", BTS[1], "authed")])
+    assert events == []
+    assert state2 == state  # completely inert, not even burst_started_ts touched
+
+
+def test_session_expired_does_not_route_to_config_error():
+    state, events = run(UP_INITIAL, [(False, "session_expired", BTS[0], "authed")])
+    assert events == []
+    assert state.status == "UP"
+    assert state.confidence == 0
+    assert state.fail_reasons == ()
+
+
+def test_session_expired_never_contributes_even_at_floor():
+    # 3 real failures right at the DOWN threshold, then a session_expired probe must not
+    # push it over/hold it back -- it's simply not counted either way.
+    state, events = run(UP_INITIAL, [
+        (False, "conn_refused", BTS[0], "authed"),
+        (False, "conn_refused", BTS[1], "authed"),
+    ])
+    assert events == []
+    state, events = run(state, [(False, "session_expired", BTS[2], "authed")])
+    assert events == []
+    assert state.confidence == 4  # unchanged by the session_expired probe
+    assert len(state.fail_reasons) == 2
+
+
+def test_session_expired_inert_during_an_open_down_incident():
+    state, _ = run(UP_INITIAL, [
+        (False, "conn_refused", BTS[0], "authed"),
+        (False, "conn_refused", BTS[1], "authed"),
+        (False, "conn_refused", BTS[2], "authed"),
+    ])
+    assert state.status == "DOWN"
+    state2, events = run(state, [(False, "session_expired", BTS[3], "authed")])
+    assert events == []
+    assert state2 == state
+
+
+# --- [v3.8 / Stage R] Rule 16: precursor_down suppresses auth-track paging ---
+
+def test_precursor_down_suppresses_auth_down_event():
+    state, events = run(UP_INITIAL, [
+        (False, "conn_refused", BTS[0], "authed"),
+        (False, "conn_refused", BTS[1], "authed"),
+        (False, "conn_refused", BTS[2], "authed"),
+    ], precursor_down=True)
+    assert events == []
+    assert state.status == "UP"  # held -- Rule 16: auth-track DOWN can't open while precursor is down
+    assert state.confidence == 6
+    assert len(state.fail_reasons) == 3
+
+
+def test_precursor_down_suppressed_evidence_fires_once_precursor_recovers():
+    state, _ = run(UP_INITIAL, [
+        (False, "conn_refused", BTS[0], "authed"),
+        (False, "conn_refused", BTS[1], "authed"),
+        (False, "conn_refused", BTS[2], "authed"),
+    ], precursor_down=True)
+    assert state.status == "UP"
+
+    # Precursor has now recovered -- the next failing probe re-evaluates against the
+    # already-accumulated evidence and fires immediately (nothing was lost).
+    state, events = run(state, [(False, "conn_refused", BTS[3], "authed")], precursor_down=False)
+    assert len(events) == 1
+    assert isinstance(events[0], DownEvent)
+    assert state.status == "DOWN"
+
+
+def test_precursor_down_does_not_affect_main_track_default():
+    # Sanity check: default precursor_down=False (every existing main-track call site)
+    # behaves exactly as before -- covered implicitly by every other test in this file,
+    # asserted explicitly here too.
+    state, events = run(UP_INITIAL, [
+        (False, "conn_refused", BTS[0], "pulse"),
+        (False, "conn_refused", BTS[1], "pulse"),
+        (False, "conn_refused", BTS[2], "pulse"),
+    ])
+    assert len(events) == 1
+    assert state.status == "DOWN"
 
 
 def test_hard_mixed_pages_faster_than_all_soft():
