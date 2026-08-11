@@ -18,6 +18,12 @@ class CheckResult:
     fail_reason: Optional[str]
     screenshot_path: Optional[str] = None
     layer: str = "render"  # "pulse" | "render" -- the strongest layer this probe actually evaluated
+    # [v3.8 / Stage R] populated only by perform_check() (the combined pulse+render probe
+    # that opens a cycle) -- None on burst re-probes and the auth journey, which each only
+    # ever measure one thing. Lets the cycles row report both legs' timing separately even
+    # though they run as one call.
+    pulse_latency_ms: Optional[float] = None
+    render_latency_ms: Optional[float] = None
 
 
 async def pulse_check(url: str, timeout_s: float = 10.0) -> tuple[bool, Optional[int], float, Optional[str]]:
@@ -103,24 +109,34 @@ async def perform_check(
     """Full check: pulse first, then browser render -- skips the browser check if the pulse
     already failed. This is the normal 60s-cadence probe and also burst probe index 0 (the
     failure that starts a burst is always this combined check)."""
-    pulse_ok, http_status, latency_ms, fail_reason = await pulse_check(url, pulse_timeout_s)
+    pulse_ok, http_status, pulse_latency_ms, fail_reason = await pulse_check(url, pulse_timeout_s)
     if not pulse_ok:
-        return CheckResult(ok=False, http_status=http_status, latency_ms=latency_ms, fail_reason=fail_reason, layer="pulse")
+        return CheckResult(
+            ok=False, http_status=http_status, latency_ms=pulse_latency_ms, fail_reason=fail_reason,
+            layer="pulse", pulse_latency_ms=pulse_latency_ms, render_latency_ms=None,
+        )
 
+    render_start = time.monotonic()
     browser_ok, browser_fail_reason, screenshot_path = await browser_check(
         url, required_text, required_role, required_name, browser_timeout_ms, artifacts_dir, headless=headless
     )
+    render_latency_ms = (time.monotonic() - render_start) * 1000
     if not browser_ok:
         return CheckResult(
             ok=False,
             http_status=http_status,
-            latency_ms=latency_ms,
+            latency_ms=pulse_latency_ms,
             fail_reason=browser_fail_reason,
             screenshot_path=screenshot_path,
             layer="render",
+            pulse_latency_ms=pulse_latency_ms,
+            render_latency_ms=render_latency_ms,
         )
 
-    return CheckResult(ok=True, http_status=http_status, latency_ms=latency_ms, fail_reason=None, layer="render")
+    return CheckResult(
+        ok=True, http_status=http_status, latency_ms=pulse_latency_ms, fail_reason=None, layer="render",
+        pulse_latency_ms=pulse_latency_ms, render_latency_ms=render_latency_ms,
+    )
 
 
 async def pulse_only_probe(url: str, pulse_timeout_s: float = 10.0) -> CheckResult:
