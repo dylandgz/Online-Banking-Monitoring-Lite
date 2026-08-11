@@ -11,6 +11,20 @@ scoring entirely and route straight to CONFIG_ERROR — see Rule 10.
 the burst, not just a high enough score — a burst of two hard failures (score 4) no
 longer pages on its own; it needs a third failed probe. This stops a single pair of
 severe-but-brief probes from paging as fast as a slower, better-corroborated outage.
+
+[v3.8 / Stage R] Two additions, both still pure:
+- `session_expired` is its own class (weight 0, like config) but does NOT route to
+  CONFIG_ERROR -- Rule 17 says it "is not platform evidence" at all. It leaves the state
+  completely untouched and emits no event; the recovery login CLAUDE.md describes as its
+  follow-up is a separate, later apply_check() call carrying its own real fail_reason
+  (or a pass), not something this function orchestrates.
+- `precursor_down` (Rule 16): when True, a failing call on the auth track that would
+  otherwise cross into DOWN is suppressed -- confidence/fail_reasons/burst_started_ts
+  still update normally (the evidence is real and keeps accumulating), but status is
+  held at UP and no DownEvent fires, so the login-screen-down incident doesn't get a
+  second, redundant page for a symptom it already explains. The suppressed evidence
+  isn't lost: the next unsuppressed failing call re-evaluates threshold/floor against
+  the accumulated state and will fire immediately if they're already met.
 """
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -22,14 +36,19 @@ from typing import Optional
 _HARD_REASONS = {"conn_refused", "dns", "auth_unavailable"}
 _SOFT_REASONS = {"timeout", "element_missing", "nav_error", "data_plane_missing", "api_shape_mismatch"}
 _CONFIG_REASONS = {"auth_rejected", "bot_challenge", "mfa_failed", "rate_limited"}
+_SESSION_REASONS = {"session_expired"}
 
 HARD_WEIGHT = 2
 SOFT_WEIGHT = 1
 CONFIG_WEIGHT = 0
+SESSION_WEIGHT = 0
 
 
 def classify(fail_reason: str) -> tuple[str, int]:
-    """Returns (class_name, weight) for a fail_reason: 'hard' (2), 'soft' (1), or 'config' (0)."""
+    """Returns (class_name, weight) for a fail_reason: 'hard' (2), 'soft' (1), 'config' (0),
+    or 'session' (0, [v3.8] never scores and never routes to CONFIG_ERROR -- see Rule 17)."""
+    if fail_reason in _SESSION_REASONS:
+        return "session", SESSION_WEIGHT
     if fail_reason in _CONFIG_REASONS:
         return "config", CONFIG_WEIGHT
     if fail_reason.startswith("bad_status:") or fail_reason.startswith("api_bad_status:"):
@@ -89,10 +108,15 @@ def apply_check(
     down_confidence: int,
     burst_window_s: int,
     min_failed_probes: int,
+    precursor_down: bool = False,
 ) -> tuple[MonitorState, list[Event]]:
     """Advances the state machine by one probe result. Emits an event only on a status
     transition — never re-emits while an incident (DOWN or CONFIG_ERROR) is ongoing, and
-    never mid-burst before the confidence threshold is crossed."""
+    never mid-burst before the confidence threshold is crossed.
+
+    precursor_down [v3.8 Rule 16]: only meaningful for the auth track, when the main
+    track's incident is already open and explains the symptom. Defaults to False, which
+    keeps every existing (main-track) call site's behavior unchanged."""
     if ok:
         if state.status in ("DOWN", "CONFIG_ERROR"):
             duration_s = round((datetime.fromisoformat(ts) - datetime.fromisoformat(state.since_ts)).total_seconds())
@@ -110,6 +134,13 @@ def apply_check(
 
     # Failure path.
     cls, weight = classify(fail_reason)
+
+    if cls == "session":
+        # [v3.8 Rule 17] Not platform evidence -- leaves state and burst untouched, no
+        # event, on any track and in any status. The follow-up recovery login (or its
+        # absence, per the login budget) is a separate apply_check() call with its own
+        # real fail_reason.
+        return state, []
 
     if cls == "config":
         if state.status == "CONFIG_ERROR":
@@ -137,7 +168,7 @@ def apply_check(
         new_reasons = (fail_reason,)
         burst_started_ts = ts
 
-    if new_confidence >= down_confidence and len(new_reasons) >= min_failed_probes:
+    if new_confidence >= down_confidence and len(new_reasons) >= min_failed_probes and not precursor_down:
         event = DownEvent(since_ts=ts, confidence=new_confidence, fail_reasons=new_reasons, trigger_layer=layer)
         return MonitorState(status="DOWN", since_ts=ts, confidence=new_confidence, fail_reasons=new_reasons), [event]
 

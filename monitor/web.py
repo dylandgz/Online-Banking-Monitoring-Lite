@@ -15,6 +15,23 @@ from monitor.timeutil import to_eastern
 app = FastAPI()
 security = HTTPBasic()
 
+# [v3.8 / Stage R] platform_status = worst_of(main, auth) -- small local copy rather than
+# importing monitor.main, so the web layer doesn't depend on the scheduler's internals.
+_STATUS_ORDER = {"UP": 0, "DEGRADED": 1, "CONFIG_ERROR": 2, "DOWN": 3}
+
+
+def _unified_verdict(main_status: str, auth_status: str) -> str:
+    return auth_status if _STATUS_ORDER[auth_status] > _STATUS_ORDER[main_status] else main_status
+
+
+def _down_wording(fail_layer: str | None) -> str | None:
+    """Rule 4: name the failed layer with exact operator wording."""
+    if fail_layer in ("pulse", "render"):
+        return "login screen unreachable / not rendering"
+    if fail_layer == "authed":
+        return "online banking behind login not rendering"
+    return None
+
 
 def require_auth(credentials: HTTPBasicCredentials = Depends(security)) -> None:
     user_ok = secrets.compare_digest(credentials.username, config.DASHBOARD_USER or "")
@@ -50,15 +67,33 @@ def healthz():
 
 @app.get("/api/status", dependencies=[Depends(require_auth)])
 def api_status(conn=Depends(get_conn)):
-    state = db.get_state(conn)
-    last_check = db.get_last_check(conn)
-    if last_check is not None:
-        last_check["ts"] = to_eastern(last_check["ts"])
+    """[v3.8 / Stage R] platform_status = worst_of(main, auth) -- the banner and every
+    field here speak platform-level, not just the pulse/render track, per Rule 16/the
+    "one platform, one verdict" realignment."""
+    main_state = db.get_state(conn, track="main")
+    auth_state = db.get_state(conn, track="auth")
+    verdict = _unified_verdict(main_state.status, auth_state.status)
 
+    since_ts = None
+    fail_layer = None
+    fail_wording = None
     screenshot_path = None
-    if state.status == "DOWN":
-        open_incident = db.get_open_incident(conn)
-        screenshot_path = open_incident["screenshot_path"] if open_incident else None
+    if verdict != "UP":
+        # Whichever track is at least as severe explains the verdict (Rule 4: name the
+        # failed layer). Ties (both DOWN, say) favor main -- it's the precursor.
+        responsible_track = "main" if _STATUS_ORDER[main_state.status] >= _STATUS_ORDER[auth_state.status] else "auth"
+        responsible_state = main_state if responsible_track == "main" else auth_state
+        since_ts = responsible_state.since_ts
+        open_incident = db.get_open_incident(conn, track=responsible_track)
+        if open_incident:
+            fail_layer = open_incident["trigger_layer"]
+            screenshot_path = open_incident["screenshot_path"]
+        if verdict == "DOWN":
+            fail_wording = _down_wording(fail_layer)
+
+    last_cycle = db.get_last_cycle(conn)
+    if last_cycle is not None:
+        last_cycle["ts"] = to_eastern(last_cycle["ts"])
 
     now = datetime.now(timezone.utc)
     uptime = {
@@ -67,6 +102,7 @@ def api_status(conn=Depends(get_conn)):
         "30d": db.uptime_pct(conn, (now - timedelta(days=30)).isoformat()),
     }
 
+    # get_recent_incidents() is track-agnostic (no filter) -- already merges both tracks.
     incidents = db.get_recent_incidents(conn, limit=20)
     for inc in incidents:
         if inc.get("started_at"):
@@ -77,9 +113,11 @@ def api_status(conn=Depends(get_conn)):
     return {
         "target_name": config.TARGET_NAME,
         "target_url": config.TARGET_URL,
-        "status": state.status,
-        "since_ts": to_eastern(state.since_ts) if state.since_ts else None,
-        "last_check": last_check,
+        "status": verdict,
+        "since_ts": to_eastern(since_ts) if since_ts else None,
+        "fail_layer": fail_layer,
+        "fail_wording": fail_wording,
+        "last_cycle": last_cycle,
         "screenshot_path": screenshot_path,
         "uptime_pct": uptime,
         "incidents": incidents,
@@ -94,39 +132,77 @@ def api_history(
     page_size: int = Query(50, ge=1, le=500),
     conn=Depends(get_conn),
 ):
-    rows, total = db.query_checks(conn, from_, to, page, page_size)
+    """[v3.8 / Stage R] Serves the cycles view -- one row per minute, per CLAUDE.md's
+    dashboard spec. Probe-level detail (including bursts) is fetched per-cycle via
+    /api/cycle/{cycle_id}, not inlined here."""
+    rows, total = db.query_cycles(conn, from_, to, page, page_size)
     for row in rows:
         row["ts"] = to_eastern(row["ts"])
     return {"rows": rows, "total": total, "page": page, "page_size": page_size}
+
+
+@app.get("/api/cycle/{cycle_id}", dependencies=[Depends(require_auth)])
+def api_cycle_probes(cycle_id: str, conn=Depends(get_conn)):
+    """Expandable probe-level detail for one cycle row -- bursts are first-class,
+    unhideable evidence (CLAUDE.md), surfaced here on drill-down."""
+    rows = db.get_checks_for_cycle(conn, cycle_id)
+    for row in rows:
+        row["ts"] = to_eastern(row["ts"])
+    return {"rows": rows}
 
 
 @app.get("/api/export", dependencies=[Depends(require_auth)])
 def api_export(
     from_: str | None = Query(None, alias="from"),
     to: str | None = Query(None),
+    table: str = Query("cycles", pattern="^(cycles|checks)$"),
 ):
+    """[v3.8 / Stage R] table=cycles (default) is the primary audit export -- one row per
+    minute; table=checks is the probe-level evidence (bursts included)."""
     conn = db.get_connection(config.DB_PATH)
-    rows = db.export_checks(conn, from_, to)
+    if table == "cycles":
+        rows = db.export_cycles(conn, from_, to)
+    else:
+        rows = db.export_checks(conn, from_, to)
     conn.close()
+
+    if table == "cycles":
+        header = [
+            "cycle_id", "ts_eastern", "pulse_ok", "render_ok", "authed_ok", "session_reused",
+            "pulse_latency_ms", "render_latency_ms", "authed_latency_ms", "verdict", "fail_layer",
+            "fail_reason", "burst_id",
+        ]
+
+        def row_values(row):
+            return [
+                row["cycle_id"], to_eastern(row["ts"]), row["pulse_ok"], row["render_ok"], row["authed_ok"],
+                row["session_reused"], row["pulse_latency_ms"], row["render_latency_ms"], row["authed_latency_ms"],
+                row["verdict"], row["fail_layer"], row["fail_reason"], row["burst_id"],
+            ]
+    else:
+        header = ["id", "ts_eastern", "ok", "http_status", "latency_ms", "fail_reason", "browser_mode", "layer", "burst_id", "cycle_id"]
+
+        def row_values(row):
+            return [
+                row["id"], to_eastern(row["ts"]), row["ok"], row["http_status"], row["latency_ms"],
+                row["fail_reason"], row["browser_mode"], row["layer"], row["burst_id"], row["cycle_id"],
+            ]
 
     def generate():
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(["id", "ts_eastern", "ok", "http_status", "latency_ms", "fail_reason", "browser_mode", "layer", "burst_id"])
+        writer.writerow(header)
         yield buf.getvalue()
         for row in rows:
             buf.seek(0)
             buf.truncate(0)
-            writer.writerow([
-                row["id"], to_eastern(row["ts"]), row["ok"], row["http_status"], row["latency_ms"],
-                row["fail_reason"], row["browser_mode"], row["layer"], row["burst_id"],
-            ])
+            writer.writerow(row_values(row))
             yield buf.getvalue()
 
     return StreamingResponse(
         generate(),
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=checks.csv"},
+        headers={"Content-Disposition": f"attachment; filename={table}.csv"},
     )
 
 
@@ -166,6 +242,14 @@ DASHBOARD_HTML = """
   tr.burst-row { background: #fff7e0; }
   .badge-burst { display: inline-block; background: #f5a623; color: #5b3b00; border-radius: 4px; padding: 0.05rem 0.4rem; font-size: 0.75rem; font-weight: 600; }
   .burst-id { color: #888; font-size: 0.75rem; margin-left: 0.3rem; }
+  .layer-badge { display: inline-block; border-radius: 4px; padding: 0.05rem 0.4rem; font-size: 0.75rem; font-weight: 600; margin-right: 0.2rem; }
+  .layer-badge.ok { background: #d7f5dd; color: #146c2e; }
+  .layer-badge.fail { background: #fbdada; color: #a11212; }
+  .layer-badge.na { background: #eee; color: #888; }
+  .badge-reused { display: inline-block; background: #e0ecff; color: #1a4d99; border-radius: 4px; padding: 0.05rem 0.4rem; font-size: 0.75rem; }
+  tr.cycle-row { cursor: pointer; }
+  tr.cycle-row:hover { background: #f7f7f7; }
+  tr.probe-detail td { background: #fbfbfb; padding: 0.5rem 0.6rem 0.9rem 1.5rem; }
 </style>
 </head>
 <body>
@@ -178,19 +262,20 @@ DASHBOARD_HTML = """
 
   <h2>Incidents</h2>
   <table id="incidents-table">
-    <thead><tr><th>Started</th><th>Ended</th><th>Duration</th><th>Checks Failed</th><th>Screenshot</th></tr></thead>
+    <thead><tr><th>Track</th><th>Layer</th><th>Started</th><th>Ended</th><th>Duration</th><th>Probes</th><th>Screenshot</th></tr></thead>
     <tbody></tbody>
   </table>
 
-  <h2>Check Log</h2>
+  <h2>Cycle Log <span style="font-weight:normal; color:#666; font-size:0.85rem;">(one row per minute -- click a row to see its probes)</span></h2>
   <div class="controls">
     <label>From <input type="datetime-local" id="from"></label>
     <label>To <input type="datetime-local" id="to"></label>
     <button onclick="state.page=1; loadHistory();">Filter</button>
-    <a class="button" id="csv-link" href="/api/export">Download CSV</a>
+    <a class="button" id="csv-link" href="/api/export?table=cycles">Download cycles CSV</a>
+    <a class="button" id="csv-link-checks" href="/api/export?table=checks">Download probes CSV</a>
   </div>
   <table id="history-table">
-    <thead><tr><th>Timestamp (Eastern)</th><th>OK</th><th>HTTP</th><th>Latency (ms)</th><th>Fail Reason</th><th>Layer</th><th>Burst</th></tr></thead>
+    <thead><tr><th>Timestamp (Eastern)</th><th>Pulse</th><th>Render</th><th>Authed</th><th>Verdict</th><th>Session</th><th>Burst</th></tr></thead>
     <tbody></tbody>
   </table>
   <div class="controls">
@@ -220,6 +305,9 @@ async function loadStatus() {
   if (data.status === "UP") {
     banner.className = "banner up";
     banner.textContent = "UP";
+  } else if (data.status === "DOWN") {
+    banner.className = "banner down";
+    banner.textContent = "DOWN since " + data.since_ts + (data.fail_wording ? " — " + data.fail_wording : "");
   } else {
     banner.className = "banner down";
     banner.textContent = data.status + " since " + data.since_ts;
@@ -234,6 +322,8 @@ async function loadStatus() {
   const tbody = document.querySelector("#incidents-table tbody");
   tbody.innerHTML = data.incidents.map(inc => `
     <tr>
+      <td>${inc.track ?? "main"}</td>
+      <td>${inc.trigger_layer ?? "-"}</td>
       <td>${inc.started_at}</td>
       <td>${inc.ended_at ?? "(ongoing)"}</td>
       <td>${fmtDuration(inc.duration_s)}</td>
@@ -241,6 +331,32 @@ async function loadStatus() {
       <td>${inc.screenshot_path ? `<a href="/api/artifact/${inc.id}" target="_blank">view</a>` : "-"}</td>
     </tr>
   `).join("");
+}
+
+function layerBadge(ok) {
+  if (ok === null || ok === undefined) return `<span class="layer-badge na">-</span>`;
+  return ok ? `<span class="layer-badge ok">OK</span>` : `<span class="layer-badge fail">FAIL</span>`;
+}
+
+async function toggleProbes(cycleId, row) {
+  const existing = document.getElementById("probes-" + cycleId);
+  if (existing) { existing.remove(); return; }
+
+  const res = await fetch("/api/cycle/" + cycleId);
+  const data = await res.json();
+  const detail = document.createElement("tr");
+  detail.id = "probes-" + cycleId;
+  detail.className = "probe-detail";
+  detail.innerHTML = `<td colspan="7">` + data.rows.map(p => `
+    <div>
+      ${p.ts} — <strong>${p.layer}</strong> —
+      <span class="${p.ok ? 'ok' : 'fail'}">${p.ok ? "OK" : "FAIL"}</span>
+      ${p.fail_reason ? ` (${p.fail_reason})` : ""}
+      ${p.latency_ms != null ? ` — ${Math.round(p.latency_ms)}ms` : ""}
+      ${p.burst_id ? `<span class="badge-burst">burst</span><span class="burst-id">${p.burst_id.slice(0, 8)}</span>` : ""}
+    </div>
+  `).join("") + `</td>`;
+  row.after(detail);
 }
 
 async function loadHistory() {
@@ -255,17 +371,22 @@ async function loadHistory() {
   state.total = data.total;
 
   const tbody = document.querySelector("#history-table tbody");
-  tbody.innerHTML = data.rows.map(r => `
-    <tr class="${r.burst_id ? 'burst-row' : ''}">
+  tbody.innerHTML = "";
+  data.rows.forEach(r => {
+    const tr = document.createElement("tr");
+    tr.className = "cycle-row" + (r.burst_id ? " burst-row" : "");
+    tr.innerHTML = `
       <td>${r.ts}</td>
-      <td class="${r.ok ? 'ok' : 'fail'}">${r.ok ? "OK" : "FAIL"}</td>
-      <td>${r.http_status ?? "-"}</td>
-      <td>${r.latency_ms ? r.latency_ms.toFixed(0) : "-"}</td>
-      <td>${r.fail_reason ?? "-"}</td>
-      <td>${r.layer ?? "-"}</td>
+      <td>${layerBadge(r.pulse_ok)}</td>
+      <td>${layerBadge(r.render_ok)}</td>
+      <td>${layerBadge(r.authed_ok)}</td>
+      <td class="${r.verdict === 'UP' ? 'ok' : 'fail'}">${r.verdict}</td>
+      <td>${r.session_reused ? `<span class="badge-reused">reused</span>` : "-"}</td>
       <td>${r.burst_id ? `<span class="badge-burst">burst</span><span class="burst-id">${r.burst_id.slice(0, 8)}</span>` : "-"}</td>
-    </tr>
-  `).join("");
+    `;
+    tr.onclick = () => toggleProbes(r.cycle_id, tr);
+    tbody.appendChild(tr);
+  });
 
   const totalPages = Math.max(1, Math.ceil(state.total / state.pageSize));
   document.getElementById("page-label").textContent = `Page ${state.page} / ${totalPages}`;
@@ -273,7 +394,8 @@ async function loadHistory() {
   const csvParams = new URLSearchParams();
   if (from) csvParams.set("from", new Date(from).toISOString());
   if (to) csvParams.set("to", new Date(to).toISOString());
-  document.getElementById("csv-link").href = "/api/export?" + csvParams.toString();
+  document.getElementById("csv-link").href = "/api/export?table=cycles&" + csvParams.toString();
+  document.getElementById("csv-link-checks").href = "/api/export?table=checks&" + csvParams.toString();
 }
 
 function prevPage() { if (state.page > 1) { state.page--; loadHistory(); } }
