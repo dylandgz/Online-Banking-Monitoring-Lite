@@ -5,11 +5,13 @@ import asyncio
 
 from monitor.channels.base import AlertChannel
 from monitor.channels.email_gmail import EmailGmailChannel
-from monitor.channels.sms_stub import SmsStubChannel
+from monitor.channels.sms_email_gateway import SmsEmailGatewayChannel
+from monitor.channels.sms_twilio import SmsTwilioChannel
 
 _REGISTRY: dict[str, type[AlertChannel]] = {
     "email": EmailGmailChannel,
-    "sms": SmsStubChannel,
+    "sms": SmsTwilioChannel,
+    "sms_gateway": SmsEmailGatewayChannel,
 }
 
 
