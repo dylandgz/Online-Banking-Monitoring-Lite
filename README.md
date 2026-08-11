@@ -42,6 +42,11 @@ pip install -r requirements.txt
 playwright install chrome
 
 cp .env.example .env
+# fill in .env: TARGET_URL, REQUIRED_TEXT (or REQUIRED_ROLE+REQUIRED_NAME),
+# DASHBOARD_USER/PASSWORD are required at minimum. Email alerting needs
+# GMAIL_USER/GMAIL_APP_PASSWORD/RECIPIENTS_EMAIL — the loop runs fine without them,
+# it just logs and skips sending. SMS (Twilio) needs TWILIO_ACCOUNT_SID/
+# TWILIO_AUTH_TOKEN/TWILIO_FROM_NUMBER/SMS_TO_NUMBER plus ALERT_CHANNELS=email,sms.
 # Fill in .env. See the file's own comments -- it's organized CORE (required to start)
 # -> PULSE+RENDER (the public login-page check) -> AUTH (the sign-in journey + session
 # reuse) -> ALERTING -> DEAD (safe to ignore/delete). At minimum: TARGET_URL,
@@ -137,6 +142,10 @@ monitor/check.py       # pulse + browser check -> CheckResult (main track)
 monitor/journey.py     # sign-in journey: login -> TOTP -> authed assertion -> logout; cheap session-reuse check
 monitor/session.py     # storageState save/load, session-freshness check
 monitor/state.py       # pure state machine: (previous_state, check_result) -> (new_state, events)
+monitor/channels/      # alert channels: email (Gmail), sms (Twilio) — see CONTRIBUTING.md to add another
+monitor/db.py          # SQLite schema, migrations, reads/writes
+monitor/web.py         # FastAPI routes + dashboard
+monitor/main.py        # composition root: check loop + uvicorn in one asyncio process
 monitor/channels/      # alert channels (email live; sms is an open contribution seam — see CONTRIBUTING.md)
 monitor/db.py          # SQLite schema, migrations, reads/writes (checks, cycles, incidents, state, login_events)
 monitor/web.py         # FastAPI routes + dashboard (unified verdict, cycle log, CSV export)
@@ -148,7 +157,8 @@ tests/                  # pytest suite
 
 ## Contributing
 
-The SMS alert channel is an open contribution seam — see [CONTRIBUTING.md](CONTRIBUTING.md)
-for the contract and what files a PR may touch. Everything else in this repo is being
-built stage-by-stage against CLAUDE.md's plan; please open an issue before sending an
-unsolicited PR against the core check/alert/state path.
+Alert channels are plug-ins (`email` and `sms` are both live) — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for the contract and what files a PR may touch to add
+another one. Everything else in this repo is being built stage-by-stage against CLAUDE.md's
+plan; please open an issue before sending an unsolicited PR against the core
+check/alert/state path.
