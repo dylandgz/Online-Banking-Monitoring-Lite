@@ -143,10 +143,6 @@ monitor/journey.py     # sign-in journey: login -> TOTP -> authed assertion -> l
 monitor/session.py     # storageState save/load, session-freshness check
 monitor/state.py       # pure state machine: (previous_state, check_result) -> (new_state, events)
 monitor/channels/      # alert channels: email (Gmail), sms (Twilio) — see CONTRIBUTING.md to add another
-monitor/db.py          # SQLite schema, migrations, reads/writes
-monitor/web.py         # FastAPI routes + dashboard
-monitor/main.py        # composition root: check loop + uvicorn in one asyncio process
-monitor/channels/      # alert channels (email live; sms is an open contribution seam — see CONTRIBUTING.md)
 monitor/db.py          # SQLite schema, migrations, reads/writes (checks, cycles, incidents, state, login_events)
 monitor/web.py         # FastAPI routes + dashboard (unified verdict, cycle log, CSV export)
 monitor/main.py        # composition root: unified cycle loop + uvicorn in one asyncio process
