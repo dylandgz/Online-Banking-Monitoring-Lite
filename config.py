@@ -80,11 +80,10 @@ MASK_TEXT = [t.strip() for t in os.getenv("MASK_TEXT", "").split(";") if t.strip
 MASKING_ENABLED = os.getenv("MASKING_ENABLED", "true").lower() != "false"
 CHALLENGE_TIMEOUT_MS = int(os.getenv("CHALLENGE_TIMEOUT_MS", "25000"))
 
-# [v3] Stages 6-7 only, sanctioned exception to Rule 11; deleted at Stage 8 (Rule 11).
-# Off by default. Turning this on is meant for the Stage 7 stress soak (full sign-in
-# every CHECK_INTERVAL_S) -- not currently read by any code path (stress-mode logic
-# itself is deliberately not built yet; see PROGRESS.md's Stage 6 notes).
-LOGIN_STRESS_MODE = os.getenv("LOGIN_STRESS_MODE", "false").lower() == "true"
+# NOTE: LOGIN_STRESS_MODE is deliberately absent. v3's sanctioned stress-mode exception to
+# Rule 11 is a Stage 7 task and the logic behind it was never built, so the setting existed
+# only as an unread module attribute -- removed here rather than left looking implemented.
+# Stage 7 reintroduces it together with the code that actually reads it.
 
 # --- Stage 8: session reuse (pulled forward ahead of Stage 7 -- see CLAUDE.md v3.7) ---
 # [v3.4] SESSION_STATE_PATH is a real secret (chmod 600, gitignored): storageState

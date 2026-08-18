@@ -7,15 +7,7 @@ import config
 from monitor.channels.base import AlertChannel, AlertEvent
 from monitor.state import ConfigErrorEvent, DownEvent, RecoveryEvent
 from monitor.timeutil import to_eastern
-
-# layers whose evidence implies the pulse (plain HTTP) itself failed -- the site is unreachable.
-PULSE_LAYERS = {"pulse"}
-
-
-def _layer_hint(trigger_layer: str) -> str:
-    if trigger_layer in PULSE_LAYERS:
-        return "site unreachable"
-    return "page loads, content missing — possible site change, verify before escalating"
+from monitor.verdict import layer_wording
 
 
 def _format_duration(duration_s: int) -> str:
@@ -29,12 +21,27 @@ def _format_duration(duration_s: int) -> str:
 
 
 def down_message(event: DownEvent) -> str:
+    """CLAUDE.md's v3.8 locked DOWN copy, verbatim:
+
+        [MONITOR] {name} DOWN since {eastern} — {layer wording} (confidence {n}: {reasons}).
+        Dashboard: {url}
+
+    where the layer wording is Rule 4's exact operator phrasing for the failed layer --
+    "login screen unreachable / not rendering" for a precursor (pulse/render) failure,
+    "online banking behind login not rendering" for an authed one. Before this, the email
+    said "{trigger_layer} failed" plus a hand-written hint, so an operator paged at 3am read
+    "render failed / page loads, content missing" while the dashboard (which they'd have to
+    open) showed Rule 4's wording. Rule 4 exists precisely so they don't need the browser.
+
+    The fallback covers a trigger_layer this vocabulary doesn't know: name it plainly and
+    still send, rather than let an unmapped layer suppress the page entirely."""
     dashboard_url = f"http://localhost:{config.PORT}"
     reasons = ", ".join(event.fail_reasons)
+    wording = layer_wording(event.trigger_layer) or f"{event.trigger_layer} layer failed"
     return (
         f"[MONITOR] {config.TARGET_NAME} DOWN since {to_eastern(event.since_ts)} — "
-        f"{event.trigger_layer} failed (confidence {event.confidence}: {reasons}). "
-        f"{_layer_hint(event.trigger_layer)}. Dashboard: {dashboard_url}"
+        f"{wording} (confidence {event.confidence}: {reasons}). "
+        f"Dashboard: {dashboard_url}"
     )
 
 
@@ -43,7 +50,14 @@ def recovery_message(event: RecoveryEvent) -> str:
 
 
 def config_message(event: ConfigErrorEvent) -> str:
-    return f"[MONITOR-CONFIG] {config.TARGET_NAME} needs attention — {event.fail_reason}. Checks paused."
+    # "Sign-in checks paused" per v3.8's locked copy -- and it's also the accurate
+    # statement: a CONFIG_ERROR halts the auth track (Rule 10), while the pulse/render
+    # precursor keeps checking every cycle. The old "Checks paused" read as though the
+    # whole monitor had stopped.
+    return (
+        f"[MONITOR-CONFIG] {config.TARGET_NAME} needs attention — {event.fail_reason}. "
+        f"Sign-in checks paused."
+    )
 
 
 class EmailGmailChannel(AlertChannel):

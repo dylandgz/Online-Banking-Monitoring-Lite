@@ -15,8 +15,7 @@ import config
 from monitor import check, db, journey, session
 from monitor.channels import build_channels, dispatch
 from monitor.state import ConfigErrorEvent, DownEvent, MonitorState, RecoveryEvent, apply_check
-
-_STATUS_ORDER = {"UP": 0, "DEGRADED": 1, "CONFIG_ERROR": 2, "DOWN": 3}
+from monitor.verdict import severity, unified_verdict
 
 
 def _now_iso() -> str:
@@ -95,15 +94,16 @@ async def _process_probe(
 
 async def _run_burst_reprobes(
     conn, channels, state: MonitorState, burst_start_ts: str, cycle_id: str,
-) -> tuple[MonitorState, "check.CheckResult"]:
+) -> tuple[MonitorState, "check.CheckResult", str]:
     """Runs the rest of the main-track confirmation burst inline (Stage 5): re-probes at
     the remaining BURST_DELAYS_S offsets, varying the probe (render, then pulse) so each
     is independent evidence rather than a correlated retry. Stops the moment the burst
     resolves -- DOWN fires, or a pass clears it. Running this inline means the cycle's
     overlap-guard lock naturally absorbs the next tick instead of double-probing while a
     burst is in flight -- the human's call: reliability over a strict 60s cadence.
-    Returns the final state AND the last probe's CheckResult (for the cycles row's
-    fail_layer)."""
+    Returns the final state, the last probe's CheckResult (for the cycles row's
+    fail_layer), and the burst_id every probe in this burst was tagged with (so the cycles
+    row can carry it too -- see run_cycle)."""
     burst_id = str(uuid.uuid4())
     last_result = None
     probe_kinds = list(itertools.islice(itertools.cycle(["render", "pulse"]), len(config.BURST_DELAYS_S) - 1))
@@ -131,7 +131,7 @@ async def _run_burst_reprobes(
         last_result = result
         state = await _process_probe(conn, channels, state, result, _now_iso(), burst_id, cycle_id=cycle_id)
 
-    return state, last_result
+    return state, last_result, burst_id
 
 
 async def _run_full_login(conn, *, should_logout: bool) -> "check.CheckResult":
@@ -234,7 +234,7 @@ async def _run_auth_probe(conn, main_down: bool, login_budget_state: dict) -> "c
 async def _run_auth_burst_reprobes(
     conn, channels, state: MonitorState, burst_start_ts: str, cycle_id: str,
     main_down: bool, login_budget_state: dict,
-) -> tuple[MonitorState, "check.CheckResult"]:
+) -> tuple[MonitorState, "check.CheckResult", str]:
     """[v3.8 / Stage R] Auth-track confirmation burst: re-probes with the cheap
     session-reuse check at the same offsets as the main track -- zero logins per probe
     (Rule 11). A session_expired probe mid-burst is inert (Rule 17: doesn't count, burst
@@ -264,15 +264,7 @@ async def _run_auth_burst_reprobes(
             min_failed_probes=config.AUTH_MIN_FAILED_PROBES, precursor_down=main_down, cycle_id=cycle_id,
         )
 
-    return state, last_result
-
-
-def _unified_verdict(main_status: str, auth_status: str | None) -> str:
-    """[v3.8] platform_status = worst_of(main, auth); auth_status=None means the auth
-    track didn't participate this cycle (not configured), so main alone decides."""
-    if auth_status is None:
-        return main_status
-    return auth_status if _STATUS_ORDER[auth_status] > _STATUS_ORDER[main_status] else main_status
+    return state, last_result, burst_id
 
 
 def _cycle_fail_info(
@@ -282,7 +274,7 @@ def _cycle_fail_info(
     by the email/dashboard layer -- this just picks which track's evidence explains it."""
     if verdict == "UP":
         return None, None
-    if main_state.status != "UP" and _STATUS_ORDER[main_state.status] >= _STATUS_ORDER.get(auth_state.status if auth_state else "UP", 0):
+    if main_state.status != "UP" and severity(main_state.status) >= severity(auth_state.status if auth_state else "UP"):
         fail_reason = main_state.fail_reasons[-1] if main_state.fail_reasons else (last_main_result.fail_reason if last_main_result else None)
         fail_layer = last_main_result.layer if last_main_result else "pulse"
         return fail_layer, fail_reason
@@ -319,8 +311,11 @@ async def run_cycle(conn, channels, auth_enabled: bool) -> None:
     new_main_state = await _process_probe(conn, channels, prev_main_state, main_result, ts_main, burst_id=None, cycle_id=cycle_id)
     last_main_result = main_result
 
+    main_burst_id = None
     if new_main_state.status == "UP" and new_main_state.burst_started_ts == ts_main and prior_main_burst_ts != ts_main:
-        new_main_state, burst_last_result = await _run_burst_reprobes(conn, channels, new_main_state, burst_start_ts=ts_main, cycle_id=cycle_id)
+        new_main_state, burst_last_result, main_burst_id = await _run_burst_reprobes(
+            conn, channels, new_main_state, burst_start_ts=ts_main, cycle_id=cycle_id
+        )
         if burst_last_result is not None:
             last_main_result = burst_last_result
 
@@ -332,6 +327,7 @@ async def run_cycle(conn, channels, auth_enabled: bool) -> None:
     authed_ok = None
     authed_latency_ms = None
     login_used_this_cycle = False
+    auth_burst_id = None
 
     if auth_enabled:
         prev_auth_state = db.get_state(conn, track="auth")
@@ -353,7 +349,7 @@ async def run_cycle(conn, channels, auth_enabled: bool) -> None:
             last_auth_result = auth_result
 
             if new_auth_state.status == "UP" and new_auth_state.burst_started_ts == ts_auth and prior_auth_burst_ts != ts_auth:
-                new_auth_state, burst_last_auth_result = await _run_auth_burst_reprobes(
+                new_auth_state, burst_last_auth_result, auth_burst_id = await _run_auth_burst_reprobes(
                     conn, channels, new_auth_state, burst_start_ts=ts_auth, cycle_id=cycle_id,
                     main_down=main_down, login_budget_state=login_budget_state,
                 )
@@ -365,8 +361,17 @@ async def run_cycle(conn, channels, auth_enabled: bool) -> None:
             login_used_this_cycle = login_budget_state["used"]
 
     # --- unified verdict + cycles row (Rule 16) ---
-    verdict = _unified_verdict(new_main_state.status, new_auth_state.status if new_auth_state else None)
+    verdict = unified_verdict(new_main_state.status, new_auth_state.status if new_auth_state else None)
     fail_layer, fail_reason = _cycle_fail_info(verdict, new_main_state, last_main_result, new_auth_state, last_auth_result)
+
+    # cycles.burst_id marks this minute as burst-confirmed so the dashboard's Burst column
+    # and the CSV audit export can show it without drilling into `checks` (bursts are
+    # first-class and unhideable). The column holds one id, so when both tracks bursted in
+    # the same cycle it carries the one belonging to the track that explains the verdict --
+    # the other track's burst is never lost, every probe in it is still tagged in `checks`
+    # under this cycle_id. Until now this argument was simply never passed, so the column
+    # was NULL on every row ever written and the dashboard's Burst badge could not fire.
+    burst_id = auth_burst_id if fail_layer == "authed" and auth_burst_id else (main_burst_id or auth_burst_id)
 
     db.append_cycle(
         conn,
@@ -384,8 +389,11 @@ async def run_cycle(conn, channels, auth_enabled: bool) -> None:
         authed_latency_ms=authed_latency_ms,
         fail_layer=fail_layer,
         fail_reason=fail_reason,
+        burst_id=burst_id,
     )
-    print(f"[{ts}] [cycle {cycle_id[:8]}] verdict={verdict}" + (f" ({fail_layer}: {fail_reason})" if fail_reason else ""))
+    print(f"[{ts}] [cycle {cycle_id[:8]}] verdict={verdict}"
+          + (f" ({fail_layer}: {fail_reason})" if fail_reason else "")
+          + (f" burst={burst_id[:8]}" if burst_id else ""))
 
 
 async def guarded_cycle(conn, channels, lock: asyncio.Lock, auth_enabled: bool) -> None:

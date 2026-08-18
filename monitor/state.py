@@ -30,11 +30,15 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Optional
 
-# Rule: only bad_status/api_bad_status in the 5xx range count as Hard evidence; other
-# non-5xx status codes aren't explicitly classified in CLAUDE.md's table, so they're
-# treated as Soft (ambiguous evidence stays cautious) rather than assumed to be Hard.
+# Rule: only bad_status in the 5xx range counts as Hard evidence; other non-5xx status
+# codes aren't explicitly classified in CLAUDE.md's table, so they're treated as Soft
+# (ambiguous evidence stays cautious) rather than assumed to be Hard.
+#
+# The data-plane/API reasons (data_plane_missing, api_shape_mismatch, api_bad_status:) that
+# used to appear here are gone: v3.8 removed data-plane/API probing from scope entirely, so
+# nothing can ever produce them. Anything unrecognized still falls through to Soft below.
 _HARD_REASONS = {"conn_refused", "dns", "auth_unavailable"}
-_SOFT_REASONS = {"timeout", "element_missing", "nav_error", "data_plane_missing", "api_shape_mismatch"}
+_SOFT_REASONS = {"timeout", "element_missing", "nav_error"}
 _CONFIG_REASONS = {"auth_rejected", "bot_challenge", "mfa_failed", "rate_limited"}
 _SESSION_REASONS = {"session_expired"}
 
@@ -51,7 +55,7 @@ def classify(fail_reason: str) -> tuple[str, int]:
         return "session", SESSION_WEIGHT
     if fail_reason in _CONFIG_REASONS:
         return "config", CONFIG_WEIGHT
-    if fail_reason.startswith("bad_status:") or fail_reason.startswith("api_bad_status:"):
+    if fail_reason.startswith("bad_status:"):
         code = fail_reason.rsplit(":", 1)[-1]
         if code.isdigit() and 500 <= int(code) <= 599:
             return "hard", HARD_WEIGHT
