@@ -130,9 +130,9 @@ budget: see CLAUDE.md's "Confidence scoring" section.
 pytest -q
 ```
 
-`monitor/state.py` is a pure function and is unit tested independently of everything
-else — no network, no DB, no browser. `journey.py`/`web.py` don't have automated
-coverage yet (both verified via live drills and manual smoke checks instead — see
+`monitor/state.py` and `monitor/verdict.py` are pure and unit tested independently of
+everything else — no network, no DB, no browser. `journey.py` and the web layer don't have
+automated coverage yet (both verified via live drills and manual smoke checks instead — see
 PROGRESS.md).
 
 ## Layout
@@ -142,9 +142,13 @@ monitor/check.py       # pulse + browser check -> CheckResult (main track)
 monitor/journey.py     # sign-in journey: login -> TOTP -> authed assertion -> logout; cheap session-reuse check
 monitor/session.py     # storageState save/load, session-freshness check
 monitor/state.py       # pure state machine: (previous_state, check_result) -> (new_state, events)
-monitor/channels/      # alert channels: email (Gmail), sms (Twilio) — see CONTRIBUTING.md to add another
+monitor/verdict.py     # pure: worst_of(main, auth) + Rule 4's operator wording (one source for dashboard + alerts)
+monitor/timeutil.py    # presentation-only UTC -> America/New_York formatting
+monitor/channels/      # alert channels: email (Gmail), sms (Twilio), sms_gateway — see CONTRIBUTING.md to add another
 monitor/db.py          # SQLite schema, migrations, reads/writes (checks, cycles, incidents, state, login_events)
-monitor/web.py         # FastAPI routes + dashboard (unified verdict, cycle log, CSV export)
+monitor/web/app.py     # FastAPI routes: unified verdict, cycle log, CSV export (backend only, builds no HTML)
+monitor/web/templates/ # dashboard.html — the page shell
+monitor/web/static/    # dashboard.css, dashboard.js — served behind the same basic auth as the rest
 monitor/main.py        # composition root: unified cycle loop + uvicorn in one asyncio process
 config.py               # loads and validates .env
 scripts/                # manual drill runners (sign-in journey, live cycle drill) -- see their docstrings

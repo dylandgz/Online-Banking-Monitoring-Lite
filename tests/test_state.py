@@ -36,12 +36,21 @@ def run(state, results, precursor_down=False):
 # --- classify() ---
 
 def test_classify_hard_reasons():
-    for reason in ("conn_refused", "dns", "auth_unavailable", "bad_status:500", "bad_status:503", "api_bad_status:502"):
+    for reason in ("conn_refused", "dns", "auth_unavailable", "bad_status:500", "bad_status:503"):
         assert classify(reason) == ("hard", 2), reason
 
 
 def test_classify_soft_reasons():
-    for reason in ("timeout", "element_missing", "nav_error", "data_plane_missing", "api_shape_mismatch", "bad_status:404", "bad_status:403"):
+    for reason in ("timeout", "element_missing", "nav_error", "bad_status:404", "bad_status:403"):
+        assert classify(reason) == ("soft", 1), reason
+
+
+def test_classify_retired_data_plane_reasons_are_merely_unrecognized():
+    """v3.8 removed data-plane/API probing from scope, so nothing can emit these anymore
+    and classify() no longer names them. They must still land on the cautious side of the
+    fence via the unrecognized-reason fallback -- never Hard, so a stray legacy row in an
+    old DB can't score double toward a page."""
+    for reason in ("data_plane_missing", "api_shape_mismatch", "api_bad_status:502"):
         assert classify(reason) == ("soft", 1), reason
 
 
