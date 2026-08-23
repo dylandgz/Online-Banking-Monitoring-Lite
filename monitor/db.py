@@ -57,8 +57,10 @@ CREATE TABLE IF NOT EXISTS login_events (
 -- platform verdict CLAUDE.md now presents (worst_of(main, auth)). Probe-level evidence
 -- (including burst re-probes) still lives in `checks`, linked back here via cycle_id --
 -- `cycles` is the audit-primary, one-line-per-minute view; `checks` is the detail.
--- authed_ok is NULL, not FALSE, when the authed layer wasn't evaluable that cycle
--- (precursor already down) -- Rule 16: NULL != fail, it means "not this cycle's evidence".
+-- authed_ok carries the initiating auth probe's real True/False whenever the auth track ran
+-- that cycle -- INCLUDING while its own alert was suppressed per Rule 16, since suppression
+-- withholds the page, never the evidence. It is NULL only when the auth track didn't run at
+-- all (journey unconfigured, or the track sitting in its own CONFIG_ERROR per Rule 10).
 CREATE TABLE IF NOT EXISTS cycles (
     cycle_id TEXT PRIMARY KEY,
     ts TEXT NOT NULL,
@@ -98,11 +100,10 @@ def _add_missing_columns(conn: sqlite3.Connection, table: str, columns: dict[str
 
 def _migrate_browser_mode(conn: sqlite3.Connection) -> None:
     """v3: checks.browser_mode was added after this table already existed in the wild.
-    Backfill pre-existing rows as 'headless' (the only mode the scheduler has ever run)."""
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(checks)")}
-    if "browser_mode" not in columns:
-        conn.execute("ALTER TABLE checks ADD COLUMN browser_mode TEXT")
-        conn.execute("UPDATE checks SET browser_mode = 'headless' WHERE browser_mode IS NULL")
+    Backfill pre-existing rows as 'headless' (the only mode the scheduler has ever run).
+    The backfill, not the ALTER, is why this still needs its own function."""
+    _add_missing_columns(conn, "checks", {"browser_mode": "TEXT"})
+    conn.execute("UPDATE checks SET browser_mode = 'headless' WHERE browser_mode IS NULL")
 
 
 def _migrate_stage5_burst_columns(conn: sqlite3.Connection) -> None:
@@ -294,21 +295,32 @@ def close_incident(
     conn.commit()
 
 
-def get_last_check(conn: sqlite3.Connection) -> dict | None:
-    row = conn.execute("SELECT * FROM checks ORDER BY id DESC LIMIT 1").fetchone()
-    return dict(row) if row else None
-
-
 def get_last_check_ts(conn: sqlite3.Connection) -> str | None:
     row = conn.execute("SELECT ts FROM checks ORDER BY id DESC LIMIT 1").fetchone()
     return row["ts"] if row else None
 
 
 def uptime_pct(conn: sqlite3.Connection, since_ts: str) -> float | None:
-    row = conn.execute("SELECT AVG(ok) a, COUNT(*) c FROM checks WHERE ts >= ?", (since_ts,)).fetchone()
+    """Share of cycles in the window whose unified platform verdict was UP.
+
+    Reads `cycles`, not `checks`. Averaging checks.ok (as this did before Stage R) counted
+    every probe as an equal sample, so one bad minute that triggered a 4-probe confirmation
+    burst contributed four failing samples against roughly one passing sample per healthy
+    minute -- it reported uptime several times worse than reality during exactly the
+    incidents an operator would be scrutinizing, and it mixed both tracks' probes into one
+    number. One cycle = one minute = one verdict is the honest denominator.
+
+    Returns None when the window holds no cycles at all: Stage R's migration is additive
+    with no backfill, so a window predating the cycles table reports "n/a" rather than a
+    number computed from a different denominator."""
+    row = conn.execute(
+        "SELECT COUNT(*) c, SUM(CASE WHEN verdict = 'UP' THEN 1 ELSE 0 END) up "
+        "FROM cycles WHERE ts >= ?",
+        (since_ts,),
+    ).fetchone()
     if row["c"] == 0:
         return None
-    return round(row["a"] * 100, 2)
+    return round(row["up"] * 100.0 / row["c"], 2)
 
 
 def get_open_incident(conn: sqlite3.Connection, track: str = "main") -> dict | None:
@@ -339,23 +351,6 @@ def _range_clause(ts_from: str | None, ts_to: str | None) -> tuple[str, list]:
         params.append(ts_to)
     clause = ("WHERE " + " AND ".join(where)) if where else ""
     return clause, params
-
-
-def query_checks(
-    conn: sqlite3.Connection,
-    ts_from: str | None,
-    ts_to: str | None,
-    page: int,
-    page_size: int,
-) -> tuple[list[dict], int]:
-    clause, params = _range_clause(ts_from, ts_to)
-    total = conn.execute(f"SELECT COUNT(*) c FROM checks {clause}", params).fetchone()["c"]
-    offset = (page - 1) * page_size
-    rows = conn.execute(
-        f"SELECT * FROM checks {clause} ORDER BY id DESC LIMIT ? OFFSET ?",
-        params + [page_size, offset],
-    ).fetchall()
-    return [dict(r) for r in rows], total
 
 
 def export_checks(conn: sqlite3.Connection, ts_from: str | None, ts_to: str | None) -> list[dict]:

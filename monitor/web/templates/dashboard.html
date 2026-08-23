@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monitor Lite</title>
+<link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+  <header class="masthead">
+    <h1 class="brand"><img class="brand-lockup" src="/static/logo.svg" alt="Teachers Federal Credit Union"></h1>
+    <p class="masthead-title">Online Banking Monitor <span class="lite">Lite</span></p>
+    <p id="target-url" class="target-url"></p>
+  </header>
+
+  <div id="banner" class="banner">
+    <span class="banner-label">Current Status</span>
+    <span class="banner-value" id="banner-value">Checking…</span>
+    <span class="banner-code" id="banner-code"></span>
+    <span class="banner-detail" id="banner-detail"></span>
+  </div>
+
+  <h2>Uptime</h2>
+  <div class="uptime" id="uptime"></div>
+
+  <h2>Incidents</h2>
+  <table id="incidents-table">
+    <thead><tr><th>Track</th><th>Layer</th><th>Started</th><th>Ended</th><th>Duration</th><th>Probes</th><th>Screenshot</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>Cycle Log <span class="hint">(one row per minute -- click a row to see its probes)</span></h2>
+  <div class="controls">
+    <label>From <input type="datetime-local" id="from"></label>
+    <label>To <input type="datetime-local" id="to"></label>
+    <button id="filter-btn" type="button">Filter</button>
+    <a class="button" id="csv-link" href="/api/export?table=all">Download Logs</a>
+  </div>
+  <table id="history-table">
+    <thead><tr><th>Timestamp (Eastern)</th><th>Pulse</th><th>Render</th><th>Authed</th><th>Verdict</th><th>Session</th><th>Burst</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <div class="controls">
+    <button id="prev-btn" type="button">Prev</button>
+    <span id="page-label"></span>
+    <button id="next-btn" type="button">Next</button>
+  </div>
+
+<script src="/static/dashboard.js"></script>
+</body>
+</html>
