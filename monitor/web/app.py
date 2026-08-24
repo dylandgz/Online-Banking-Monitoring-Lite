@@ -8,6 +8,7 @@ this file. Nothing here builds HTML.
 import csv
 import io
 import secrets
+import sqlite3
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,7 +22,14 @@ from monitor import db
 from monitor.timeutil import to_eastern
 from monitor.verdict import layer_wording, severity, unified_verdict
 
-app = FastAPI()
+# [v3.9 / Stage H P1] docs_url/redoc_url/openapi_url disabled. FastAPI's defaults served
+# /docs, /redoc and /openapi.json with NO dependencies attached -- verified live returning
+# 200 to an unauthenticated caller while the real API routes correctly returned 401. That
+# contradicted this module's own docstring ("basic auth on everything but /healthz") and
+# handed anyone who could reach the port the full route map. uvicorn binds 0.0.0.0, so on
+# a shared network that is every colleague; Stage 7 puts it behind Tailscale, but defence
+# in depth belongs here, not only in the network topology.
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 security = HTTPBasic()
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -50,8 +58,25 @@ _STATIC_FILES.update({path.name: "font/woff2" for path in _STATIC_DIR.glob("*.wo
 
 
 def require_auth(credentials: HTTPBasicCredentials = Depends(security)) -> None:
-    user_ok = secrets.compare_digest(credentials.username, config.DASHBOARD_USER or "")
-    pass_ok = secrets.compare_digest(credentials.password, config.DASHBOARD_PASSWORD or "")
+    """Constant-time basic auth, failing CLOSED when the credentials aren't configured.
+
+    [v3.9 / Stage H P1] The `or ""` fallbacks below are load-bearing for the comparison to
+    be constant-time, but on their own they meant unset credentials compared as
+    compare_digest("", "") -> True, so `curl -u ":"` authenticated. config.validate_core()
+    requires both values and main() calls it, so `python -m monitor.main` was never
+    exposed -- but `uvicorn monitor.web:app` is a natural thing for an operator to type and
+    never touches validate_core, which is exactly the path where a dashboard ends up
+    accidentally public. An unconfigured password must deny everyone, not admit everyone.
+
+    Both comparisons still run before the `and` so neither the username nor the password
+    short-circuits, keeping the timing signal free of a username oracle."""
+    if not (config.DASHBOARD_USER and config.DASHBOARD_PASSWORD):
+        raise HTTPException(
+            status_code=503,
+            detail="Dashboard credentials are not configured (DASHBOARD_USER/DASHBOARD_PASSWORD).",
+        )
+    user_ok = secrets.compare_digest(credentials.username, config.DASHBOARD_USER)
+    pass_ok = secrets.compare_digest(credentials.password, config.DASHBOARD_PASSWORD)
     if not (user_ok and pass_ok):
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
 
@@ -69,6 +94,19 @@ def healthz():
     conn = db.get_connection(config.DB_PATH)
     try:
         last_ts = db.get_last_check_ts(conn)
+    except sqlite3.Error as exc:
+        # [v3.9 / Stage H P2] 503, not an unhandled 500. get_connection CREATES the file
+        # if absent but only cycle_scheduler ever calls init_db, so a web process pointed
+        # at a fresh or wrong DB_PATH hits an empty database and every query raises
+        # "no such table: checks". This endpoint exists to be polled by systemd and by
+        # Tailscale-side monitoring, and "unhealthy" is a meaningful answer to them while
+        # a 500 traceback is not. Deliberately does NOT call init_db: the schema owner is
+        # the monitor process, and having a health probe silently create tables would hide
+        # exactly the misconfiguration it is reporting.
+        return JSONResponse(
+            {"status": "unhealthy", "reason": f"database not readable: {type(exc).__name__}"},
+            status_code=503,
+        )
     finally:
         conn.close()
 
@@ -214,29 +252,76 @@ def api_export(
     different schemas and different grains (one row per minute vs. one row per probe), and
     Rule 6 requires each export to stay row-for-row faithful to its table. A zip keeps both
     intact and keeps them reconcilable against each other, which a flattened join would
-    destroy."""
+    destroy.
+
+    [v3.9 / Stage H P1] Both paths are now memory-bounded -- see db.iter_export for the
+    measurements that motivated it (715-736MB peak and ~35s GIL-bound at one year of data,
+    in the same process as the monitor). Single-table exports stream straight off a live
+    cursor at flat memory. The zip cannot stream (the format needs to seek back and write
+    a central directory), so it is instead written member-by-member from the same cursors
+    -- which keeps the *CSV text* out of memory -- and guarded by a row cap, since the
+    compressed archive itself still has to be buffered."""
+    if table == "all":
+        return _export_zip(from_, to)
+
+    # Streaming: the connection must outlive this function, so the generator owns it and
+    # closes it in its own finally. StreamingResponse closes the generator on client
+    # disconnect too, so an abandoned download doesn't leak the connection.
+    conn = db.get_connection(config.DB_PATH)
+
+    def stream():
+        try:
+            yield from _csv_lines(table, db.iter_export(conn, table, from_, to))
+        finally:
+            conn.close()
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={table}.csv"},
+    )
+
+
+# Ceiling on a single table=all zip. 200k cycles is ~139 days at one row/minute, and the
+# uncompressed CSV behind it is on the order of tens of MB -- comfortably servable from a
+# 4GB VM, while refusing the unbounded "export everything, forever" request that the
+# dashboard's default (empty filters) used to send. Not a silent truncation: exceeding it
+# is a 413 naming the count and telling the operator to narrow the range, because quietly
+# returning a partial audit export would be worse than refusing (Rule 6).
+_MAX_ZIP_ROWS_PER_TABLE = 200_000
+
+
+def _export_zip(from_: str | None, to: str | None) -> Response:
     conn = db.get_connection(config.DB_PATH)
     try:
-        cycles = db.export_cycles(conn, from_, to) if table in ("cycles", "all") else None
-        checks = db.export_checks(conn, from_, to) if table in ("checks", "all") else None
+        for table in ("cycles", "checks"):
+            count = db.count_export_rows(conn, table, from_, to)
+            if count > _MAX_ZIP_ROWS_PER_TABLE:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"{table} has {count:,} rows in this range, over the "
+                        f"{_MAX_ZIP_ROWS_PER_TABLE:,}-row export limit. Narrow the date "
+                        f"filter, or fetch one table at a time via "
+                        f"/api/export?table={table} (that path streams and is unlimited)."
+                    ),
+                )
+
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+            for table in ("cycles", "checks"):
+                # bundle.open(...,'w') writes incrementally, so the member's full CSV text
+                # never exists as one string the way "".join(...) forced it to.
+                with bundle.open(f"{table}.csv", "w") as member:
+                    for chunk in _csv_lines(table, db.iter_export(conn, table, from_, to)):
+                        member.write(chunk.encode("utf-8"))
     finally:
         conn.close()
 
-    if table == "all":
-        archive = io.BytesIO()
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
-            bundle.writestr("cycles.csv", "".join(_csv_lines("cycles", cycles)))
-            bundle.writestr("checks.csv", "".join(_csv_lines("checks", checks)))
-        return Response(
-            archive.getvalue(),
-            media_type="application/zip",
-            headers={"Content-Disposition": "attachment; filename=monitor-logs.zip"},
-        )
-
-    return StreamingResponse(
-        _csv_lines(table, cycles if table == "cycles" else checks),
-        media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={table}.csv"},
+    return Response(
+        archive.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=monitor-logs.zip"},
     )
 
 
