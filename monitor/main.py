@@ -6,6 +6,7 @@ CLAUDE.md's v3.8 amendment and Rule 16 for the reasoning."""
 import asyncio
 import itertools
 import random
+import traceback
 import uuid
 from datetime import datetime, timezone
 
@@ -92,6 +93,23 @@ async def _process_probe(
     return new_state
 
 
+async def _sleep_until_offset(start: datetime, delay_s: float) -> None:
+    """Sleeps until `delay_s` (+/- jitter) has elapsed since `start`, not simply
+    `asyncio.sleep(delay_s)` -- each prior loop iteration already spent real time on
+    _process_probe's DB writes and alert dispatch, so a raw per-iteration sleep would
+    accumulate drift and push later offsets later with every probe. Measuring elapsed
+    time since the burst's actual start and sleeping only the remainder keeps every
+    probe close to its intended BURST_DELAYS_S offset regardless of how long earlier
+    iterations took. Shared by both tracks' burst loops (main and auth) since the timing
+    math is identical; only the probe each loop runs afterward differs."""
+    jitter = random.uniform(-config.BURST_JITTER_S, config.BURST_JITTER_S)
+    target_offset = max(0.0, delay_s + jitter)
+    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+    sleep_s = max(0.0, target_offset - elapsed)
+    if sleep_s:
+        await asyncio.sleep(sleep_s)
+
+
 async def _run_burst_reprobes(
     conn, channels, state: MonitorState, burst_start_ts: str, cycle_id: str,
 ) -> tuple[MonitorState, "check.CheckResult", str]:
@@ -113,12 +131,7 @@ async def _run_burst_reprobes(
         if state.status != "UP" or state.burst_started_ts != burst_start_ts:
             break  # already resolved: DOWN fired, or a pass cleared the burst
 
-        jitter = random.uniform(-config.BURST_JITTER_S, config.BURST_JITTER_S)
-        target_offset = max(0.0, delay_s + jitter)
-        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-        sleep_s = max(0.0, target_offset - elapsed)
-        if sleep_s:
-            await asyncio.sleep(sleep_s)
+        await _sleep_until_offset(start, delay_s)
 
         if kind == "render":
             result = await check.render_only_probe(
@@ -136,34 +149,62 @@ async def _run_burst_reprobes(
 
 async def _run_full_login(conn, *, should_logout: bool) -> "check.CheckResult":
     """One real login attempt (credentials + TOTP), saving the refreshed session on
-    success. Always logged to login_events -- this is the real, budgeted action."""
-    result = await journey.run_journey(
-        login_url=config.LOGIN_URL,
-        login_user=config.LOGIN_USER,
-        login_password=config.LOGIN_PASSWORD,
-        totp_secret=config.TOTP_SECRET,
-        error_banner_text=config.ERROR_BANNER_TEXT,
-        authed_text=config.AUTHED_REQUIRED_TEXT,
-        authed_role=config.AUTHED_REQUIRED_ROLE,
-        authed_name=config.AUTHED_REQUIRED_NAME,
-        browser_channel=config.BROWSER_CHANNEL,
-        browser_timeout_ms=config.BROWSER_TIMEOUT_MS,
-        challenge_timeout_ms=config.CHALLENGE_TIMEOUT_MS,
-        artifacts_dir=config.ARTIFACTS_DIR,
-        mask_patterns=config.MASK_TEXT,
-        masking_enabled=config.MASKING_ENABLED,
-        session_state_path=config.SESSION_STATE_PATH,
-        # A fresh login must NOT be seeded with the old (possibly stale) session -- found
-        # live to cause the bank's server to redirect to the marketing homepage instead
-        # of the login form (see journey.run_journey's docstring, fix 2026-08-11).
-        seed_from_existing_session=False,
-        should_logout=should_logout,
-    )
-    db.append_login_event(
-        conn, ts=_now_iso(), ok=result.ok, latency_ms=result.latency_ms,
-        reason=result.fail_reason, http_status=result.http_status, session_reused=False,
-    )
-    return result
+    success. Always logged to login_events -- this is the real, budgeted action.
+
+    "Always" is enforced by try/finally, and that matters more than it looks. Rule 11's
+    login budget is a HARD limit, but _login_budget_allows() derives it entirely from the
+    login_events table -- both the daily count and the LOGIN_INTERVAL_S gap. Recording the
+    attempt only on the success path therefore made the budget unenforceable in exactly
+    the case it exists for: if run_journey raised (before the guards added alongside this,
+    any unhandled Playwright error mid-journey did), no row was written, the ledger showed
+    no attempt, and because the crash also happened before save_session_state the session
+    never became fresh either -- so the next cycle, 60s later, judged the budget untouched
+    and logged in again. Unbounded credentialed attempts against a real bank account,
+    invisible in the audit trail. The ledger has to be written on the failure path
+    precisely because that is the path that can loop."""
+    result = None
+    try:
+        result = await journey.run_journey(
+            login_url=config.LOGIN_URL,
+            login_user=config.LOGIN_USER,
+            login_password=config.LOGIN_PASSWORD,
+            totp_secret=config.TOTP_SECRET,
+            error_banner_text=config.ERROR_BANNER_TEXT,
+            authed_text=config.AUTHED_REQUIRED_TEXT,
+            authed_role=config.AUTHED_REQUIRED_ROLE,
+            authed_name=config.AUTHED_REQUIRED_NAME,
+            browser_channel=config.BROWSER_CHANNEL,
+            browser_timeout_ms=config.BROWSER_TIMEOUT_MS,
+            challenge_timeout_ms=config.CHALLENGE_TIMEOUT_MS,
+            artifacts_dir=config.ARTIFACTS_DIR,
+            mask_patterns=config.MASK_TEXT,
+            masking_enabled=config.MASKING_ENABLED,
+            session_state_path=config.SESSION_STATE_PATH,
+            # A fresh login must NOT be seeded with the old (possibly stale) session -- found
+            # live to cause the bank's server to redirect to the marketing homepage instead
+            # of the login form (see journey.run_journey's docstring, fix 2026-08-11).
+            seed_from_existing_session=False,
+            should_logout=should_logout,
+        )
+        return result
+    finally:
+        # Nested try: a failure to WRITE the ledger must not mask whatever the login
+        # actually did (and must not replace the original exception on the failure path).
+        try:
+            db.append_login_event(
+                conn, ts=_now_iso(),
+                ok=bool(result and result.ok),
+                latency_ms=result.latency_ms if result else 0.0,
+                # No result at all means run_journey raised rather than reporting -- with
+                # the journey-level guards in place that should now be unreachable, so
+                # record it as its own distinct reason rather than a plausible-looking
+                # browser fail_reason. It never reaches classify()/apply_check from here.
+                reason=result.fail_reason if result else "internal_error",
+                http_status=result.http_status if result else None,
+                session_reused=False,
+            )
+        except Exception as exc:  # noqa: BLE001 -- last-resort audit write, never fatal
+            print(f"[login] CRITICAL: could not record login attempt in login_events: {exc!r}", flush=True)
 
 
 def _login_budget_allows(conn) -> bool:
@@ -185,7 +226,9 @@ def _session_expired_result() -> "check.CheckResult":
     return check.CheckResult(ok=False, http_status=None, latency_ms=0.0, fail_reason="session_expired", layer="authed")
 
 
-async def _run_auth_probe(conn, main_down: bool, login_budget_state: dict) -> "check.CheckResult":
+async def _run_auth_probe(
+    conn, main_down: bool, login_budget_state: dict
+) -> tuple["check.CheckResult", bool]:
     """One auth-track probe attempt for this cycle. Cheap session-reuse check first
     (zero logins). session_expired (or no session at all) triggers exactly one budgeted
     recovery login per cycle (Rule 11) -- UNLESS the main track's precursor is already
@@ -193,7 +236,17 @@ async def _run_auth_probe(conn, main_down: bool, login_budget_state: dict) -> "c
     is spent chasing a possibly-down site, and the session_expired result is reported
     as-is (harmless either way -- Rule 17 makes session_expired inert to scoring on any
     track). Any *other* cheap-check failure (e.g. nav_error) is real evidence and is
-    returned untouched -- no login involved, it feeds the burst directly."""
+    returned untouched -- no login involved, it feeds the burst directly.
+
+    Returns (result, probed): `probed` is False when nothing actually contacted the
+    platform this cycle -- no usable session AND the recovery login was either paused
+    (Rule 16) or refused by the budget (Rule 11). The result in that case is a synthetic
+    session_expired, which is inert by Rule 17, so it is honest as a `checks` row (it
+    records that we wanted to look and could not) but it is NOT an observation of the
+    platform. [v3.9 / Stage H P2] Callers use `probed` to decide `cycles.authed_ok`:
+    writing False there conflated "the authed layer failed" with "we never looked",
+    contradicting Rule 16's own wording that NULL means the track didn't run, and painting
+    the dashboard's authed badge red on a completely healthy platform."""
     result = None
     if session.is_session_fresh(config.SESSION_STATE_PATH, config.SESSION_MAX_AGE_S):
         result = await journey.run_authed_check(
@@ -211,15 +264,21 @@ async def _run_auth_probe(conn, main_down: bool, login_budget_state: dict) -> "c
             masking_enabled=config.MASKING_ENABLED,
         )
 
+    # The cheap check ran and produced a real observation if we got a result at all.
+    probed = result is not None
     needs_recovery = result is None or result.fail_reason == "session_expired"
 
     if needs_recovery and main_down:
-        return result if result is not None else _session_expired_result()
+        # Rule 16: recovery logins are paused while the precursor is DOWN. If the cheap
+        # check itself ran and said session_expired, that IS a real observation (probed
+        # stays True); if there was no session to check, nothing was observed.
+        return (result, probed) if result is not None else (_session_expired_result(), False)
 
     if needs_recovery and not login_budget_state["used"]:
         if _login_budget_allows(conn):
             login_budget_state["used"] = True
             result = await _run_full_login(conn, should_logout=False)
+            probed = True  # a real login attempt is very much an observation
         elif result is None:
             result = _session_expired_result()
         # else: budget says wait -- keep the cheap check's own session_expired result.
@@ -228,7 +287,7 @@ async def _run_auth_probe(conn, main_down: bool, login_budget_state: dict) -> "c
         # plainly rather than silently doing nothing (Rule 6: every probe writes a row).
         result = _session_expired_result()
 
-    return result
+    return result, probed
 
 
 async def _run_auth_burst_reprobes(
@@ -248,14 +307,11 @@ async def _run_auth_burst_reprobes(
         if state.status != "UP" or state.burst_started_ts != burst_start_ts:
             break  # already resolved: DOWN fired, or a pass cleared the burst
 
-        jitter = random.uniform(-config.BURST_JITTER_S, config.BURST_JITTER_S)
-        target_offset = max(0.0, delay_s + jitter)
-        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-        sleep_s = max(0.0, target_offset - elapsed)
-        if sleep_s:
-            await asyncio.sleep(sleep_s)
+        await _sleep_until_offset(start, delay_s)
 
-        result = await _run_auth_probe(conn, main_down, login_budget_state)
+        # The burst only needs the result; whether it counted as a real observation
+        # matters to the cycles row, which the initiating probe already decided.
+        result, _probed = await _run_auth_probe(conn, main_down, login_budget_state)
         last_result = result
         state = await _process_probe(
             conn, channels, state, result, _now_iso(), burst_id,
@@ -271,7 +327,13 @@ def _cycle_fail_info(
     verdict: str, main_state: MonitorState, last_main_result, auth_state: MonitorState | None, last_auth_result,
 ) -> tuple[str | None, str | None]:
     """Rule 4: name the layer responsible for a non-UP verdict, with exact wording owned
-    by the email/dashboard layer -- this just picks which track's evidence explains it."""
+    by the email/dashboard layer -- this just picks which track's evidence explains it.
+
+    On an equal-severity tie (e.g. both tracks DOWN) this favors main -- it's the
+    precursor, so its evidence is what an operator should look at first. Same tie-break,
+    same rationale, as monitor/web/app.py's dashboard-badge logic; kept in both places
+    since each derives fail_layer/fail_reason from different inputs (this one also needs
+    the last CheckResult as a fallback when a track has no fail_reasons of its own yet)."""
     if verdict == "UP":
         return None, None
     if main_state.status != "UP" and severity(main_state.status) >= severity(auth_state.status if auth_state else "UP"):
@@ -282,7 +344,7 @@ def _cycle_fail_info(
     return "authed", fail_reason
 
 
-async def run_cycle(conn, channels, auth_enabled: bool) -> None:
+async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = None) -> None:
     """[v3.8 / Stage R] One unified cycle: the main track (pulse/render, with its
     confirmation burst) always runs; the auth track (cheap authed check, with its own
     burst and a budgeted recovery-login fallback) runs too, UNLESS its own status is
@@ -290,8 +352,14 @@ async def run_cycle(conn, channels, auth_enabled: bool) -> None:
     all. Both tracks' results are combined into one `cycles` row (Rule 16's unified
     verdict). A burst on either track extends this cycle's wall-clock time rather than
     running detached -- deliberate, per the human's call: reliable checks over a strict
-    60s cadence."""
-    cycle_id = str(uuid.uuid4())
+    60s cadence.
+
+    cycle_id is normally supplied by guarded_cycle so that its failure handler can write
+    the cycles row under the SAME id this cycle already tagged its checks rows with -- a
+    generated-here id would leave those probe rows orphaned (a cycle_id with no cycles
+    row), invisible to /api/history and the dashboard drill-down, which read cycles. It
+    still defaults to generating one so run_cycle stays callable on its own."""
+    cycle_id = cycle_id or str(uuid.uuid4())
     ts = _now_iso()
 
     # --- main track: pulse + render, with its confirmation burst ---
@@ -338,7 +406,7 @@ async def run_cycle(conn, channels, auth_enabled: bool) -> None:
             prior_auth_burst_ts = prev_auth_state.burst_started_ts if prev_auth_state.status == "UP" else None
             login_budget_state = {"used": False}
 
-            auth_result = await _run_auth_probe(conn, main_down, login_budget_state)
+            auth_result, auth_probed = await _run_auth_probe(conn, main_down, login_budget_state)
             ts_auth = _now_iso()
             new_auth_state = await _process_probe(
                 conn, channels, prev_auth_state, auth_result, ts_auth, burst_id=None,
@@ -356,8 +424,10 @@ async def run_cycle(conn, channels, auth_enabled: bool) -> None:
                 if burst_last_auth_result is not None:
                     last_auth_result = burst_last_auth_result
 
-            authed_ok = auth_result.ok
-            authed_latency_ms = auth_result.latency_ms
+            # [v3.9 / Stage H P2] NULL when nothing actually contacted the platform this
+            # cycle, per Rule 16 -- see _run_auth_probe's `probed` return value.
+            authed_ok = auth_result.ok if auth_probed else None
+            authed_latency_ms = auth_result.latency_ms if auth_probed else None
             login_used_this_cycle = login_budget_state["used"]
 
     # --- unified verdict + cycles row (Rule 16) ---
@@ -371,6 +441,10 @@ async def run_cycle(conn, channels, auth_enabled: bool) -> None:
     # the other track's burst is never lost, every probe in it is still tagged in `checks`
     # under this cycle_id. Until now this argument was simply never passed, so the column
     # was NULL on every row ever written and the dashboard's Burst badge could not fire.
+    # Precedence, spelled out: authed-caused verdict + an auth burst happened -> auth_burst_id;
+    # otherwise prefer main_burst_id if a main burst happened; otherwise fall back to
+    # auth_burst_id (covers a precursor-caused verdict where only the auth track bursted --
+    # e.g. an absorbed auth failure per Rule 16); otherwise None (no burst ran either track).
     burst_id = auth_burst_id if fail_layer == "authed" and auth_burst_id else (main_burst_id or auth_burst_id)
 
     db.append_cycle(
@@ -397,8 +471,43 @@ async def run_cycle(conn, channels, auth_enabled: bool) -> None:
 
 
 async def guarded_cycle(conn, channels, lock: asyncio.Lock, auth_enabled: bool) -> None:
+    """Overlap guard, plus the self-health net that keeps a crashed cycle from vanishing.
+
+    Why the net exists: cycle_scheduler launches this with asyncio.create_task and never
+    awaits it, so before this handler an unexpected exception anywhere in run_cycle
+    (unmapped browser error, `database is locked` from a concurrent CSV export, corrupt
+    session file) surfaced only as asyncio's "Task exception was never retrieved" on
+    stderr. The minute then had no checks row, no cycles row, no state advance and no
+    alert -- for a monitor, silently missing a minute during an outage is the worst
+    possible failure, since a quiet dashboard reads as "the bank is fine".
+
+    The recorded verdict is DEGRADED, deliberately: Rule 13 guarantees DEGRADED never
+    pages, and a bug in the monitor is not evidence about the bank -- inventing a DOWN
+    here would manufacture exactly the false positive this project ranks above all other
+    concerns. Note this row is written directly, NOT through apply_check(), so it cannot
+    touch either track's state or contribute to any burst's confidence or probe floor.
+
+    Known consequence, worth stating: uptime_pct counts only verdict='UP', so DEGRADED
+    minutes count against uptime. That is arguably right -- the platform's state during a
+    blind minute is genuinely unknown, so it isn't UP -- but it is the same denominator
+    question as the latched-CONFIG_ERROR issue and belongs in that fix, not this one."""
     async with lock:
-        await run_cycle(conn, channels, auth_enabled)
+        cycle_id = str(uuid.uuid4())
+        try:
+            await run_cycle(conn, channels, auth_enabled, cycle_id=cycle_id)
+        except Exception:  # noqa: BLE001 -- deliberate catch-all; see docstring
+            traceback.print_exc()
+            try:
+                db.append_cycle(
+                    conn, cycle_id=cycle_id, ts=_now_iso(),
+                    pulse_ok=None, render_ok=None, authed_ok=None,
+                    verdict="DEGRADED", fail_layer="monitor", fail_reason="internal_error",
+                )
+                print(f"[{_now_iso()}] [cycle {cycle_id[:8]}] verdict=DEGRADED "
+                      f"(monitor: internal_error) -- cycle failed, see traceback above", flush=True)
+            except Exception as exc:  # noqa: BLE001 -- the DB may be the thing that broke
+                print(f"[{_now_iso()}] CRITICAL: cycle failed AND its DEGRADED marker row "
+                      f"could not be written: {exc!r}", flush=True)
 
 
 async def cycle_scheduler() -> None:
