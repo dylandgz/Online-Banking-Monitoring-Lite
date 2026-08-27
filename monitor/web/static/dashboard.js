@@ -94,6 +94,31 @@ function layerBadge(ok) {
   return ok ? `<span class="layer-badge ok">OK</span>` : `<span class="layer-badge fail">FAIL</span>`;
 }
 
+// The Session column has to say four different things, because cycles.session_reused is
+// written as bool(authed_ok and not login_used_this_cycle) -- so a bare `false` collapses
+// "a budgeted login did the work", "the authed check failed", and "the track never looked"
+// into one empty cell. authed_ok already carries that distinction: per Rule 16 it is a real
+// True/False whenever the authed check actually contacted the platform, and NULL only when
+// nothing looked at all (track unconfigured, track in CONFIG_ERROR, or no usable session and
+// the recovery login was paused or refused by the budget).
+//
+// Note the comparisons: /api/history serves these straight out of SQLite, so they arrive as
+// 1/0/null integers, NOT JS booleans. `authed_ok === false` would never match.
+//
+// The failed-check case deliberately reports "n/a" rather than "new login": whether a login
+// was actually spent on a failing cycle is not recorded anywhere on the cycles row, and
+// guessing would put a claim in the audit view that the data does not support.
+function sessionBadge(r) {
+  if (r.session_reused) return `<span class="badge-reused">reused</span>`;
+  if (r.authed_ok === null || r.authed_ok === undefined) {
+    return `<span class="badge-muted" title="Auth track did not run this cycle">not checked</span>`;
+  }
+  if (!r.authed_ok) {
+    return `<span class="badge-muted" title="Authed check failed -- whether a login was spent is not recorded on the cycle row">n/a</span>`;
+  }
+  return `<span class="badge-login">new login</span>`;
+}
+
 async function toggleProbes(cycleId, row) {
   const existing = document.getElementById("probes-" + cycleId);
   if (existing) { existing.remove(); return; }
@@ -137,7 +162,7 @@ async function loadHistory() {
       <td>${layerBadge(r.render_ok)}</td>
       <td>${layerBadge(r.authed_ok)}</td>
       <td class="${verdictClass(r.verdict)}">${r.verdict}</td>
-      <td>${r.session_reused ? `<span class="badge-reused">reused</span>` : "-"}</td>
+      <td>${sessionBadge(r)}</td>
       <td>${r.burst_id ? `<span class="badge-burst">burst</span><span class="burst-id">${r.burst_id.slice(0, 8)}</span>` : "-"}</td>
     `;
     tr.onclick = () => toggleProbes(r.cycle_id, tr);
