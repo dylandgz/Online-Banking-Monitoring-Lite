@@ -45,30 +45,14 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _check_required_config() -> None:
-    """Same required fields as config.validate_stage6(), minus TOTP_SECRET -- this
-    script can substitute manual entry for it (see the module docstring)."""
-    missing = []
-    if not config.LOGIN_URL:
-        missing.append("LOGIN_URL")
-    if not config.LOGIN_USER:
-        missing.append("LOGIN_USER")
-    if not config.LOGIN_PASSWORD:
-        missing.append("LOGIN_PASSWORD")
-    if not config.ERROR_BANNER_TEXT:
-        missing.append("ERROR_BANNER_TEXT")
-    if not config.AUTHED_REQUIRED_TEXT and not (config.AUTHED_REQUIRED_ROLE and config.AUTHED_REQUIRED_NAME):
-        missing.append("AUTHED_REQUIRED_TEXT (or AUTHED_REQUIRED_ROLE + AUTHED_REQUIRED_NAME)")
-    if missing:
-        raise SystemExit(
-            "Missing required .env values for the sign-in journey: " + ", ".join(missing) +
-            "\nCopy .env.example to .env and fill these in."
-        )
-
-
 async def _manual_mfa_pause() -> None:
     print("No TOTP_SECRET configured -- manual MFA mode. The script will not click "
           "'Enter code' or touch any code field.")
+    # input() blocks the whole interpreter thread waiting on stdin; called directly inside
+    # an async function it would freeze the event loop (and, with it, the browser's own
+    # background tasks) until Enter is pressed. asyncio.to_thread runs the blocking read on
+    # a worker thread instead, so the event loop -- and the visible browser page the human
+    # is completing MFA in -- stays responsive while this coroutine waits.
     await asyncio.to_thread(
         input, "Complete MFA yourself in the browser window (any factor -- phone call, "
                "TOTP app, etc.), then press Enter here to continue: "
@@ -76,7 +60,7 @@ async def _manual_mfa_pause() -> None:
 
 
 async def main() -> None:
-    _check_required_config()
+    config.validate_stage6(require_totp=False, require_authed_url=False)
     manual_mfa = not config.TOTP_SECRET
     keep_session = "--keep-session" in sys.argv
 

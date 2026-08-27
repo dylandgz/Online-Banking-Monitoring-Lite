@@ -125,54 +125,68 @@ AUTH_DOWN_CONFIDENCE = int(os.getenv("AUTH_DOWN_CONFIDENCE", "4"))
 AUTH_MIN_FAILED_PROBES = int(os.getenv("AUTH_MIN_FAILED_PROBES", "3"))
 
 
-def validate_stage6():
+def _collect_missing(*checks: tuple[bool, str]) -> list[str]:
+    """Shared shape behind every "required .env values" check below: each check is
+    (condition_is_missing, label); returns the labels whose condition is True. Exists so
+    validate_stage6()'s field list can be reused as-is by the manual drill runner (which
+    needs the identical set minus TOTP_SECRET) instead of hand-copying it -- see
+    validate_stage6's require_totp parameter."""
+    return [label for is_missing, label in checks if is_missing]
+
+
+def _exit_if_missing(missing: list[str], context: str = "") -> None:
+    if not missing:
+        return
+    suffix = f" {context}" if context else ""
+    sys.exit(
+        f"Missing required .env values{suffix}: " + ", ".join(missing) +
+        "\nCopy .env.example to .env and fill these in."
+    )
+
+
+def validate_stage6(require_totp: bool = True, require_authed_url: bool = True) -> list[str]:
     """Called at cycle_scheduler() startup to decide whether the auth track runs at all,
-    and by the manual drill runner. TOTP_SECRET is required whenever MFA_ENABLED, UNLESS
-    ALLOW_MFA_UNCONFIGURED is explicitly set (testing-only escape hatch, off by default --
-    see its definition above): the auth track then still starts and runs session-reuse
-    checks normally, but any recovery login it needs will cleanly report mfa_failed
-    instead of completing (journey.py's submit_totp guard)."""
-    missing = []
-    if not LOGIN_URL:
-        missing.append("LOGIN_URL")
-    if not AUTHED_URL:
-        missing.append("AUTHED_URL")
-    if not LOGIN_USER:
-        missing.append("LOGIN_USER")
-    if not LOGIN_PASSWORD:
-        missing.append("LOGIN_PASSWORD")
-    if not ERROR_BANNER_TEXT:
-        missing.append("ERROR_BANNER_TEXT")
-    if not AUTHED_REQUIRED_TEXT and not (AUTHED_REQUIRED_ROLE and AUTHED_REQUIRED_NAME):
-        missing.append("AUTHED_REQUIRED_TEXT (or AUTHED_REQUIRED_ROLE + AUTHED_REQUIRED_NAME)")
-    if MFA_ENABLED and not TOTP_SECRET and not ALLOW_MFA_UNCONFIGURED:
+    and by the manual drill runner (scripts/run_signin_drill.py) with both flags off: that
+    script drives monitor.journey.run_journey() directly, which asserts the authed content
+    on the page reached via LOGIN_URL's own post-login redirect and never touches AUTHED_URL
+    at all -- only the cheap session-reuse check (run_authed_check) navigates there. It also
+    substitutes a manual-MFA pause for a captured TOTP_SECRET (see that script's docstring).
+
+    TOTP_SECRET is otherwise required whenever MFA_ENABLED, UNLESS ALLOW_MFA_UNCONFIGURED is
+    explicitly set (testing-only escape hatch, off by default -- see its definition above):
+    the auth track then still starts and runs session-reuse checks normally, but any
+    recovery login it needs will cleanly report mfa_failed instead of completing
+    (journey.py's submit_totp guard).
+
+    Exits the process (via _exit_if_missing) if anything required is missing, and also
+    returns the missing-labels list so a caller could inspect it without exiting -- not
+    currently used that way, but keeps the check itself reusable independent of the exit."""
+    missing = _collect_missing(
+        (not LOGIN_URL, "LOGIN_URL"),
+        (require_authed_url and not AUTHED_URL, "AUTHED_URL"),
+        (not LOGIN_USER, "LOGIN_USER"),
+        (not LOGIN_PASSWORD, "LOGIN_PASSWORD"),
+        (not ERROR_BANNER_TEXT, "ERROR_BANNER_TEXT"),
+        (not AUTHED_REQUIRED_TEXT and not (AUTHED_REQUIRED_ROLE and AUTHED_REQUIRED_NAME),
+         "AUTHED_REQUIRED_TEXT (or AUTHED_REQUIRED_ROLE + AUTHED_REQUIRED_NAME)"),
+    )
+    if require_totp and MFA_ENABLED and not TOTP_SECRET and not ALLOW_MFA_UNCONFIGURED:
         missing.append("TOTP_SECRET (or set ALLOW_MFA_UNCONFIGURED=true for testing)")
 
-    if missing:
-        sys.exit(
-            "Missing required .env values for the sign-in journey: " + ", ".join(missing) +
-            "\nCopy .env.example to .env and fill these in."
-        )
+    _exit_if_missing(missing, "for the sign-in journey")
+    return missing
 
 
-def validate_core():
+def validate_core() -> None:
     """Validates the settings the app needs at startup. Email settings are not
     required here — alert.py logs and skips sending if they're unset, since a
     missing app password shouldn't take the whole monitor down."""
-    missing = []
-    if not TARGET_NAME:
-        missing.append("TARGET_NAME")
-    if not TARGET_URL:
-        missing.append("TARGET_URL")
-    if not REQUIRED_TEXT and not (REQUIRED_ROLE and REQUIRED_NAME):
-        missing.append("REQUIRED_TEXT (or REQUIRED_ROLE + REQUIRED_NAME)")
-    if not DASHBOARD_USER:
-        missing.append("DASHBOARD_USER")
-    if not DASHBOARD_PASSWORD:
-        missing.append("DASHBOARD_PASSWORD")
-
-    if missing:
-        sys.exit(
-            "Missing required .env values: " + ", ".join(missing) +
-            "\nCopy .env.example to .env and fill these in."
-        )
+    missing = _collect_missing(
+        (not TARGET_NAME, "TARGET_NAME"),
+        (not TARGET_URL, "TARGET_URL"),
+        (not REQUIRED_TEXT and not (REQUIRED_ROLE and REQUIRED_NAME),
+         "REQUIRED_TEXT (or REQUIRED_ROLE + REQUIRED_NAME)"),
+        (not DASHBOARD_USER, "DASHBOARD_USER"),
+        (not DASHBOARD_PASSWORD, "DASHBOARD_PASSWORD"),
+    )
+    _exit_if_missing(missing)
