@@ -1,136 +1,335 @@
 # CLAUDE.md — Monitor Lite
 
-> **Amendment v3.9 — 2026-08-24 — SELF-HEALTH.** The monitor is allowed to fail, but never silently. Scoped: adds Rule 18 and the `monitor`/`internal_error` vocabulary; changes no probe, scoring, alerting or schema behavior.
->
-> **Amendment v3.8 — 2026-08-11 — THE REALIGNMENT.** One platform, one verdict.
-> ⚠️ **Merge note for Claude Code:** this file was produced from a copy of CLAUDE.md that predates amendments v3.1–v3.7; their substance has been reconstructed from PROGRESS.md and integrated below. Before adopting this file, diff it against the repo's current CLAUDE.md and preserve any v3.2–v3.5 exception wording (patchright scope, headed-xvfb, retired USER_DATA_DIR note, `.nth()` scope) that is more precise than what's here. Flag discrepancies to the human; do not silently drop text.
+## Purpose
 
-**Amendment history (one line each):** v3 stages/stress-experiment · v3.1 burst floor (`MIN_FAILED_PROBES=3`, `DOWN_CONFIDENCE=4`, 4 probes, 90s window) + Eastern-time presentation · v3.2 patchright approved as scoped Rule-12 exception (Cloudflare, logged clearances) · v3.3 sign-in journey runs headed under xvfb (scoped Rule-14 exception) · v3.4 (retired by v3.7) · v3.5 no `"unknown"` fail_reason; `.nth()` scoped to username/password only · v3.6 auth runs on its own track/scheduler · v3.7 session reuse pulled forward; cheap `run_authed_check()` every 60s; `USER_DATA_DIR` retired · v3.8 the realignment (one platform, one verdict) · **v3.9 this amendment — `MAX_LOGINS_PER_DAY` removed; `LOGIN_INTERVAL_S` is the single login limit, floored at 60s in `config.py`; shipped values `SESSION_MAX_AGE_S=600` / `LOGIN_INTERVAL_S=120`.** v3.8.1 one platform / one verdict / `cycles` table / Rules 16–17 · **v3.9.1 this amendment: Rule 18 self-health net, `internal_error` + `fail_layer='monitor'`, unexpected browser errors mapped onto the taxonomy.**
+A monitor that answers ONE question every 60 seconds: **is the online banking platform up for a customer?**
 
-## What this is
-A monitor that answers ONE question every minute: **is the online banking platform up for a customer?** "Up" is defined as: the authenticated area behind login returns HTTP 200 **and renders the expected content**. The public pulse + login-page render checks are **precursor layers** — the cheap outer evidence of the same single question, not a separate product. Results in SQLite (audit-grade). Email alerts on state transitions only. FastAPI dashboard. Replaces a Selenium tool that false-positived on DOM changes — **low false positives outrank everything, and no alert ever fires on fewer than 3 failed probes (executive commitment).**
+**UP** = the authenticated area behind login returns HTTP 200 **and renders the expected content.**
 
-## What changed in v3.8 (orientation)
-1. **Unified verdict.** The "site check" and "sign-in check" are no longer two products with two verdicts. There is ONE platform status. Precursor failure (pulse/render) can drive DOWN — labeled **"login screen unreachable / not rendering."** Authed-layer failure can drive DOWN — labeled **"online banking behind login not rendering."** Same burst + confidence + floor rules on both paths.
-2. **Internally, the two state tracks (`main`, `auth`) remain** — PROGRESS.md documents the real bug a shared status caused (an auth success falsely recovering a site outage). Unification happens at presentation and alerting: platform status = worst-of(main, auth); one row per minute; layer-labeled incidents; **no double-paging** (see suppression rule, Rule 16).
-3. **The 3-probe floor now applies to the auth track too.** v3.6's `AUTH_MIN_FAILED_PROBES=1` is retired — it violated the "at least 3 checks" commitment. Since v3.7, authed probes are cheap (session reuse, zero credentials, zero logins), so the auth layer bursts like any other layer: re-probe `run_authed_check()` at the burst offsets. `AUTH_MIN_FAILED_PROBES=3`, `AUTH_DOWN_CONFIDENCE=4`.
-4. **`session_expired` is not platform evidence.** A cached-session probe failing with `session_expired` speaks to the session, not the bank. It never scores toward DOWN. It triggers the (single, budgeted) recovery login; the recovery's outcome is the evidence: success → self-healed non-event; `auth_unavailable`/5xx → hard platform evidence; `auth_rejected` → CONFIG. If the session is broken, burst probes each fail fast on the cheap path — that fast-fail IS correct evidence collection, and it still costs zero logins.
-5. **Data-plane / API probes (old Stage 9) are OUT OF SCOPE.** The behind-the-wall check is: 200 + authed content locator renders. Nothing deeper. Old Stage 9 is deleted from the plan; `data`/`api` layers, `data_plane_missing`, `api_*` fail_reasons and env vars are removed from the spec (leave dead constants in code untouched until the next natural refactor; do not build on them).
-6. **One row per minute: the `cycles` table.** Each 60s cycle writes exactly one summary row combining both tracks; probe-level rows in `checks` link to it via `cycle_id`. Dashboard log becomes the cycles view (one line/minute, layer badges), expandable to probe detail. Both tables CSV-exportable.
+The public pulse and login-page render checks are *precursor* evidence for that same question — not a separate product. This replaces a Selenium tool that false-positived on DOM changes, so **low false positives outrank everything else**, and no alert ever fires on fewer than 3 failed probes (executive commitment).
 
-## How we work
-Unchanged: stages in order, acceptance test + human sign-off before the next, explain before building, PROGRESS.md after every session, stop-and-ask for new dependencies/services. LEARNING.md on request (Rule 9).
+Results go to SQLite (audit-grade — every probe writes a row, pass or fail). Email alerts fire on state transitions only. A FastAPI dashboard reads the same data.
 
-## Rules (non-negotiable) — v3.8 consolidated
-1. `state.py` stays pure (no I/O), fully unit-tested: burst evaluation, confidence scoring, floors, suppression.
-2. Alert ONLY on transitions. DOWN requires BOTH weighted score ≥ threshold AND ≥ floor distinct failed probes within the burst window, no intervening pass. Main track: `DOWN_CONFIDENCE=4`, `MIN_FAILED_PROBES=3`. **[v3.8]** Auth track: `AUTH_DOWN_CONFIDENCE=4`, `AUTH_MIN_FAILED_PROBES=3` (cheap session-reuse probes make this affordable). One DOWN + one RECOVERY email per incident, ever.
-3. Locators: `get_by_role`/`get_by_text`/`get_by_label` only. (v3.5 exception: `.nth()` scoped to username/password fields, as shipped.)
-4. Every DOWN names its layer with exact operator wording: precursor → **"login screen unreachable / not rendering"**; authed → **"online banking behind login not rendering"**. The operator must never need a browser to know which wall failed.
-5. Screenshots on failure only; authed screenshots always masked (PII = data-leak bug).
-6. Every probe writes a `checks` row (with `cycle_id`, `layer`, `burst_id`, `browser_mode`); every cycle writes a `cycles` row. CSV export row-for-row faithful for BOTH tables. Storage UTC ISO-8601; presentation (dashboard, CSV, email) America/New_York per v3.1.
-7. Secrets from `.env` only; chmod 600 on `.env` and session state; parameterized SQL; credentials/TOTP never logged, rendered, or screenshotted.
-8. Single asyncio process, overlap guards, no frameworks/ORM/queues/second process.
-9. LEARNING.md documentation duty unchanged.
-10. Never retry a credential rejection. `auth_rejected` → CONFIG, halts logins until a human clears it. Applies everywhere, always.
-11. **[amended v3.9, 2026-08-26]** Login budget is a hard limit. **`LOGIN_INTERVAL_S` is the single login rate limit** — minimum gap since the last *attempt*, success or failure alike. `MAX_LOGINS_PER_DAY` is **removed**: `LOGIN_INTERVAL_S` already bounds the daily total by arithmetic, and exhausting a daily cap was a dead end until UTC midnight — the auth track stopped attempting logins while `session_expired` kept scoring 0 (Rule 17), so the platform read UP on no authed evidence and nothing alerted. A throttle that recovers on its own is the correct shape; a breaker that silently blinds the monitor is not. Any future total ceiling MUST raise `CONFIG_ERROR` on exhaustion (like `bot_challenge`) so it is loud. Because `LOGIN_INTERVAL_S` now carries this alone, `config.py` refuses to start below a 60s floor (a cooldown shorter than one cycle limits nothing). Note the achievable rate is `ceil((LOGIN_INTERVAL_S + login_duration) / CHECK_INTERVAL_S) × CHECK_INTERVAL_S`, **not** `3600/LOGIN_INTERVAL_S` — attempts only start on cycle boundaries. Keep `LOGIN_INTERVAL_S` well under `SESSION_MAX_AGE_S` and never equal: the session clock starts when the session file is *written* and the login clock when the login row is *recorded*, so equal values open a dead window as wide as the gap between them (observed live 2026-08-26: a 300s post-login teardown stall at 600/600 produced 5 minutes of false `session_expired` on a healthy session). Cheap session-reuse probes are NOT logins and are exempt. Burst re-probes on the auth layer MUST use `run_authed_check()` — a burst consumes zero logins; at most one budgeted recovery login may run per cycle, outside the burst's scoring.
-12. Bot challenges: detect, never defeat. `bot_challenge` → CONFIG, never pages. (v3.2 exception: patchright, scoped and logged, as shipped.)
-13. `DEGRADED`/`BLIND` never page. Only DOWN pages.
-14. Headless is the scheduler's mode for pulse/render. (v3.3 exception: the sign-in journey runs headed under xvfb, `browser_mode='headed-xvfb'`, as shipped.) Dashboard headless/headed toggle remains forbidden.
-15. Channels are plug-ins (`send(event)`, per-channel try/except). SMS = colleague's PR, scoped per CONTRIBUTING.md.
-16. **[v3.8, amended 2026-08-11 — Stage R implementation] Layer attribution & no double-paging.** The cheap authed check keeps running every cycle regardless of the main track's status — login-route and authed-home-route outages are genuinely independent evidence (different backends: auth service/MFA/login UI/Cloudflare vs. plain session-cookie validation), and a login-route outage can leave existing sessions still served for roughly one session lifetime. That distinction belongs in the incident record, so it's not skipped. What Rule 16 actually suppresses: while a main-track (precursor) DOWN incident is open, an auth-track failure that would cross into its own DOWN is held back (logged, annotated onto the open main incident) instead of opening a second incident or paging again — if the login screen is down, the alert already covers the symptom. Auth-track DOWN can only *open* while the precursor is passing; suppressed evidence is never discarded, and fires immediately on the next failing probe once the precursor recovers, with nothing lost. Recovery logins (Rule 11's budgeted fallback) are paused while the precursor is DOWN — no budget is spent chasing a possibly-down site; a `session_expired` result during that window is recorded and, per Rule 17, contributes nothing to score either way. Conversely, auth-track recovery never closes a main-track incident, and vice versa. `cycles.authed_ok` is a real True/False whenever the authed check actually ran (including while suppressed) — it is NULL only when the auth track didn't run at all that cycle (unconfigured, or its own CONFIG_ERROR per Rule 10), never because of suppression.
-17. **[v3.8] `session_expired` never scores.** It routes to the recovery-login path (Rule 11) and is recorded, but it cannot contribute to DOWN confidence or the probe floor on any track.
-18. **[v3.9] The monitor's own failures are recorded, never silent, and never page.** Three parts, all non-negotiable:
-    - **(a) No minute may vanish.** The cycle runner is launched fire-and-forget (`asyncio.create_task`), so an unhandled exception used to surface only as asyncio's "Task exception was never retrieved" — no `checks` row, no `cycles` row, no state advance, no alert. A monitor that silently skips a minute is worse than one that reports a wrong answer, because a quiet dashboard reads as "the platform is fine". Every cycle therefore writes a `cycles` row **even when it crashes**: `verdict='DEGRADED'`, `fail_layer='monitor'`, `fail_reason='internal_error'`. The marker write is itself guarded (the DB may be what broke) and failing that too must print a CRITICAL line, not raise.
-    - **(b) A monitor bug is not evidence about the bank.** The self-health row is written **directly, never through `apply_check()`** — it cannot touch either track's state, confidence, or probe floor. `DEGRADED` is chosen precisely because Rule 13 guarantees it never pages: manufacturing a DOWN from our own defect would create exactly the false positive this project ranks above every other concern. `internal_error` never reaches `classify()` and has no weight; it is not part of the probe taxonomy below and must never be returned by a probe.
-    - **(c) Browser exceptions map onto the closed taxonomy, they don't escape.** No `page.*` call may be left unguarded such that it raises out of a probe. Anything unforeseen resolves via `journey.unexpected_fail_reason()`: timeout-shaped → `timeout`, everything else → `nav_error`, both Soft. **Known limitation, deliberately accepted and documented in code:** a *persistent* monitor-side defect (e.g. a locator that always matches two elements) is indistinguishable from a real soft outage and four such probes reach `DOWN_CONFIDENCE`. The 3-probe floor stops a single flake, not a systematic bug. Closing that needs a distinct non-scoring monitor-error class in the taxonomy — a future amendment, not something to assume is already handled.
+> History, amendment logs, live-drill notes and per-session decisions live in **PROGRESS.md**. This file is the spec: what the system does now, why, and what it must never do. Keep it that way — do not append changelogs here.
+
+## What this is not
+
+- Not a data-plane or API monitor. UP is *authed 200 + rendered content*, nothing deeper. No balance checks, no transaction probes, no JSON shape assertions.
+- Not multi-target. One platform, one verdict.
+- Not a bot-challenge defeater. Challenges are detected and reported, never solved.
+- Not a retry engine. A rejected credential is never retried, ever.
 
 ## Stack
-Python 3.12 · fastapi · uvicorn · curl_cffi (pulse — v: httpx retired after the TLS-fingerprint 403 incident) · patchright (journey; scoped v3.2) · playwright-style API via patchright · sqlite3 · smtplib · python-dotenv · pytest · pyotp.
 
-## Behavior
+Python 3.12 · fastapi · uvicorn · curl_cffi (pulse) · patchright (browser journey, playwright-style API) · playwright (pulse-track render check) · sqlite3 · smtplib · python-dotenv · pytest · pyotp
 
-### Layers of the ONE check (cheapest → strongest)
+Single asyncio process. No ORM, no queues, no second process, no framework beyond FastAPI. `httpx` was retired after a TLS-fingerprint 403 incident — do not reintroduce it for the pulse probe.
+
+## Code map
+
+| File | Responsibility |
+|---|---|
+| `config.py` | Loads `.env`, validates at startup, holds every tunable. Fails fast. |
+| `monitor/main.py` | Scheduler, cycle orchestration, bursts, login budget, self-health net. The composition root. |
+| `monitor/check.py` | `pulse` + `render` probes (curl_cffi + Playwright). Returns `CheckResult`, no I/O. |
+| `monitor/journey.py` | Sign-in journey and the cheap authed check (patchright). Locators, TOTP, `classify_*` steps. |
+| `monitor/session.py` | `storageState` save + freshness/validity check. |
+| `monitor/state.py` | **Pure** state machine: burst scoring, floors, suppression. No I/O. |
+| `monitor/verdict.py` | Severity ladder, `worst_of()`, the locked operator wording. Pure. |
+| `monitor/db.py` | Schema, additive migrations, queries, streaming export. |
+| `monitor/web/app.py` | FastAPI routes + static dashboard. |
+| `monitor/channels/` | Alert plug-ins (`email`, `sms`, `sms_gateway`). |
+| `scripts/` | Manual drills: sign-in, live cycle, DOM dump, TOTP check, CONFIG_ERROR clear. |
+
+## How a cycle works
+
+`cycle_scheduler()` fires every `CHECK_INTERVAL_S` (60s). Each tick:
+
+1. **Overlap guard.** If the previous cycle (or a burst it started) still holds the lock, this tick is **skipped and logged**. Bursts run *inline*, so a confirming burst deliberately eats the next tick — reliability over a strict 60s cadence.
+2. **Main track** runs `perform_check()`: pulse first, render only if the pulse passed.
+3. If that probe **starts a new burst**, the rest of the burst runs inline right here (see [The DOWN algorithm](#the-down-algorithm)).
+4. **Auth track** runs its cheap authed check, its own burst, and at most one budgeted recovery login.
+5. Both tracks are combined into **one `cycles` row** and one platform verdict.
+6. Every individual probe — burst re-probes included — has already written its own `checks` row, linked by `cycle_id`.
+
+The whole cycle runs inside `guarded_cycle()`, which catches everything (see [Self-health](#self-health-degraded--internal_error)).
+
+## The three layers
+
+Cheapest → strongest. Each proves strictly more than the one above it.
+
 | Layer | Proves | Mechanism | Track |
 |---|---|---|---|
-| `pulse` | reachable (DNS/TCP/TLS/HTTP) | curl_cffi GET | main |
-| `render` | login page renders | login-form locator visible | main |
-| `authed` | **the platform is up (the definition of UP)** | session-reuse check: navigates DIRECTLY to `AUTHED_URL` (never derived from `LOGIN_URL`) and asserts the authed content locator; fresh login only via budgeted recovery path | auth |
+| `pulse` | reachable (DNS/TCP/TLS/HTTP) | `curl_cffi` GET impersonating Chrome's TLS/HTTP2 fingerprint | main |
+| `render` | the login page renders | headless Chromium; `REQUIRED_TEXT` or `REQUIRED_ROLE`+`REQUIRED_NAME` locator visible | main |
+| `authed` | **the platform is up — the definition of UP** | patchright, headed under xvfb; navigates directly to `AUTHED_URL` with a reused session, asserts `AUTHED_REQUIRED_*` visible and the error banner absent | auth |
 
-### Verdict (presentation layer)
-`platform_status = worst_of(main, auth)` where DOWN > CONFIG_ERROR > DEGRADED > UP. The dashboard banner, `/api/status`, and alert subjects all speak platform-level, with the layer named per Rule 4.
+### What each layer emits on failure
 
-### fail_reason (v3.8 — data/api reasons removed)
-`timeout | dns | conn_refused | bad_status:<code> | element_missing | nav_error | auth_rejected | auth_unavailable | mfa_failed | bot_challenge | rate_limited | session_expired | logout_failed`
+**`pulse`** — `dns` · `conn_refused` · `timeout` · `bad_status:<code>` (any status ≥ 400) · `nav_error` (other request errors). A pulse failure short-circuits the cycle's main probe; render is not attempted.
 
-**[v3.9]** This list is the **probe** taxonomy and is unchanged. `internal_error` is deliberately *not* in it: it describes the monitor, not the platform, is only ever written by Rule 18's self-health path (`fail_layer='monitor'`) and by `login_events` when a login attempt produced no result at all, and it must never be returned by a probe or passed to `classify()`. Layers likewise stay `pulse | render | authed`; `monitor` is a `cycles.fail_layer` value only, and `verdict.layer_wording()` returns `None` for it so Rule 4's operator phrasing is never misapplied to our own bug.
+**`render`** — `nav_error` (`goto` timed out or errored) · `element_missing` (locator never became visible).
 
-### Confidence scoring (both tracks)
-| Class | Reasons | Weight |
-|---|---|---|
-| Hard | `conn_refused`, `dns`, `bad_status:5xx`, `auth_unavailable` | 2 |
-| Soft | `timeout`, `element_missing`, `nav_error`, non-5xx `bad_status`, unrecognized | 1 |
-| Config | `auth_rejected`, `bot_challenge`, `mfa_failed`, `rate_limited` | 0 → CONFIG_ERROR |
-| **[v3.8] Session** | `session_expired` | **0 → recovery-login path (Rule 17), never scores** |
-| **[v3.9] Monitor self-health** | `internal_error` | **never enters this table at all — bypasses `classify()`/`apply_check()` entirely (Rule 18b)** |
+**`authed`** (`run_authed_check`) — in evaluation order:
+- `nav_error` — `goto` raised (network-level failure).
+- `bad_status:<code>` — the response status is ≥ 400. Playwright does **not** raise on HTTP error status, so this is read explicitly off the `Response`. A 5xx here is Hard evidence and is emphatically *not* a session problem.
+- `session_expired` — the marker is missing **and** `bounced_to_login()` is true: we were redirected *away* from the authed route **and** a login form is present. Both conditions are required; a redirect to a maintenance or error page is platform evidence, not a session problem.
+- `element_missing` — the marker is missing but we are still on the authed route. This is the platform serving something wrong. **This is the path that makes "online banking behind login not rendering" reachable.**
 
-DOWN = score ≥ 4 AND ≥ 3 failed probes within 90s, no intervening pass. Outcome table (per v3.1): hard-heavy pages on 3 probes ~40s (email <60s); all-soft needs a 4th (~email 70–90s); any pass clears (flap logged); nothing pages under 3 failed probes — on either track.
+`AUTHED_URL` is navigated **directly** — configured, never derived from `LOGIN_URL`. The login route and the authed-home route have different dependencies (auth service / MFA / login UI / Cloudflare vs. plain session-cookie validation), so they are independent evidence.
 
-### Bursts (both tracks)
-Main track: as shipped (probe variation render/pulse, offsets `0,15,35,55` ±jitter, window 90s, inline under the overlap lock).
-**[v3.8] Auth track:** on a first authed failure (non-config, non-session), burst re-probes call `run_authed_check()` at the same offsets — cheap, zero logins. If a probe fails `session_expired`, it's inert (Rule 17: doesn't count, doesn't clear the burst either) and triggers at most one budgeted recovery login per cycle (paused entirely if the precursor is DOWN, per Rule 16) — that login's real outcome is what actually feeds the burst's scoring. Auth burst rows carry `burst_id` + `cycle_id` like any other probe.
+A **full login** (`run_journey`: credentials → MFA → authed assertion → optional logout) is only ever the budgeted recovery path. It emits `nav_error`/`element_missing` at `layer="render"` before credentials are submitted, and `auth_rejected` · `bot_challenge` · `mfa_failed` · `element_missing` · `logout_failed` at `layer="authed"` after.
 
-### Tables (v3.8)
-- **`cycles` (new):** `(cycle_id, ts, pulse_ok, render_ok, authed_ok, session_reused, pulse_latency_ms, render_latency_ms, authed_latency_ms, verdict, fail_layer, fail_reason, burst_id NULLABLE)` — exactly one row per 60s cycle. `authed_ok` reflects the initiating auth probe's real True/False whenever the auth track ran that cycle (including while its alert was suppressed per Rule 16); it's NULL only when the auth track didn't run at all (unconfigured, or its own CONFIG_ERROR). Index `(ts)`.
-- `checks` — as shipped, plus `cycle_id` FK. Probe-level evidence (bursts included) under its cycle.
-- `incidents` — as shipped (`track`, `confidence`, `trigger_layer`), plus absorbed-auth annotation per Rule 16.
-- `state` — as shipped (per-track rows).
-- `login_events` — as shipped; recovery logins and their outcomes land here.
-- Migration: additive (`cycles` table, `checks.cycle_id`); no backfill required for historic rows (note in PROGRESS.md).
+## The two tracks
 
-### Routes & dashboard
-Routes as shipped. **[v3.8]** `/api/history` serves cycles (with expandable probe detail); `/api/export` gains `table=cycles|checks` (cycles = primary audit export, checks = probe evidence). Dashboard log = one row per minute: three layer badges (pulse/render/authed), verdict, session-reused marker, burst badge when applicable; failed cycles expand to their probes. Bursts remain first-class and unhideable. Banner speaks platform-level per the verdict rule. Timestamps Eastern everywhere per v3.1.
+`main` (pulse + render) and `auth` (authed) are **separate state machines** with separate rows in `state` and separate incidents. They must stay separate: a shared status previously let an auth success falsely recover a site outage.
 
-### Email copy (v3.8 wording locked)
-- `[MONITOR] {name} DOWN since {eastern} — login screen unreachable / not rendering (confidence {n}: {reasons}). Dashboard: {url}`
-- `[MONITOR] {name} DOWN since {eastern} — online banking behind login not rendering (confidence {n}: {reasons}). Dashboard: {url}`
-- `[MONITOR] {name} RECOVERED after {duration}.`
-- `[MONITOR-CONFIG] {name} needs attention — {reason}. Sign-in checks paused.`
-- DEGRADED info copy unchanged.
+Unification happens only at presentation and alerting.
 
-## .env (v3.8 deltas only)
-Remove: `DATA_PLANE_*`, `API_PROBE_*` (out of scope). Change: `AUTH_DOWN_CONFIDENCE=4`, `AUTH_MIN_FAILED_PROBES=3`. Add: `AUTHED_URL` (the authenticated home route the cheap session-reuse check navigates to directly — required alongside `LOGIN_URL` once Stage 6 is configured; see Rule 16). Everything else as currently shipped (`SESSION_STATE_PATH`, `SESSION_MAX_AGE_S`, `LOGIN_INTERVAL_S`, burst constants, Eastern handled in code).
+## Verdict
 
-## .env (v3.9 deltas)
-Remove: `MAX_LOGINS_PER_DAY` (Rule 11). Change: `SESSION_MAX_AGE_S=600`, `LOGIN_INTERVAL_S=120` in both `.env` and `.env.example` — the previous 1800/1800 (example) and 600/600 (live) both set the two clocks equal, which is the defect Rule 11 now forbids. `.env.example`'s reference section carries the worked example for both clocks; keep it in sync if either value moves. Stage 7's soak still replaces both with measured numbers.
+`platform_status = worst_of(main, auth)`, on the severity ladder:
 
-## Stages (v3.8 — reflects reality per PROGRESS.md)
+```
+UP (0)  <  DEGRADED (1)  <  CONFIG_ERROR (2)  <  DOWN (3)
+```
 
-**Complete, signed off:** Sessions 1–3 ✅ · Stage 4 (shareable + channels + GitHub) ✅ · Stage 5 (+v3.1 floor) ✅ · Stage 6 core journey ✅ (live sign-in end-to-end) · Stage 8 mechanism (session reuse, pulled forward per v3.7) ✅
+`auth_status = None` (track not configured) means the main track alone decides.
 
----
+The dashboard banner, `/api/status` and alert subjects all speak platform-level, and always name the failing layer:
 
-**Stage R — Realignment (built 2026-08-11, pending live verification + human sign-off).** Implement v3.8: `cycles` table + `cycle_id` FK + migration; unified verdict in `/api/status` + banner; Rule 16 suppression/absorption; Rule 17 session_expired routing; auth-track burst via `run_authed_check()` with floor 3 / confidence 4 (retire `AUTH_MIN_FAILED_PROBES=1`); dashboard cycles view + `table=` export param; remove data/api from specs. All state-machine changes land as pure `state.py` logic with tests first. Built and verified via `pytest` + mocked-probe/seeded-DB smoke tests (see PROGRESS.md 2026-08-11) -- not yet drilled against the real target live, so not moved to "complete, signed off" until that happens.
-*Accept:* (a) induced precursor outage → exactly one DOWN, precursor wording, auth failures during it absorbed (no second alert); (b) induced authed failure with precursor healthy → burst of ≥3 cheap probes (zero `login_events` rows from the burst itself), one DOWN with authed wording; (c) forced `session_expired` → recovery login runs (≤1, budgeted), success = non-event, and `session_expired` provably contributes 0 to score/floor; (d) dashboard shows one row/minute with three badges; cycles CSV + checks CSV both export and reconcile; (e) `grep` confirms no path can page under 3 failed probes on either track; (f) all existing tests still pass.
+- precursor failure → **"login screen unreachable / not rendering"**
+- authed failure → **"online banking behind login not rendering"**
 
-**Stage 6 closeout (small, before or with Stage R):** the deferred acceptance drills — wrong-password → `auth_rejected` CONFIG alert, zero retries, logins halt; masked-screenshot PII eyeball check; TOTP cross-check vs the phone app. Plus the three flagged `classify_*` judgment calls (see PROGRESS.md 2026-08-10) — review against live behavior.
+The operator must never need a browser to know which wall failed. The wording lives in `monitor/verdict.py` and nowhere else. `fail_layer='monitor'` deliberately returns `None` — our own bug never gets operator phrasing.
 
-**Stage H — Hardening (opened 2026-08-24, blocks Stage 7).** A code-quality review found one systemic defect and a set of specific ones; full findings and measurements in PROGRESS.md 2026-08-24. Sequenced P0→P3, and **Stage 7's soak is not trustworthy until at least P0+P1 are in** — several findings are precisely the kind that a soak would otherwise hide (a silently-skipped minute looks identical to a healthy one).
-- **P0 — done 2026-08-24, pending live verification.** Rule 18's self-health net; Rule 11's login ledger written on the failure path (it was bypassable, allowing unbounded credentialed logins against a real account); every Playwright call mapped onto the taxonomy; `.first` on ambiguous free-text locators; guarded screenshot/session-save/TOTP-parse. First automated coverage of `main.py` (11 tests, validated by stashing the fixes — 8 failed against the pre-fix tree).
-- **P1 — done 2026-08-24, pending live verification.** `/docs`/`/redoc`/`/openapi.json` disabled (they were served **unauthenticated**, verified live, despite the "only `/healthz` is open" claim); `require_auth` now **fails closed** on unset credentials (`compare_digest("","")` is `True`, so blank config admitted `curl -u ":"` — reachable via `uvicorn monitor.web:app`, which never calls `validate_core`); `PRAGMA journal_mode=WAL` + `busy_timeout=15000` on every connection (rollback-journal mode let a long export read make the cycle's write raise `database is locked`); `/api/export` single-table now streams off a live cursor at flat memory and the `table=all` zip is written member-by-member behind a 200k-row cap that **413s with guidance rather than truncating** (it previously materialised both unbounded tables in the monitor's own process — measured 715–736 MB at one year of data, an OOM kill on the planned B2s). 16 new tests; export output verified byte-identical to the old materialised path, so Rule 6 still holds.
-- **P2 — done 2026-08-24, pending live verification.** `uptime_pct`'s denominator now counts only cycles that produced platform evidence (`verdict IN ('UP','DOWN')`); CONFIG_ERROR and DEGRADED are excluded from both sides, so a latched auth CONFIG_ERROR reports "n/a" instead of **0% uptime for a platform that is up every minute** (Rule 13 said it wasn't an outage; the arithmetic now agrees). `cycles.authed_ok`/`authed_latency_ms` are NULL when nothing actually contacted the platform, per Rule 16 — `_run_auth_probe` returns an explicit `probed` flag rather than letting a synthetic `session_expired` masquerade as an observation. `is_session_fresh` now validates the JSON, not just mtime: **this closes a false-DOWN path that P0 opened** (a corrupt file used to die silently; with P0's guard it reported `nav_error` every cycle, and 4 Soft probes reach `AUTH_DOWN_CONFIDENCE`, so a damaged local file would page a false authed DOWN — now it reads as "no session" and the budgeted recovery login self-heals it). Empty `MASK_TEXT` under `MASKING_ENABLED=true` now warns loudly (previously the silent default). `/healthz` returns 503 rather than an unhandled 500 on an unreadable DB, and deliberately does **not** call `init_db` — the schema owner is the monitor process, and a health probe creating tables would hide the very misconfiguration it reports.
-  *Still open from P2, needs a human decision:* `SESSION_STATE_PATH` defaults inside the OneDrive-synced repo tree (latent — no session file exists today), and `os.chmod(0o600)` is a silent no-op on Windows despite `session.py` asserting it.
-- **P3 — mostly dropped by decision (2026-08-24); one item folded into P2.** (i) **The unreachable authed DOWN was fixed, not deferred** — it was a functional gap, not a spec question: `run_authed_check` now reads `goto`'s `Response` status (Playwright does not raise on HTTP error status, so a 5xx behind login previously produced *zero* evidence) and emits `bad_status:<code>`, and it only calls a missing marker `session_expired` when the page was actually **bounced to a login form** (`bounced_to_login`: redirect away from the authed route *and* a login form present). Still on the authed route with no marker is now `element_missing` — Soft, scoring, burst-opening — so Rule 4's "online banking behind login not rendering" is reachable and Stage R acceptance (b) can pass. (ii) `MASK_TEXT` as a *required* setting: dropped in favour of P2's loud warning; the structural limit stands and is documented in code — `get_by_text` matches text nodes, so masking can never redact an `<input>` value and the login ID will appear in any post-submit failure screenshot. (iii) A non-scoring monitor-error class: dropped — validating the session file removed its main realistic trigger. Rule 18c's limitation is still real but no longer has a known path to fire.
+## Failure classification
 
-**Stage 7 — Azure deploy + soak (after Stage R **and** Stage H P0+P1).** x86 VM (B2als_v2/B2s), venv, systemd, NTP, chmod 600, dashboard via Tailscale/SSH tunnel only. Soak 2–3 days with the *unified* monitor. `LOGIN_STRESS_MODE` remains available for the sanctioned limit-finding experiment per v3 (test account/site from security) — run it as a bounded window within the soak, then Stage 8's budget numbers get replaced with measured ones and stress mode is deleted per the original plan.
-*Accept:* 48h+ unattended; zero false DOWN pages; **zero `verdict='DEGRADED'`/`internal_error` cycles unexplained (Rule 18 makes these visible — a soak with any is not a clean soak)**; stress window produces a measured limit or "none found"; budget values updated from data; stress code deleted (`grep` clean).
+### `fail_reason` — the closed probe taxonomy
 
----
+```
+timeout | dns | conn_refused | bad_status:<code> | element_missing | nav_error |
+auth_rejected | auth_unavailable | mfa_failed | bot_challenge | rate_limited |
+session_expired | logout_failed
+```
 
-## Ad hoc backlog (unchanged triggers)
-BLIND status (the *self-health* half landed as Rule 18 / Stage H P0 — what remains is a distinct BLIND status + surfacing it, still non-paging per Rule 13) · Maintenance windows · Docker · Cross-browser Edge+Firefox (no WebKit, ever) · Diagnostic runner · `/api/logins` route + login-budget gauge (deferred from Stage 6) · CONFIG_ERROR clear/retry control, dashboard or API (currently the only way to clear a stuck track is a manual DB edit or a passing manual drill run — flagged 2026-08-11 during live Stage R testing) · supportability/code-optimization session (**standing reminder: raise after the Stage 7 soak report; do not refactor toward it proactively**).
+There is no `"unknown"` fail_reason. `internal_error` is **not** in this list — it describes the monitor, not the platform (see [Self-health](#self-health-degraded--internal_error)).
 
-## Out of scope (confirm first, always)
-**Data-plane / API probes — removed per v3.8: UP is defined as authed 200 + rendered content, nothing deeper.** `journeys.json`, multi-target, voice alerts, AI judge, retention pruning, CI, stealth libraries beyond the scoped patchright exception, dashboard mode toggle, WebKit/Safari, second process.
+Three members are currently **unreachable** — no code path emits `auth_unavailable`, `rate_limited`, or (in the scheduler) `logout_failed`. See [Known limitations](#known-limitations) #3.
 
-## Appendix — MFA alternatives (reference only)
-Unchanged from v3.
+Layers are `pulse | render | authed`. `monitor` is a `cycles.fail_layer` value only. Note the spelling split: **`authed`** is the layer, **`auth`** is the track.
+
+### Confidence weights (identical on both tracks)
+
+| Class | Reasons | Weight | Effect |
+|---|---|---|---|
+| Hard | `conn_refused`, `dns`, `bad_status:5xx`, `auth_unavailable`† | 2 | scores toward DOWN |
+| Soft | `timeout`, `element_missing`, `nav_error`, non-5xx `bad_status`, **anything unrecognized** | 1 | scores toward DOWN |
+| Config | `auth_rejected`, `bot_challenge`, `mfa_failed`, `rate_limited`† | 0 | → CONFIG_ERROR, halts logins |
+| Session | `session_expired` | 0 | → recovery-login path, **never scores** |
+
+Unrecognized reasons fail *safe as Soft* — ambiguous evidence stays cautious rather than paging.
+
+† Never actually emitted by any probe today — see [Known limitations](#known-limitations) #3 (tracked as B20).
+
+### Unexpected browser errors
+
+No `page.*` call may raise out of a probe. Anything unforeseen resolves through `journey.unexpected_fail_reason()`: timeout-shaped → `timeout`, everything else → `nav_error`. Both Soft. See [Known limitations](#known-limitations) for the residual risk this leaves.
+
+## The DOWN algorithm
+
+**DOWN = accumulated score ≥ `DOWN_CONFIDENCE` (4) AND ≥ `MIN_FAILED_PROBES` (3) distinct failed probes within a `BURST_WINDOW_S` (90s) window, with no intervening pass.**
+
+Both tracks use the same numbers (`AUTH_DOWN_CONFIDENCE=4`, `AUTH_MIN_FAILED_PROBES=3`).
+
+### State transition, precisely
+
+Per failing probe, in `state.apply_check()`:
+
+1. `session_expired` → **return unchanged**. No score, no burst, no event, on any track, in any status.
+2. Config-class reason → `CONFIG_ERROR` + one alert (or nothing, if already CONFIG_ERROR).
+3. Already `CONFIG_ERROR` → ignored. Only a human (or a passing probe) clears it.
+4. Already `DOWN` → keep tallying evidence for the incident record; never re-alert.
+5. Otherwise (status `UP`):
+   - Burst is **active** if `burst_started_ts` is set and `now - burst_started_ts ≤ BURST_WINDOW_S`.
+   - Active → `confidence += weight`, append the reason.
+   - Not active → start a fresh burst: `confidence = weight`, `fail_reasons = (reason,)`, `burst_started_ts = now`.
+   - If `confidence ≥ threshold` **and** `len(fail_reasons) ≥ floor` **and** not suppressed → **DOWN**, emit one `DownEvent`.
+
+**Any passing probe** returns the track to `UP` with a clean burst. Mid-burst that is a flap: logged in `checks`, no alert. From `DOWN`/`CONFIG_ERROR` it emits one `RecoveryEvent`.
+
+### Bursts
+
+A burst launches only when a probe *starts a new burst* (not when it extends one). Re-probes run inline at `BURST_DELAYS_S` offsets `0, 15, 35, 55` ± `BURST_JITTER_S` (5s), measured **from burst start**, not per-iteration — so DB writes and alert dispatch don't accumulate drift. Offset 0 is the initiating probe; the loop covers the rest and **stops the moment the burst resolves** (DOWN fired, or a pass cleared it).
+
+- **Main track** alternates the probe kind — `render`, `pulse`, `render` — so each is independent evidence rather than a correlated retry.
+- **Auth track** re-probes with `run_authed_check()` only. **A burst therefore consumes zero logins.**
+- Every burst probe carries `burst_id` and `cycle_id`.
+
+### Worked examples
+
+| Scenario | Probes | Score | Outcome |
+|---|---|---|---|
+| 3 hard failures (e.g. `dns`) at 0/15/35s | 3 | 6 | **DOWN** at ≈35s into the burst |
+| 4 soft failures (e.g. `element_missing`) at 0/15/35/55s | 4 | 4 | **DOWN** at ≈55s into the burst |
+| 2 hard failures, then the window closes | 2 | 4 | **not DOWN** — floor of 3 not met |
+| 2 failures then a pass | — | — | burst cleared, logged as a flap, **no alert** |
+| Any single failure | 1 | ≤2 | **never** pages |
+
+Add probe execution time on top of the offsets; email lands well inside a minute for hard-heavy bursts, 70–90s for all-soft.
+
+## Special routing
+
+### `session_expired`
+
+A cached-session probe failing this way speaks to the session, not the bank. It **never** scores and **never** clears a burst — it is completely inert. It routes to the recovery login, and the recovery's own outcome is the evidence:
+
+- success → self-healed non-event
+- `bad_status:5xx` → hard platform evidence (the spec's `auth_unavailable` is never emitted today — limitation #3)
+- `auth_rejected` → CONFIG_ERROR
+
+If the session is broken, burst probes each fail fast on the cheap path. That fast-fail is correct evidence collection and still costs zero logins.
+
+### CONFIG_ERROR
+
+Latches. Alerts once, never re-alerts, and never pages (it is not an outage). While the **auth** track is CONFIG_ERROR it is skipped entirely each cycle, so it cannot self-clear — clear it with `python -m scripts.clear_config_error --track auth`, or by a passing manual drill run. The **main** track is never skipped, so it self-clears on the next passing probe.
+
+### Self-health (`DEGRADED` / `internal_error`)
+
+The monitor is allowed to fail, but never silently. **No minute may vanish** — the cycle runner is fire-and-forget, so an unhandled exception once surfaced only as asyncio's "Task exception was never retrieved": no rows, no state advance, no alert, and a quiet dashboard reads as "the platform is fine".
+
+Every crashed cycle therefore still writes a `cycles` row — `verdict='DEGRADED'`, `fail_layer='monitor'`, `fail_reason='internal_error'` — under the **same `cycle_id`** its probe rows already carry. That marker write is itself guarded: if the DB is what broke, it prints CRITICAL rather than raising.
+
+The row is written **directly, never through `apply_check()`**, so it cannot touch either track's state, confidence or probe floor. `DEGRADED` is chosen precisely because it never pages — manufacturing a DOWN out of our own defect would create exactly the false positive this project ranks above everything else. The only other place `internal_error` appears is `login_events`, when a login attempt produced no result at all.
+
+## Cross-track suppression
+
+The cheap authed check runs **every cycle regardless of the main track's status** — a login-route outage can leave existing sessions served for roughly one session lifetime, and that distinction belongs in the incident record.
+
+What is suppressed: while a **main-track DOWN incident is open**, an auth-track failure that would cross into its own DOWN is held back — logged and annotated onto the open main incident rather than opening a second incident or paging again. If the login screen is down, the alert already covers the symptom.
+
+- Auth-track DOWN can only *open* while the precursor is passing.
+- Suppressed evidence is never discarded — confidence and reasons keep accumulating, and it fires on the next unsuppressed failing probe once the precursor recovers.
+- Recovery logins are **paused** while the precursor is DOWN — no budget spent chasing a possibly-down site.
+- Auth-track recovery never closes a main-track incident, and vice versa.
+- `cycles.authed_ok` is a real True/False whenever the authed check actually contacted the platform, **including while suppressed**. It is NULL only when nothing looked at all: track unconfigured, track in its own CONFIG_ERROR, or no usable session *and* the recovery login was paused or refused by the budget.
+
+## Login budget
+
+`LOGIN_INTERVAL_S` is the **single** login rate limit: a minimum gap since the last *attempt*, success or failure alike, read from the `login_events` ledger.
+
+- Cheap session-reuse probes are **not** logins and are exempt.
+- At most **one** budgeted recovery login per cycle, outside the burst's scoring.
+- Every attempt is ledgered **on the failure path too** (`try/finally`). Load-bearing: the budget is derived from that ledger, so an unrecorded attempt let a crashing login loop every 60s, unbounded, against a real account and invisible in the audit trail.
+- `config.py` refuses to start below a **60s floor** — a cooldown shorter than one cycle limits nothing.
+- Keep `LOGIN_INTERVAL_S` well under `SESSION_MAX_AGE_S` and **never equal**. The session clock starts when the file is *written*, the login clock when the attempt is *recorded*; equal values open a dead window as wide as the gap between them. Observed live: a 300s teardown stall at 600/600 produced five minutes of false `session_expired` on a healthy session.
+- Achievable rate is `ceil((LOGIN_INTERVAL_S + login_duration) / CHECK_INTERVAL_S) × CHECK_INTERVAL_S` — **not** `3600/LOGIN_INTERVAL_S`. Attempts only start on cycle boundaries.
+- There is deliberately **no daily cap**. Exhausting one was a dead end until UTC midnight: the track stopped attempting logins while `session_expired` kept scoring 0, so the platform read UP on no authed evidence and nothing alerted. Any future total ceiling **must** raise CONFIG_ERROR on exhaustion so it is loud.
+
+## Data model
+
+- **`cycles`** — exactly one row per cycle, the primary audit export:
+  `(cycle_id, ts, pulse_ok, render_ok, authed_ok, session_reused, pulse_latency_ms, render_latency_ms, authed_latency_ms, verdict, fail_layer, fail_reason, burst_id)`. Indexed on `ts`.
+  `burst_id` marks the minute as burst-confirmed; when both tracks bursted it carries the one belonging to the track that explains the verdict (the other's probes are still tagged in `checks`).
+- **`checks`** — one row per probe: `ts, ok, http_status, latency_ms, fail_reason, browser_mode, layer, burst_id, cycle_id`. Probe-level evidence, bursts included.
+- **`incidents`** — `started_at, ended_at, duration_s, checks_failed, confidence, trigger_layer, screenshot_path, track`.
+- **`state`** — one row per track: `status, since_ts, burst_started_ts, confidence, fail_reasons`.
+- **`login_events`** — every login attempt and its outcome, including recovery logins.
+
+Timestamps stored **UTC ISO-8601**; presented **America/New_York** everywhere (dashboard, CSV, email) via `monitor/timeutil.py`. Migrations are additive only; no backfill.
+
+Connections open with `PRAGMA journal_mode=WAL` and `busy_timeout=15000` — rollback-journal mode let a long export read make the cycle's write raise `database is locked`.
+
+`uptime_pct` counts only cycles that produced platform evidence: `verdict IN ('UP','DOWN')`. CONFIG_ERROR and DEGRADED are excluded from **both** sides, so a latched CONFIG_ERROR reports "n/a" rather than 0% uptime for a platform that is up every minute. A window with only excluded verdicts honestly reports "n/a", not 100%.
+
+## Routes & dashboard
+
+- `/healthz` — **the only unauthenticated route.** 503 on an unreadable DB or a stale last check (> 3 × `CHECK_INTERVAL_S`). Deliberately does **not** call `init_db`: the schema owner is the monitor process, and a health probe creating tables would hide the misconfiguration it reports.
+- `/api/status` — platform verdict, failing layer + wording, last cycle, uptime, recent incidents.
+- `/api/history` — the cycles view, paginated · `/api/cycle/{cycle_id}` — probe-level drill-down.
+- `/api/export` — `table=cycles|checks|all`. Single tables stream off a live cursor at flat memory; `table=all` zips both member-by-member behind a 200k-row-per-table cap that **413s with guidance rather than truncating**.
+- `/api/artifact/{incident_id}` · `/` · `/static/{filename}`.
+
+`docs_url`/`redoc_url`/`openapi_url` are disabled, and `require_auth` **fails closed** on unset credentials (`compare_digest("","")` is `True`, so blank config once admitted `curl -u ":"`).
+
+Dashboard log is one row per minute: three layer badges (pulse / render / authed), verdict, session-reused marker, burst badge when applicable. Failed cycles expand to their probes. Bursts are first-class and cannot be hidden. Only DOWN wears alarm red; CONFIG_ERROR and DEGRADED are gold.
+
+## Email copy (locked wording)
+
+```
+[MONITOR] {name} DOWN since {eastern} — login screen unreachable / not rendering (confidence {n}: {reasons}). Dashboard: {url}
+[MONITOR] {name} DOWN since {eastern} — online banking behind login not rendering (confidence {n}: {reasons}). Dashboard: {url}
+[MONITOR] {name} RECOVERED after {duration}.
+[MONITOR-CONFIG] {name} needs attention — {reason}. Sign-in checks paused.
+```
+
+One DOWN email and one RECOVERY email per incident, ever.
+
+## `.env`
+
+**Core (required):** `TARGET_NAME`, `TARGET_URL`, `REQUIRED_TEXT` *or* `REQUIRED_ROLE`+`REQUIRED_NAME`, `DASHBOARD_USER`, `DASHBOARD_PASSWORD`.
+
+**Auth track (required together, or the track never runs):** `LOGIN_URL`, `AUTHED_URL`, `LOGIN_USER`, `LOGIN_PASSWORD`, `ERROR_BANNER_TEXT`, `AUTHED_REQUIRED_TEXT` *or* `AUTHED_REQUIRED_ROLE`+`AUTHED_REQUIRED_NAME`, `TOTP_SECRET` (unless `ALLOW_MFA_UNCONFIGURED=true`, testing only).
+
+**Timing:** `CHECK_INTERVAL_S=60`, `BROWSER_TIMEOUT_MS=15000`, `CHALLENGE_TIMEOUT_MS=25000`.
+
+**Detection:** `BURST_DELAYS_S=0,15,35,55`, `BURST_JITTER_S=5`, `BURST_WINDOW_S=90`, `DOWN_CONFIDENCE=4`, `MIN_FAILED_PROBES=3`, `AUTH_DOWN_CONFIDENCE=4`, `AUTH_MIN_FAILED_PROBES=3`.
+
+**Session & budget:** `SESSION_STATE_PATH`, `SESSION_MAX_AGE_S=600`, `LOGIN_INTERVAL_S=120` (floor 60; never equal to `SESSION_MAX_AGE_S`).
+
+**Screenshots:** `MASK_TEXT` (semicolon-separated regexes), `MASKING_ENABLED=true`.
+
+**Alerts:** `ALERT_CHANNELS`, `RECIPIENTS_EMAIL`, `GMAIL_USER`, `GMAIL_APP_PASSWORD`, plus Twilio/gateway settings.
+
+Eastern-time presentation is handled in code, not configured. `.env.example` carries the worked examples — keep it in sync when a value moves.
+
+## Rules (non-negotiable)
+
+1. **`state.py` stays pure** — no I/O, fully unit-tested: burst evaluation, confidence scoring, floors, suppression.
+2. **Alert only on transitions.** DOWN requires *both* score ≥ threshold *and* ≥ 3 distinct failed probes in the window with no intervening pass — on both tracks. One DOWN + one RECOVERY email per incident, ever.
+3. **`session_expired` never scores.** It routes to the recovery-login path and is recorded, but it cannot contribute to DOWN confidence or the probe floor on any track.
+4. **Never retry a credential rejection.** `auth_rejected` → CONFIG_ERROR, logins halt until a human clears it. Always, everywhere.
+5. **The login budget is a hard limit.** Burst re-probes on the auth track MUST use `run_authed_check()` — a burst consumes zero logins. Every attempt is ledgered, including failures.
+6. **Bot challenges: detect, never defeat.** `bot_challenge` → CONFIG_ERROR, never pages. patchright is the one approved, scoped mitigation.
+7. **Only DOWN pages.** `DEGRADED` and `CONFIG_ERROR` never do.
+8. **A monitor bug is never evidence about the bank.** Self-health rows bypass `apply_check()` entirely; `internal_error` never reaches `classify()` and is never returned by a probe.
+9. **No minute may vanish.** Every cycle writes a `cycles` row even when it crashes.
+10. **Every DOWN names its layer** with the exact wording in [Verdict](#verdict), read from `monitor/verdict.py`.
+11. **Locators:** `get_by_role` / `get_by_text` / `get_by_label` only. Scoped exception: `.nth()` on the username and password fields only. Use `.first` on any locator built from free-form `.env` text — Playwright strict mode raises `Error` (not `AssertionError`) on multiple matches, and no `classify_*` helper catches that.
+12. **Never guess a locator name from a screenshot.** Run `scripts/dump_dom.py`, read `elements.txt`, cross-check the accessible name's source in `page.html`. Guessing is what produced the MFA misclassification bug.
+13. **Screenshots on failure only**, and authed screenshots are always masked.
+14. **Headless is the scheduler's mode** for pulse and render. Scoped exception: the sign-in journey and authed check run headed under xvfb, recorded as `browser_mode='headed-xvfb'`. A dashboard headless/headed toggle is forbidden.
+15. **Every probe writes a `checks` row; every cycle writes a `cycles` row.** CSV export stays row-for-row faithful to both tables — refuse rather than truncate.
+16. **Secrets from `.env` only.** `chmod 600` on `.env` and session state. Parameterized SQL. Credentials and TOTP are never logged, rendered, or screenshotted.
+17. **Single asyncio process** with overlap guards. No frameworks, ORM, queues, or second process.
+18. **Alert channels are plug-ins:** `send(event)`, per-channel try/except — one broken channel never blocks another or the cycle loop.
+
+## Known limitations
+
+Open and deliberate. Read this before diagnosing a bug — several "bugs" are already on this list.
+
+1. **False-UP blind spot on the authed marker (iframe scope).** The live target's banking content lives inside a separate `nxg-olb` iframe; `authed_marker()` builds **page-level locators only**, and `get_by_text` does not pierce iframes. The configured marker is outer-shell chrome, so if the iframe fails to render — which is literally "online banking behind login not rendering" — the check still reports **UP**. This contradicts the definition of UP and is a silent false negative. Fix needs `frame_locator` support in `journey.py` plus a frame-URL setting.
+2. **Three unverified `classify_*` fallback mappings.** `classify_after_submit` → `bot_challenge` (this one already fired wrongly on a live MFA screen and parked the auth track in CONFIG_ERROR); `classify_after_totp` → `mfa_failed`; `classify_authed` with marker *and* error banner both visible → `element_missing`. The MFA **locators** are now confirmed against captured DOM; these **fallbacks** are not.
+3. **The authed layer's evidence vocabulary is narrower than this spec claims.** `auth_unavailable` and `rate_limited` exist only in `state.py`'s classification sets — nothing emits them; `classify_after_submit` lumps "bot challenge / auth service down / rate limited" into `bot_challenge`, which is Config-class and **never pages**, so a genuinely unavailable auth service reads as a config problem. `logout_failed` is only reachable from the drill script (the scheduler always runs `should_logout=False`). Worse, `run_authed_check()` collapses *every* navigation exception to `nav_error`, so on the `authed` layer `dns` and `conn_refused` are unreachable too — its only Hard evidence is `bad_status:5xx`, and a hard network failure there scores Soft. Tracked as **B20/B21** in `personal/ISSUES.md`.
+4. **`element_missing` conflates absence with ambiguity.** A locator matching 2+ elements fails `to_be_visible` identically to one matching 0. `.first` guards the known free-text locators; anything else raises and lands on `nav_error` via `unexpected_fail_reason` — Soft, and therefore scoring.
+5. **A *persistent* monitor-side defect can page.** Unforeseen browser errors map to Soft reasons, and four Soft probes reach `DOWN_CONFIDENCE`. The 3-probe floor stops a single flake, not a systematic bug. Closing this needs a distinct non-scoring monitor-error class in the taxonomy — a spec change, not a code tweak. Do not assume it is already handled.
+6. **Masking cannot redact `<input>` values.** `get_by_text` matches text nodes, so a filled login-ID field appears in any post-submit failure screenshot. A `MASK_TEXT` pattern that matches nothing fails *open* (no mask, no error). An empty `MASK_TEXT` under `MASKING_ENABLED=true` warns loudly but does not block. The current target is a security-team test site with fake data; this must be populated before pointing at a real account.
+7. **TOTP is not yet captured.** The live step-up offers SMS / call / authenticator. Without a real `TOTP_SECRET`, any recovery login reports `mfa_failed` → CONFIG_ERROR. The code-entry screen also carries an unhandled device-registration choice ("register my private device" / "this is a public device") that `submit_totp` ignores — may matter for unattended logins.
+8. **The auth track's CONFIG_ERROR cannot self-clear** (the track is skipped while latched). No dashboard or API control exists — use `scripts/clear_config_error.py` or a passing drill.
+9. **`SESSION_STATE_PATH` defaults inside the synced repo tree**, and `os.chmod(0o600)` is a silent no-op on Windows despite `session.py` asserting it.
+10. **`.env.example` declares `LOGIN_STRESS_MODE`, which `config.py` deliberately does not read.** Reserved for a future sanctioned stress window; it is not implemented.
+11. **`db.count_login_events_since()` has no callers** — it was the daily-cap query, and was deliberately kept because the deferred `/api/logins` budget gauge is exactly that query. Wire it or drop it; don't leave it parked (**B22**).
+
+## Out of scope
+
+Confirm before building any of these:
+
+Data-plane / API probes · `journeys.json` · multi-target · voice alerts · AI judge · retention pruning · CI · stealth libraries beyond the scoped patchright exception · dashboard mode toggle · WebKit/Safari · second process.
+
+Backlog, not scope: a distinct non-paging `BLIND` status · maintenance windows · Docker · cross-browser Edge+Firefox · diagnostic runner · `/api/logins` route + budget gauge · a CONFIG_ERROR clear/retry control in the UI.
+
+## How we work
+
+Stages in order, acceptance test + human sign-off before the next. Explain before building. Update **PROGRESS.md** after every session. Stop and ask before adding a dependency or service. `LEARNING.md` on request.
+
+**Where things stand:** the pulse/render monitor, the sign-in journey, session reuse, the unified one-verdict cycle and the hardening pass are all built; 117 tests pass. What remains is live verification of the hardening work, the Stage 6 closeout drills (wrong-password → `auth_rejected`, masked-screenshot review, TOTP cross-check), and the Azure deploy + multi-day soak. A soak is not clean if it contains any unexplained `DEGRADED`/`internal_error` cycle — Rule 9 exists to make those visible.

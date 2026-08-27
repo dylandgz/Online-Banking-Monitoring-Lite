@@ -340,7 +340,10 @@ def api_artifact(incident_id: int, conn=Depends(get_conn)):
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_auth)])
 def dashboard():
-    return HTMLResponse((_TEMPLATES_DIR / "dashboard.html").read_text(encoding="utf-8"))
+    return HTMLResponse(
+        (_TEMPLATES_DIR / "dashboard.html").read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/static/{filename}", dependencies=[Depends(require_auth)])
@@ -348,4 +351,22 @@ def static_asset(filename: str):
     media_type = _STATIC_FILES.get(filename)
     if media_type is None:
         raise HTTPException(status_code=404, detail="Not found")
-    return FileResponse(_STATIC_DIR / filename, media_type=media_type)
+    # Cache-Control is set explicitly because FileResponse sends ETag and Last-Modified but
+    # no Cache-Control at all, which leaves the browser free to apply *heuristic* freshness
+    # (Chrome: a fraction of the age since Last-Modified) and reuse dashboard.js from disk
+    # without ever revalidating. Observed 2026-08-27: a shipped Session-column change was
+    # served correctly by this route and still did not reach the operator's browser, which
+    # is the worst shape of bug for an ops dashboard -- the fix looks deployed and isn't.
+    #
+    # "no-cache" does not mean "do not store"; it means "revalidate before reuse", so the
+    # ETag still collapses the common case into a cheap 304 rather than a re-download.
+    #
+    # The brand fonts are the exception: their bytes never change (a new weight arrives as a
+    # new filename), and they are the only assets here big enough for the extra round-trip to
+    # be worth avoiding on a link that may be a Tailscale hop.
+    cache_control = (
+        "public, max-age=31536000, immutable" if filename.endswith(".woff2") else "no-cache"
+    )
+    return FileResponse(
+        _STATIC_DIR / filename, media_type=media_type, headers={"Cache-Control": cache_control}
+    )
