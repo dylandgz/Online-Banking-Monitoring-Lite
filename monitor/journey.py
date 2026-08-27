@@ -113,15 +113,36 @@ def error_banner(page: Page, text: str) -> Locator:
 
 
 def mfa_heading(page: Page) -> Locator:
-    return page.get_by_role("heading", name="Secure login", exact=True)
+    # [2026-08-25] The step-up flow has TWO screens, each with its own heading, and this
+    # locator is what tells classify_after_submit "we reached MFA" and classify_after_totp
+    # "we left MFA" -- so it has to mean the whole step, not one screen of it. "Login
+    # Security" is the factor picker (Text / Call / Authenticator rows, live-confirmed
+    # from the failure screenshot); "Verify Information" is the code-entry screen that
+    # follows. Matching only one of them is exactly the bug that fell through to the
+    # bot_challenge fallback and parked the auth track in CONFIG_ERROR.
+    return page.get_by_role("heading", name="Login Security", exact=True).or_(
+        page.get_by_role("heading", name="Verify Information", exact=True)
+    )
 
 
 def enter_code_button(page: Page) -> Locator:
-    return page.get_by_role("button", name="Enter code")
+    return page.get_by_role("button", name="send code to authenticator")
 
 
 def totp_field(page: Page) -> Locator:
-    return page.get_by_role("textbox", name="Enter code", exact=True)
+    # The picker's Authenticator button is confirmed to be named "Enter code"
+    # (enter_code_button, above -- live screenshot). The accessible name of the FIELD
+    # revealed after clicking it has never been captured, and the SMS variant of this
+    # screen labels its own field "Verification code" -- so a single guessed string here
+    # would fail the entire login on a wrong word. Accept the plausible wordings instead
+    # (still Rule 3: get_by_role only, no CSS/XPath). or_() is a union, so an unmatched
+    # alternative costs nothing. Collapse this to the one real name once a live run
+    # confirms it.
+    return (
+        page.get_by_role("textbox", name="Enter code", exact=True)
+        .or_(page.get_by_role("textbox", name="Verification code", exact=True))
+        .or_(page.get_by_role("textbox", name="Authenticator code", exact=True))
+    )
 
 
 def authed_marker(page: Page, *, text: Optional[str], role: Optional[str], name: Optional[str]) -> Locator:
