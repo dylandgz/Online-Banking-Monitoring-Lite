@@ -93,13 +93,28 @@ SESSION_STATE_PATH = os.getenv("SESSION_STATE_PATH", "./data/session_state.json"
 SESSION_MAX_AGE_S = int(os.getenv("SESSION_MAX_AGE_S", "1800"))
 
 # Minimum gap between full login attempts (credentials + TOTP) -- a deliberately
-# conservative, hand-picked value (default 30 min = 48/day max) since there's no
-# measured safe rate yet (that's Stage 7's job). Reuses the name Stage 8's spec already
-# reserves for this -- expect Stage 8 to replace this value with one derived from the
-# stress soak, not introduce a new setting. A hard daily backstop independent of this
-# cadence, per Rule 11 ("the login budget is a hard limit").
+# conservative, hand-picked value since there's no measured safe rate yet (that's Stage
+# 7's job, which should replace it with a measured number).
+#
+# [v3.9] This is now the ONLY login rate limit -- MAX_LOGINS_PER_DAY was removed (see
+# _login_budget_allows() in main.py for why). Because attempts can only start on a
+# CHECK_INTERVAL_S boundary and each attempt takes real time, the achievable rate is
+# NOT 3600/LOGIN_INTERVAL_S: it's one attempt every
+#   ceil((LOGIN_INTERVAL_S + login_duration_s) / CHECK_INTERVAL_S) * CHECK_INTERVAL_S
+# seconds. At 120s with a ~15-20s login that's every 180s (20/hour), not every 120s.
+# Worked example in .env.example's reference section.
+#
+# It must stay meaningfully longer than one cycle or it stops limiting anything (a
+# cooldown shorter than CHECK_INTERVAL_S is always already satisfied by the time the
+# next cycle asks), hence the startup floor below rather than a daily counter.
 LOGIN_INTERVAL_S = int(os.getenv("LOGIN_INTERVAL_S", "1800"))
-MAX_LOGINS_PER_DAY = int(os.getenv("MAX_LOGINS_PER_DAY", "60"))
+MIN_LOGIN_INTERVAL_S = 60
+if LOGIN_INTERVAL_S < MIN_LOGIN_INTERVAL_S:
+    sys.exit(
+        f"LOGIN_INTERVAL_S={LOGIN_INTERVAL_S} is below the {MIN_LOGIN_INTERVAL_S}s floor. "
+        "It is the only limit on full credential+MFA logins (Rule 11) -- a lower value "
+        "lets a persistently failing login retry every cycle indefinitely."
+    )
 
 # [v3.8 / Stage R] The auth track's own confidence thresholds -- now matched to the main
 # track's (v3.6's AUTH_DOWN_CONFIDENCE=2/AUTH_MIN_FAILED_PROBES=1 shortcut is retired: it
