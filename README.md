@@ -42,19 +42,18 @@ pip install -r requirements.txt
 playwright install chrome
 
 cp .env.example .env
-# fill in .env: TARGET_URL, REQUIRED_TEXT (or REQUIRED_ROLE+REQUIRED_NAME),
-# DASHBOARD_USER/PASSWORD are required at minimum. Email alerting needs
-# GMAIL_USER/GMAIL_APP_PASSWORD/RECIPIENTS_EMAIL — the loop runs fine without them,
-# it just logs and skips sending. SMS (Twilio) needs TWILIO_ACCOUNT_SID/
-# TWILIO_AUTH_TOKEN/TWILIO_FROM_NUMBER/SMS_TO_NUMBER plus ALERT_CHANNELS=email,sms.
-# Fill in .env. See the file's own comments -- it's organized CORE (required to start)
-# -> PULSE+RENDER (the public login-page check) -> AUTH (the sign-in journey + session
-# reuse) -> ALERTING -> DEAD (safe to ignore/delete). At minimum: TARGET_URL,
-# REQUIRED_TEXT (or REQUIRED_ROLE+REQUIRED_NAME), DASHBOARD_USER/PASSWORD. Email alerting
-# needs GMAIL_USER/GMAIL_APP_PASSWORD/RECIPIENTS_EMAIL -- the loop runs fine without them,
-# it just logs and skips sending. The sign-in journey needs its own block filled in too
-# (LOGIN_URL, AUTHED_URL, LOGIN_USER/PASSWORD, TOTP_SECRET, ...) -- see "Sign-in journey /
-# session cookies" below if you don't have a captured TOTP_SECRET yet.
+# Fill in .env. The file is in two parts: a block of bare variable assignments,
+# grouped CORE (required to start) -> PULSE+RENDER (the public login-page check) ->
+# AUTH (the sign-in journey + session reuse) -> ALERTING, followed by a reference
+# section explaining every variable in the same order.
+#
+# At minimum: TARGET_URL, REQUIRED_TEXT (or REQUIRED_ROLE+REQUIRED_NAME),
+# DASHBOARD_USER/PASSWORD. Email alerting needs GMAIL_USER/GMAIL_APP_PASSWORD/
+# RECIPIENTS_EMAIL -- the loop runs fine without them, it just logs and skips sending.
+# SMS (Twilio) needs TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/TWILIO_FROM_NUMBER/
+# SMS_TO_NUMBER plus ALERT_CHANNELS=email,sms. The sign-in journey needs its own block
+# filled in too (LOGIN_URL, AUTHED_URL, LOGIN_USER/PASSWORD, TOTP_SECRET, ...) -- see
+# "Sign-in journey / session cookies" below if you don't have a captured TOTP_SECRET yet.
 ```
 
 ## Running
@@ -151,7 +150,11 @@ monitor/web/templates/ # dashboard.html — the page shell
 monitor/web/static/    # dashboard.css, dashboard.js — served behind the same basic auth as the rest
 monitor/main.py        # composition root: unified cycle loop + uvicorn in one asyncio process
 config.py               # loads and validates .env
-scripts/                # manual drill runners (sign-in journey, live cycle drill) -- see their docstrings
+scripts/                # manual drill runners + operator tools -- see each file's docstring
+                        #   run_signin_drill.py    -- live sign-in, optionally saving the session
+                        #   dump_dom.py            -- capture real markup to write locators from
+                        #   check_totp.py          -- offline TOTP cross-check vs the phone app
+                        #   clear_config_error.py  -- Rule 10's human "I looked, resume"
 tests/                  # pytest suite
 ```
 

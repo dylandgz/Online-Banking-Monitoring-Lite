@@ -253,6 +253,9 @@ def get_recent_login_events(conn: sqlite3.Connection, limit: int = 50) -> list[d
 
 
 def count_login_events_since(conn: sqlite3.Connection, since_ts: str) -> int:
+    """[v3.9] No longer called by the login budget -- MAX_LOGINS_PER_DAY was removed.
+    Kept because the deferred `/api/logins` route + login-rate gauge (ad hoc backlog)
+    is exactly this query; delete it with that item if it's ever dropped instead."""
     return conn.execute(
         "SELECT COUNT(*) c FROM login_events WHERE ts >= ?", (since_ts,)
     ).fetchone()["c"]

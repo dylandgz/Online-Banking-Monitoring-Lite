@@ -208,12 +208,18 @@ async def _run_full_login(conn, *, should_logout: bool) -> "check.CheckResult":
 
 
 def _login_budget_allows(conn) -> bool:
-    """Rule 11's hard limit, applied to the recovery path below: a daily cap
-    independent of cadence, plus a minimum gap since the last attempt (success or
-    failure) so a session that keeps expiring immediately can't trigger a login storm."""
-    since_midnight = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    if db.count_login_events_since(conn, since_midnight) >= config.MAX_LOGINS_PER_DAY:
-        return False
+    """Rule 11's hard limit, applied to the recovery path below: a minimum gap since the
+    last attempt (success or failure) so a session that keeps expiring immediately can't
+    trigger a login storm.
+
+    [v3.9] The old MAX_LOGINS_PER_DAY cap was removed. LOGIN_INTERVAL_S already bounds
+    the daily total by arithmetic (see .env.example's worked example), so the cap only
+    ever mattered as a second ceiling below that bound -- and reaching it was a dead end
+    until UTC midnight: the auth track stopped probing while `session_expired` kept
+    scoring 0, so the dashboard read UP with no authed evidence behind it and nothing
+    alerted. A throttle that recovers on its own is the right shape here; a breaker that
+    silently blinds the monitor for the rest of the day is not. config.py now enforces a
+    minimum LOGIN_INTERVAL_S at startup, since it is the only login rate limit left."""
     recent = db.get_recent_login_events(conn, limit=1)
     if recent:
         last_ts = datetime.fromisoformat(recent[0]["ts"])
