@@ -113,15 +113,37 @@ def error_banner(page: Page, text: str) -> Locator:
 
 
 def mfa_heading(page: Page) -> Locator:
-    return page.get_by_role("heading", name="Secure login", exact=True)
+    # [2026-08-25] The step-up flow has TWO screens, each with its own heading, and this
+    # locator is what tells classify_after_submit "we reached MFA" and classify_after_totp
+    # "we left MFA" -- so it has to mean the whole step, not one screen of it. "Login
+    # Security" is the factor picker (h1); "Verify Information" is the code-entry screen
+    # that follows (h3). Both are served from the SAME url (/nxg-olb/beta/mfaVerification)
+    # as two render states of one route -- the heading is the only thing distinguishing
+    # them, so the union is load-bearing, not caution. Matching only one of them is
+    # exactly the bug that fell through to the bot_challenge fallback and parked the auth
+    # track in CONFIG_ERROR. Both names confirmed against captured DOM (data/dom_dumps,
+    # 2026-08-25).
+    return page.get_by_role("heading", name="Login Security", exact=True).or_(
+        page.get_by_role("heading", name="Verify Information", exact=True)
+    )
 
 
 def enter_code_button(page: Page) -> Locator:
-    return page.get_by_role("button", name="Enter code")
+    # Confirmed against captured DOM (data/dom_dumps, 2026-08-25). The picker also offers
+    # "send a text to phone number ending in NNNN" and two "call phone number ..." rows;
+    # this is the authenticator-app one.
+    return page.get_by_role("button", name="send code to authenticator", exact=True)
 
 
 def totp_field(page: Page) -> Locator:
-    return page.get_by_role("textbox", name="Enter code", exact=True)
+    # [2026-08-25] Confirmed against captured DOM (data/dom_dumps, 03_verification_code_screen):
+    #   <label for=":r8k:">Verification code</label><input id=":r8k:" type="text">
+    # The name comes from a real <label for>, not a placeholder fallback, so exact=True is
+    # safe. The same string also appears in a <legend> inside an aria-hidden fieldset,
+    # which contributes nothing to the accessible name -- no double-match risk.
+    # Do NOT key off id or data-testid: the id (":r8k:") is React-generated and changes
+    # between renders, and data-testid is outside Rule 3.
+    return page.get_by_role("textbox", name="Verification code", exact=True)
 
 
 def authed_marker(page: Page, *, text: Optional[str], role: Optional[str], name: Optional[str]) -> Locator:

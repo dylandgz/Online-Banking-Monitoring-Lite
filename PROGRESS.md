@@ -372,3 +372,125 @@ Also fixed a small display bug introduced by the restyle itself: making the upti
 **Live-run note (not a code change):** the app was run locally against `data/dev-run.db` with `ALERT_CHANNELS=` empty, so no email/SMS reached real recipients and the audit-grade `data/monitor.db` was never written to. During that run a genuine burst was observed end-to-end against an unreachable target -- three varied probes (pulse, render, pulse), DOWN at confidence 5, and a `burst_id` on the `cycles` row -- which live-confirms the `cycles.burst_id` fix above against the real code path rather than mocked probes. A `RecoveryEvent` also fired and closed the incident cleanly when the target was pointed back at the real site.
 
 **Still open from this session:** `sms_twilio.py` keeps the pre-v3.8 `"{trigger_layer} failed"` phrasing and its own duplicate `_format_duration` (contributor-scoped file, needs a human decision -- see above). The `main.py` split and the `config.py` Settings-object conversion remain deferred to the post-Stage-7 supportability session.
+
+## Stage 6 closeout: MFA locators fixed against real markup, two operator scripts, `.env.example` reorganized -- 2026-08-25
+
+**Trigger:** the auth track sat parked in `CONFIG_ERROR` with `bot_challenge`, on a site that was serving the sign-in flow normally in a visible browser. This is flagged `classify_*` judgment call #1 (see the `journey_unknown_fallback_review` note) **confirmed as a live bug**, not a judgment call: the monitor was reporting a bot challenge where there was none.
+
+**Diagnosis.** `mfa_heading()` matched exactly one string, `"Secure login"`, which is not a heading this flow ever renders. The real step-up flow has **two** screens, each with its own heading: `"Login Security"` (the factor picker -- Text / Call / Authenticator rows) and `"Verify Information"` (the code-entry screen that follows). `mfa_heading()` is what tells `classify_after_submit()` "we reached MFA" and `classify_after_totp()` "we left MFA", so matching neither screen meant the classifier fell through to its `bot_challenge` fallback every time -> Rule 10 -> `CONFIG_ERROR` -> logins halted. The wall it named was real, but it named the wrong wall, which is exactly the failure Rule 4 exists to prevent one layer up.
+
+**Instrument first, fix second (`scripts/dump_dom.py`, new).** The previous locators had been written from screenshots, and screenshots are what produced the wrong strings -- so the first thing built was a way to read the real markup. `dump_dom.py` walks the sign-in flow and writes, per frame, an `elements.txt` (visible interactive elements with inferred ARIA role, approximated accessible name, and a ready-to-paste `get_by_role(...)` line) plus that frame's serialized `page.html`, into `data/dom_dumps/<run ts>/NN_<label>/`.
+
+Two deliberate design choices in it. (1) It **does not use `journey.py`'s MFA locators** -- those were the suspects, and automating past a screen with a locator that may be wrong is how you get zero information. It drives only the three login-form locators known to work (fill credentials, submit), then hands the visible browser to the human: click through the flow yourself, press Enter at each screen to capture it. (2) It **changes nothing** -- imports `monitor/` code for browser setup only, never writes the database, never touches monitor state, never saves a session, never logs out. Its only cost is one real credentialed sign-in. Input values are stripped from both outputs, since a value attribute can hold the password or a live OTP (Rule 7).
+
+**Fixed (`monitor/journey.py`), all still Rule 3 (`get_by_role` only, no CSS/XPath):**
+- `mfa_heading()` -- now the union of `"Login Security"` and `"Verify Information"` via `.or_()`. It has to mean *the whole step*, not one screen of it, because two different classifiers read it from opposite directions.
+- `enter_code_button()` -- was `"Enter code"`; the picker's Authenticator row is actually named `"send code to authenticator"`.
+- `totp_field()` -- shipped first as a three-way `.or_()` hedge (`"Enter code"` / `"Verification code"` / `"Authenticator code"`) because the field's accessible name had not been read out of the captures yet, then **collapsed to the confirmed single locator `get_by_role("textbox", name="Verification code", exact=True)`** once it had (see the 08-26 addendum below). The name comes from a real `<label for=":r8k:">Verification code</label>`, not a placeholder fallback, so `exact=True` is safe; the duplicate string in an `aria-hidden` `<legend>` contributes nothing to the accessible name and cannot cause a double match.
+
+**`scripts/clear_config_error.py` (new)** -- implements the human half of Rule 10, which until now had no implementation at all. This closes the CLAUDE.md ad hoc backlog item "CONFIG_ERROR clear/retry control (currently the only way to clear a stuck track is a manual DB edit or a passing manual drill run)", flagged 2026-08-11 and hit repeatedly since. Rule 10 is deliberate -- a credential rejection, bot challenge or MFA failure halts logins until a person has looked, precisely so the monitor can never retry its way into a lockout -- so this script is *that person* saying "I looked, I fixed the cause, resume." It is not a retry mechanism and **nothing automated may ever call it.**
+
+It resets the track to `UP` with a clean slate (no confidence, no `fail_reasons`, no in-progress burst) rather than restoring its pre-error status. The stored confidence belongs to the burst that *ended* in the config failure; carrying it forward would let stale evidence count toward a future DOWN. The next real probe re-establishes the truth within one cycle, and because `CONFIG_ERROR` never opens an incident row there is nothing else to close. No-ops with a message if the track isn't actually in `CONFIG_ERROR`.
+
+**`scripts/check_totp.py` (new)** -- one of Stage 6's deferred acceptance drills: cross-check the captured `TOTP_SECRET` against the phone authenticator app, offline. Prints the code this codebase would submit alongside the seconds left in the window, and refreshes across window boundaries so agreement can be watched over a roll-over rather than inferred from one sample. It calls `journey.get_fresh_totp_code()` -- the same function `submit_totp()` calls, including its roll-over wait -- rather than reimplementing TOTP, so agreement here means agreement there. Touches nothing: no browser, no network, no database, no `login_events` row, zero logins consumed.
+
+It deliberately prints the live code, which is the one place Rule 7's "never rendered" gives way -- that *is* the drill, and it's scoped to a human verifying a factor by eye. The docstring says to run it in a terminal nobody is looking over and not to paste the output anywhere. The secret itself is never printed. (Note this drill can't be *run* until a real `TOTP_SECRET` is captured; it exits with instructions if the var is empty.)
+
+**`.env.example` reorganized (no variable added, removed, or renamed by this change).** The file had grown to where the actual assignments were buried in paragraphs of rationale, and several variables had no explanation at all while others had three sentences. Now two parts: an **ACTUAL VARIABLES** block of bare grouped assignments (`CORE` -> `PULSE + RENDER` -> `AUTH` -> `ALERTING`), copyable to `.env` without wading through prose, followed by an **ENVIRONMENT VARIABLES REFERENCE** section carrying all of the old rationale plus a new entry for every previously-undocumented variable. Reviewed line-by-line against `config.py`, and `grep` confirmed `config.py` is the only module calling `os.getenv` -- the channel modules read their own provider vars, which the reference section notes explicitly.
+
+**Verified:** `pytest` 69/69 green (unchanged -- `journey.py` still has no automated coverage; these are locator strings, verifiable only against the live site). All three new scripts import clean and `--help`-path/guard branches behave. All three MFA locators are **verified against captured markup, not yet against a full unattended login** -- the latter still needs a real `TOTP_SECRET`.
+
+**Open / next from this session:**
+- The MFA fix has not been drilled end-to-end unattended -- and can't be until a real `TOTP_SECRET` exists. `ALLOW_MFA_UNCONFIGURED=true` remains load-bearing.
+- Judgment calls #2 and #3 from `journey_unknown_fallback_review` are still unreviewed against live behavior. #1 turned out to be a real bug on first contact, which is reason to treat the other two as likely-wrong rather than probably-fine.
+
+## CLAUDE.md v3.9 -- `MAX_LOGINS_PER_DAY` removed; `LOGIN_INTERVAL_S` becomes the single login limit -- 2026-08-26
+
+**Trigger:** a live incident on the dashboard at 15:13-15:17 EDT -- five consecutive cycles of authed `FAIL (session_expired)` on a session that was working perfectly at 15:12 and logged in first-try at 15:18.
+
+**Diagnosis (no code changed during the investigation):**
+- The five rows were `latency_ms=0.0` with no screenshot artifact, i.e. `main.py`'s synthetic `_session_expired_result()`, not a real `run_authed_check()` failure. No browser was ever launched. The only route there is `session.is_session_fresh()` returning False.
+- Root cause was a **skew between two clocks that were both set to 600s**. `save_session_state()` runs inside `run_journey()`'s stopwatch (before the return), so the session file's mtime is stamped at ~19:02:30 UTC. `db.append_login_event(ts=_now_iso())` runs *after* `run_journey()` returns -- and browser/driver teardown hung for **exactly 300.1s** that cycle -- so the login row was stamped 19:07:30. `SESSION_MAX_AGE_S` counts from the file, `LOGIN_INTERVAL_S` counts from the row. Session went stale at 19:12:30; the budget didn't open until 19:17:30. Five dead minutes.
+- Confirmed by SQL across the whole run: normal post-journey overhead is ~0.3-0.5s, and there are **zero** `session_expired` rows anywhere else in a 100-minute stretch. Two outliers found: 300.1s (2026-08-26, this one, on a *successful* login) and 1015.7s (2026-08-25, on a `bot_challenge` failure, so no session was written and no skew resulted).
+- Rules held throughout: Rule 17 kept `session_expired` at weight 0, no burst opened, verdict stayed UP, no incident row, no page. The bug was cosmetic-plus-blind-spot, never a false alert.
+
+**Separately diagnosed while in here (2026-08-26 evening, sparse dashboard rows):** the hourly-ish cycle rows from ~16:10 EDT onward are **macOS sleep**, confirmed against `pmset -g log`. The laptop has been on battery cycling through Deep Idle with ~45s dark-wake windows. The 18:17:23 EDT row is a single cycle spanning 28 minutes across three dark wakes: pulse OK (2s), then `page.goto` killed mid-navigation when the wake window expired (`nav_error`, 6.7KB blank screenshot), burst re-probe deferred 24 minutes to the next wake where it **passed** (main track never left UP), then the recovery login hit Cloudflare (`bot_challenge`) -> auth track CONFIG_ERROR, stuck 3h42m until manually cleared at 21:59:45 EDT. **No data collected on this laptop under battery is usable as a Stage 7 baseline.** Local workaround is `caffeinate -dimsu`; the real fix is Stage 7's always-on VM.
+
+**Also found while tracing (not fixed, logged for later):**
+- A **permanently failing login can never page.** Each failed login scores 1 (soft); the burst re-probes that follow it return `session_expired` which scores 0 by design (Rule 17); cycles are 60s and `BURST_WINDOW_S` is 90s, so confidence oscillates 1,2,1,2 and never reaches `AUTH_DOWN_CONFIDENCE=4`. `element_missing` on the login form (already seen live 4x) would loop silently forever with the dashboard reading UP.
+- `cycles.authed_ok` is written `False` when the auth probe was skipped entirely (budget denied, no browser opened). CLAUDE.md Rule 16 defines it as the real True/False "whenever the authed check actually ran" -- a NULL would be more faithful there.
+- `cycles.render_ok` records only the *initiating* probe, so a cycle whose burst re-probe passed still renders as RENDER FAIL on the dashboard even though the main track stayed UP (visible on the 18:17:23 row).
+- `cycles.burst_id` falls back to `main_burst_id` when `fail_layer == "authed"` but no auth burst ran, so an authed-attributed row can display the main track's burst badge (also visible on 18:17:23).
+
+**Changed (v3.9):**
+- `monitor/main.py` -- `_login_budget_allows()`: removed the `MAX_LOGINS_PER_DAY` / `count_login_events_since()` check. `LOGIN_INTERVAL_S` is the whole function now.
+- `config.py` -- `MAX_LOGINS_PER_DAY` constant deleted; added a `MIN_LOGIN_INTERVAL_S = 60` startup floor (`sys.exit` below it) since `LOGIN_INTERVAL_S` now carries the limit alone, and a cooldown shorter than `CHECK_INTERVAL_S` is always already satisfied by the time the next cycle asks -- it would silently limit nothing.
+- `monitor/db.py` -- `count_login_events_since()` kept but documented as unused, since the deferred `/api/logins` route + login-rate gauge is exactly that query.
+- `.env` and `.env.example` -- `MAX_LOGINS_PER_DAY` removed; `SESSION_MAX_AGE_S=600`, `LOGIN_INTERVAL_S=120` in both. The example previously shipped 1800/1800 and the live file 600/600 -- **both set the two clocks equal**, which is precisely the defect.
+- `.env.example` reference section -- rewrote the `SESSION_MAX_AGE_S` / `LOGIN_INTERVAL_S` entries around a worked Q1/Q2 example (healthy day vs. broken login), the spacing formula, the why-120 rationale, and a tombstone entry for `MAX_LOGINS_PER_DAY`. `CHECK_INTERVAL_S`'s entry now notes it sets the throttle's granularity.
+- `CLAUDE.md` -- Rule 11 amended (single limit, the CONFIG_ERROR requirement on any future ceiling, the rate formula, the never-set-them-equal rule); added a `.env (v3.9 deltas)` section; amendment-history line updated.
+
+**Why removal rather than a bigger cap:** `LOGIN_INTERVAL_S` already bounds the daily total by arithmetic -- at 120s a permanently broken login attempts once every 180s (~20/hour, ~480/day), so any cap above that is decorative and any cap below it only exists to fire. And firing was the bad outcome: the auth track stopped attempting logins until UTC midnight while `session_expired` kept scoring 0, so the platform read UP on zero authed evidence with no alert. The daily cap was the *sole* cause of that silent-blindness mode; removing it deletes the failure mode. Worst case is now "retries every 3 minutes indefinitely," which is honest and self-heals when the site returns. **If a total ceiling is ever wanted back, Rule 11 now requires it raise CONFIG_ERROR on exhaustion.**
+
+**Why 120 specifically:** the dead window opens whenever `LOGIN_INTERVAL_S + skew >= SESSION_MAX_AGE_S`. At 600 it tolerates 0s of skew (the bug). At 300 it tolerates 300s -- exactly the observed skew, i.e. borderline. At 120 it tolerates 480s. 120 also collapses the blind window when the bank invalidates a session mid-life: recovery now happens in the same cycle instead of up to ~7 minutes later. Note the achievable rate is **not** `3600/LOGIN_INTERVAL_S` -- attempts only start on `CHECK_INTERVAL_S` boundaries and the attempt itself burns time before being recorded, so spacing is `ceil((LOGIN_INTERVAL_S + login_duration) / CHECK_INTERVAL_S) * CHECK_INTERVAL_S`. 120 + ~18s rounds up to 180s, stable for login durations from ~2s to ~40s.
+
+**Verified:** `pytest` 69/69 green. `config.py` imports with the new values (600 / 120, `MAX_LOGINS_PER_DAY` absent); `monitor.main` and `monitor.db` import clean; the floor guard exits 1 on `LOGIN_INTERVAL_S=30` with the intended message. `grep` confirms no live reference to `MAX_LOGINS_PER_DAY` outside documentation and tombstones. **Not yet drilled live** -- the running monitor (PID 76193) still holds the old 600/600 config and needs a restart to pick this up.
+
+**Open / next:**
+- Restart the monitor to load 600/120, ideally under `caffeinate` so the observation isn't shredded by sleep.
+- Consider making a failing login able to page at all (see the oscillating-confidence finding above) -- currently the most likely real failure mode is silent.
+- Stage 7's soak still replaces both `SESSION_MAX_AGE_S` and `LOGIN_INTERVAL_S` with measured numbers; both remain hand-picked.
+
+## Documentation catch-up + repo hygiene before pushing -- 2026-08-26
+
+Housekeeping session, no behavior changed. The working tree had accumulated two separate
+bodies of work, only one of which was written down.
+
+**Logged the 2026-08-25 session**, which had no PROGRESS.md entry at all: the MFA locator
+fix in `journey.py`, `scripts/dump_dom.py`, `scripts/clear_config_error.py`,
+`scripts/check_totp.py`, and the `.env.example` reorganization. Entry inserted above in
+chronological order (before the v3.9 entry), not appended, so the log still reads in order.
+The v3.9 work from earlier today was already documented and needed nothing.
+
+**README corrected.** Two defects, both predating this session:
+- The Setup block's `.env` instructions had been **duplicated** -- an older paragraph and
+  its replacement were both left in, contradicting each other on what the minimum config
+  is. Merged into one.
+- It described `.env.example` as ending in a `DEAD (safe to ignore/delete)` section. No
+  such section exists; the 08-25 reorganization landed as CORE / PULSE+RENDER / AUTH /
+  ALERTING plus a reference section. Rewritten to describe the file as it actually is.
+- Layout section's one-line `scripts/` entry now names all four scripts, since two of the
+  new ones are operator tools rather than drill runners and wouldn't be found otherwise.
+
+**Hygiene:** `.DS_Store` added to `.gitignore` (it was sitting untracked in the repo root
+and would otherwise have been committed); `.env.example` given its missing trailing
+newline.
+
+**Found while cross-checking v3.9, not fixed -- needs a decision.** `config.py`'s *fallback
+defaults* are `SESSION_MAX_AGE_S=1800` and `LOGIN_INTERVAL_S=1800` -- **equal**, which is
+exactly the configuration v3.9's Rule 11 now forbids ("keep `LOGIN_INTERVAL_S` well under
+`SESSION_MAX_AGE_S` and never equal"), and the shape that caused the 5-dead-minute
+`session_expired` incident. v3.9 changed the values in `.env` and `.env.example` (to
+600/120) but not the `os.getenv` defaults behind them, so anyone running without those two
+variables set gets the forbidden pairing silently -- the `MIN_LOGIN_INTERVAL_S` floor
+doesn't catch it, since 1800 clears a 60s floor. Left alone deliberately: changing a
+default is a config decision, and the natural fix (make the defaults 600/120 to match the
+shipped example, or add a startup guard asserting `LOGIN_INTERVAL_S < SESSION_MAX_AGE_S`
+by some margin) is a small behavior change that should be chosen, not slipped in during a
+docs pass. The guard is probably the better of the two -- it enforces the rule rather than
+just avoiding one instance of breaking it.
+
+**Verified:** `pytest` 69/69 green.
+
+### Addendum -- the captures already held the answer (2026-08-26)
+
+Reviewing the above before pushing, the `totp_field()` hedge turned out to be unnecessary: `dump_dom.py`'s 08-25 run had **already captured the code-entry screen** (`data/dom_dumps/20260825T194512Z/03_verification_code_screen/`). Nobody had read it. All three locators check out against that markup, and two things in it are worth recording:
+
+- **The field is `"Verification code"`** -- guess #2 of the three. Named by `<label for=":r8k:">`, so `exact=True` is safe. Collapsed to the single locator; the two dead alternatives are gone. The `id` (`:r8k:`) is React-generated and unstable, and `data-testid="code-text-field"` is outside Rule 3 -- neither is usable, which is the case for `get_by_role` rather than against it.
+- **The factor picker and the code screen share one URL** (`/nxg-olb/beta/mfaVerification`) as two render states. The heading is the *only* thing distinguishing them, so `mfa_heading()`'s union is load-bearing rather than cautious. `enter_code_button()` also gained `exact=True`, matching the rest of the file.
+
+**Two findings from the same capture, neither acted on:**
+- The code screen carries a **device-registration choice** -- `"Yes, register my private device"` / `"No, this is a public device"` (both `type=submit`) -- that `submit_totp()` never clicks; it fills the code and presses Enter. Whether Enter completes the flow, and which choice an unattended monitor should make (registering the device plausibly suppresses future challenges, which is what a machine logging in repeatedly wants), is unresolved and probably matters more to Stage 7 than the locators do.
+- The picker offers `send a text ...`, two `call phone number ...` rows, **and** `send code to authenticator`. So an authenticator factor is offered, which makes capturing a `TOTP_SECRET` look feasible -- but the button existing is not proof the account is enrolled.
+
+**Also traced and not fixed -- new backlog item.** An exception raised inside a cycle (as a Playwright strict-mode violation would be, if a redesign ever made two locator alternatives match at once) is not caught anywhere: `submit_totp()`'s `except AssertionError` wraps only the visibility wait, `_run_full_login()` and `guarded_cycle()` have no handler, and the cycle is launched fire-and-forget via `asyncio.create_task`. The exception dies in an orphaned task, **no `cycles` or `checks` row is written for that cycle (Rule 6), and the state machine never sees a failure so the verdict stays UP.** Silent blindness, structurally the same shape as the `MAX_LOGINS_PER_DAY` hole v3.9 closed. Independent of the locators; worth a guard.
