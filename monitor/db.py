@@ -1,5 +1,6 @@
 """SQLite schema init and check-row writes. Parameterized SQL only."""
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 from monitor.state import MonitorState
@@ -60,7 +61,11 @@ CREATE TABLE IF NOT EXISTS login_events (
 -- authed_ok carries the initiating auth probe's real True/False whenever the auth track ran
 -- that cycle -- INCLUDING while its own alert was suppressed per Rule 16, since suppression
 -- withholds the page, never the evidence. It is NULL only when the auth track didn't run at
--- all (journey unconfigured, or the track sitting in its own CONFIG_ERROR per Rule 10).
+-- all: journey unconfigured, the track sitting in its own CONFIG_ERROR per Rule 10, or
+-- [v3.9] nothing actually contacted the platform because there was no usable session AND
+-- the recovery login was paused (Rule 16) or refused by the budget (Rule 11). That last
+-- case used to write False, which read on the dashboard and in the CSV as "the authed
+-- layer failed" when the truth was "we never looked" -- see main.py's _run_auth_probe.
 CREATE TABLE IF NOT EXISTS cycles (
     cycle_id TEXT PRIMARY KEY,
     ts TEXT NOT NULL,
@@ -88,6 +93,32 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     # violation even though there's no actual concurrent access.
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+
+    # [v3.9 / Stage H P1] WAL + a longer busy_timeout, on every connection.
+    #
+    # The default rollback journal takes a whole-database lock, so a reader and the writer
+    # genuinely exclude each other: a dashboard CSV export holding a SHARED lock blocks the
+    # cycle loop's append_check() from taking its EXCLUSIVE lock at commit. Measured on a
+    # one-year DB (~1M checks rows): the writer stalled 1.42s behind a large export, and a
+    # 7s export made it fail outright with "database is locked" once the 5s default
+    # busy_timeout expired. That exception lands in append_check -- BEFORE apply_check --
+    # so the probe was lost. Rule 18's net now records such a minute as DEGRADED instead of
+    # dropping it silently, but recording a self-inflicted blind minute is damage control,
+    # not a fix: the point of WAL is that the minute never goes blind at all.
+    #
+    # WAL lets readers and one writer proceed concurrently, which is exactly this app's
+    # shape (a single writer in the asyncio loop, short-lived reader connections per web
+    # request). It is a persistent property of the database file, not the connection, so
+    # setting it here is idempotent -- every later connection just reads back "wal".
+    # busy_timeout is per-connection, hence set on all of them; 15s covers a slow export on
+    # the modest Stage 7 VM without letting a genuinely stuck writer hang a cycle forever.
+    #
+    # NOTE: WAL adds -wal/-shm sidecar files next to the DB and requires the filesystem to
+    # support shared memory -- fine locally and on the Azure VM's ext4, but it does NOT work
+    # reliably on network filesystems. If DB_PATH is ever moved to an SMB/NFS share this
+    # must be revisited. `data/` is gitignored, so the sidecars need no .gitignore change.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
 
@@ -299,6 +330,10 @@ def close_incident(
 
 
 def get_last_check_ts(conn: sqlite3.Connection) -> str | None:
+    """Newest row across BOTH tracks (no `track` filter) -- this is what backs
+    /healthz's staleness check in monitor/web/app.py, which treats the monitor as
+    unhealthy if nothing has been written in 3x CHECK_INTERVAL_S regardless of which
+    track wrote it, since either track going silent means the loop itself has stalled."""
     row = conn.execute("SELECT ts FROM checks ORDER BY id DESC LIMIT 1").fetchone()
     return row["ts"] if row else None
 
@@ -315,15 +350,39 @@ def uptime_pct(conn: sqlite3.Connection, since_ts: str) -> float | None:
 
     Returns None when the window holds no cycles at all: Stage R's migration is additive
     with no backfill, so a window predating the cycles table reports "n/a" rather than a
-    number computed from a different denominator."""
+    number computed from a different denominator.
+
+    [v3.9 / Stage H P2] The denominator counts only cycles that actually produced platform
+    evidence -- verdict UP or DOWN. CONFIG_ERROR and DEGRADED are excluded from BOTH sides.
+
+    Why: the denominator used to be every cycle, so anything that wasn't literally 'UP'
+    counted as downtime. Because the stored verdict is worst_of(main, auth), a single stale
+    LOGIN_PASSWORD -> auth_rejected -> CONFIG_ERROR made every subsequent cycle write
+    verdict='CONFIG_ERROR' (main.py holds the track there until a human clears it, and per
+    the backlog the only way to clear it today is a manual DB edit). The dashboard then
+    reported 0.0% uptime for 24h/7d/30d while pulse and render passed every single minute
+    and the platform was entirely healthy -- an audit-grade number describing a total
+    outage that never happened. Rule 13 says CONFIG_ERROR is not an outage; this makes the
+    arithmetic agree with the rule. DEGRADED is excluded on the same grounds: Rule 18's
+    self-health row means "the monitor broke, we do not know what the platform was doing",
+    and a minute we could not measure is not a minute of downtime.
+
+    The honest consequence, accepted deliberately: a window containing ONLY excluded
+    verdicts has an empty denominator and reports None -> "n/a" on the dashboard, not
+    "100%". "We could not tell you" is the truthful answer there, and the banner is
+    already showing CONFIG_ERROR/DEGRADED alongside it to say why. Reporting 100% would be
+    the same class of lie as the 0.0% this replaces, in the opposite direction."""
     row = conn.execute(
-        "SELECT COUNT(*) c, SUM(CASE WHEN verdict = 'UP' THEN 1 ELSE 0 END) up "
+        "SELECT "
+        "  SUM(CASE WHEN verdict IN ('UP', 'DOWN') THEN 1 ELSE 0 END) measured, "
+        "  SUM(CASE WHEN verdict = 'UP' THEN 1 ELSE 0 END) up "
         "FROM cycles WHERE ts >= ?",
         (since_ts,),
     ).fetchone()
-    if row["c"] == 0:
+    measured = row["measured"] or 0  # SUM over zero rows is NULL, not 0
+    if measured == 0:
         return None
-    return round(row["up"] * 100.0 / row["c"], 2)
+    return round((row["up"] or 0) * 100.0 / measured, 2)
 
 
 def get_open_incident(conn: sqlite3.Connection, track: str = "main") -> dict | None:
@@ -423,6 +482,50 @@ def export_cycles(conn: sqlite3.Connection, ts_from: str | None, ts_to: str | No
     clause, params = _range_clause(ts_from, ts_to)
     rows = conn.execute(f"SELECT * FROM cycles {clause} ORDER BY ts ASC", params).fetchall()
     return [dict(r) for r in rows]
+
+
+# Table -> ORDER BY column for the streaming export below. Doubles as the allowlist: a
+# table name reaches SQL only by being a key here, never from the request.
+_EXPORT_ORDER = {"cycles": "ts", "checks": "id"}
+
+
+def iter_export(
+    conn: sqlite3.Connection, table: str, ts_from: str | None, ts_to: str | None
+) -> Iterator[dict]:
+    """[v3.9 / Stage H P1] Lazy row-at-a-time twin of export_cycles/export_checks.
+
+    Why this exists: the export route used to .fetchall() the whole table into a list of
+    dicts and then "".join() the entire CSV into one string, inside the monitor's own
+    process (Rule 8 -- uvicorn and the cycle loop share it, there is no second process to
+    absorb the cost). Measured on a one-year DB (525,600 cycles / 1,051,200 checks): 715MB
+    peak RSS for the fetch, 736MB once the CSV string existed, and ~35s of GIL-bound work
+    that starves the asyncio cycle loop meanwhile. The dashboard's "Download Logs" button
+    sends exactly that request when the date filters are empty, which is the default state
+    of the page -- so two operators clicking it during an incident is an OOM kill of the
+    monitor on the planned B2s VM. Iterating the cursor instead keeps memory flat and
+    constant regardless of table size.
+
+    The caller MUST keep `conn` open until the iterator is exhausted or closed -- the rows
+    come from a live cursor, not a materialised list. sqlite3 cursors are iterable and
+    fetch in batches, so this holds one batch in memory, not the result set.
+
+    export_cycles/export_checks are intentionally left in place: get_checks_for_cycle and
+    the tests want a concrete list, and a small bounded read is clearer as a list."""
+    order_by = _EXPORT_ORDER[table]  # KeyError on anything not allowlisted, by design
+    clause, params = _range_clause(ts_from, ts_to)
+    cursor = conn.execute(f"SELECT * FROM {table} {clause} ORDER BY {order_by} ASC", params)
+    for row in cursor:
+        yield dict(row)
+
+
+def count_export_rows(
+    conn: sqlite3.Connection, table: str, ts_from: str | None, ts_to: str | None
+) -> int:
+    """Row count for the same window iter_export would return -- lets the route refuse an
+    unreasonably large zip before doing the work, rather than discovering it by dying."""
+    _ = _EXPORT_ORDER[table]  # same allowlist gate
+    clause, params = _range_clause(ts_from, ts_to)
+    return conn.execute(f"SELECT COUNT(*) c FROM {table} {clause}", params).fetchone()["c"]
 
 
 def get_checks_for_cycle(conn: sqlite3.Connection, cycle_id: str) -> list[dict]:
