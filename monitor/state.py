@@ -1,11 +1,11 @@
 """Pure state machine: (previous_state, probe_result) -> (new_state, events). No I/O.
 
 Stage 5 rework: replaces the old "N consecutive fails" rule with a confirmation-burst /
-confidence-score model (CLAUDE.md Rule 2, Stage 5). Each failing probe is weighted by how
+confidence-score model (CLAUDE.md Rule 2 "alert only on transitions", Stage 5). Each failing probe is weighted by how
 strong its evidence is; DOWN fires once the accumulated score within a burst reaches
 DOWN_CONFIDENCE. A passing probe at any point clears the burst with no alert (a flap).
 Config-class reasons (auth_rejected, bot_challenge, mfa_failed, rate_limited) bypass
-scoring entirely and route straight to CONFIG_ERROR — see Rule 10.
+scoring entirely and route straight to CONFIG_ERROR — see Rule 4 "never retry a credential rejection".
 
 [v3.1] DOWN additionally requires at least MIN_FAILED_PROBES distinct failed probes in
 the burst, not just a high enough score — a burst of two hard failures (score 4) no
@@ -14,11 +14,11 @@ severe-but-brief probes from paging as fast as a slower, better-corroborated out
 
 [v3.8 / Stage R] Two additions, both still pure:
 - `session_expired` is its own class (weight 0, like config) but does NOT route to
-  CONFIG_ERROR -- Rule 17 says it "is not platform evidence" at all. It leaves the state
+  CONFIG_ERROR -- Rule 3 "session_expired never scores" says it "is not platform evidence" at all. It leaves the state
   completely untouched and emits no event; the recovery login CLAUDE.md describes as its
   follow-up is a separate, later apply_check() call carrying its own real fail_reason
   (or a pass), not something this function orchestrates.
-- `precursor_down` (Rule 16): when True, a failing call on the auth track that would
+- `precursor_down` (the "Cross-track suppression" section): when True, a failing call on the auth track that would
   otherwise cross into DOWN is suppressed -- confidence/fail_reasons/burst_started_ts
   still update normally (the evidence is real and keeps accumulating), but status is
   held at UP and no DownEvent fires, so the login-screen-down incident doesn't get a
@@ -50,7 +50,7 @@ SESSION_WEIGHT = 0
 
 def classify(fail_reason: str) -> tuple[str, int]:
     """Returns (class_name, weight) for a fail_reason: 'hard' (2), 'soft' (1), 'config' (0),
-    or 'session' (0, [v3.8] never scores and never routes to CONFIG_ERROR -- see Rule 17)."""
+    or 'session' (0, [v3.8] never scores and never routes to CONFIG_ERROR -- see Rule 3 "session_expired never scores")."""
     if fail_reason in _SESSION_REASONS:
         return "session", SESSION_WEIGHT
     if fail_reason in _CONFIG_REASONS:
@@ -118,7 +118,7 @@ def apply_check(
     transition — never re-emits while an incident (DOWN or CONFIG_ERROR) is ongoing, and
     never mid-burst before the confidence threshold is crossed.
 
-    precursor_down [v3.8 Rule 16]: only meaningful for the auth track, when the main
+    precursor_down [v3.8, the "Cross-track suppression" section]: only meaningful for the auth track, when the main
     track's incident is already open and explains the symptom. Defaults to False, which
     keeps every existing (main-track) call site's behavior unchanged."""
     if ok:
@@ -140,7 +140,7 @@ def apply_check(
     cls, weight = classify(fail_reason)
 
     if cls == "session":
-        # [v3.8 Rule 17] Not platform evidence -- leaves state and burst untouched, no
+        # [v3.8 Rule 3 "session_expired never scores"] Not platform evidence -- leaves state and burst untouched, no
         # event, on any track and in any status. The follow-up recovery login (or its
         # absence, per the login budget) is a separate apply_check() call with its own
         # real fail_reason.

@@ -8,7 +8,7 @@ consumed. It exercises exactly the code path submit_totp() uses (journey.get_fre
 rather than a reimplementation, so agreement here means agreement there.
 
 Note it deliberately prints the live code -- that is the entire point of the drill, and
-it is the one place Rule 7's "never rendered" gives way to a human verifying the factor
+it is the one place Rule 16's "never logged, rendered, or screenshotted" gives way to a human verifying the factor
 by eye. Run it in a terminal nobody is looking over, and don't paste the output anywhere.
 The SECRET itself is never printed.
 

@@ -1,8 +1,8 @@
-"""Locks CLAUDE.md v3.8's verdict rule and Rule 4's operator wording.
+"""Locks CLAUDE.md v3.8's verdict rule and Rule 10's operator wording.
 
 These assertions exist because the wording had already drifted once: the dashboard used
-Rule 4's phrasing while the alert email -- the surface that actually pages a human -- still
-used pre-v3.8 text. Rule 4's promise is that an operator never needs a browser to know
+Rule 10's phrasing while the alert email -- the surface that actually pages a human -- still
+used pre-v3.8 text. Rule 10's promise is that an operator never needs a browser to know
 which wall failed, so the exact strings are part of the contract, not cosmetic.
 """
 import pytest
@@ -11,7 +11,7 @@ from monitor.state import ConfigErrorEvent, DownEvent, RecoveryEvent
 from monitor.verdict import AUTHED_WORDING, PRECURSOR_WORDING, layer_wording, severity, unified_verdict
 
 
-# --- Rule 4 wording ---
+# --- Rule 10 "every DOWN names its layer" wording ---
 
 def test_precursor_layers_share_the_login_screen_wording():
     for layer in ("pulse", "render"):
@@ -46,7 +46,7 @@ def test_unified_verdict_is_worst_of(main_status, auth_status, expected):
 
 def test_auth_track_absent_leaves_main_deciding():
     """auth_status=None means the auth track didn't participate (unconfigured, or its own
-    CONFIG_ERROR per Rule 10) -- the base pulse/render monitor still works standalone."""
+    CONFIG_ERROR per Rule 4 "never retry a credential rejection") -- the base pulse/render monitor still works standalone."""
     assert unified_verdict("UP", None) == "UP"
     assert unified_verdict("DOWN", None) == "DOWN"
 
@@ -91,7 +91,7 @@ def test_down_email_still_sends_for_an_unmapped_layer():
 
 
 def test_config_email_says_sign_in_checks_paused():
-    """Rule 10 halts the auth track only -- the pulse/render precursor keeps checking, so
+    """Rule 4 "never retry a credential rejection" halts the auth track only -- the pulse/render precursor keeps checking, so
     the old "Checks paused" overstated the outage."""
     from monitor.channels.email_gmail import config_message
 

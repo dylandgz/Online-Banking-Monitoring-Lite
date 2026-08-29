@@ -95,7 +95,7 @@ async def main() -> None:
 
     ts = _now_iso()
 
-    # Rule 6 / Stage 6 spec: every sign-in attempt is its own audit row, independent of
+    # Rule 15 "every probe writes a checks row" / Stage 6 spec: every sign-in attempt is its own audit row, independent of
     # the checks table (which _process_probe writes below in the same call).
     db.append_login_event(
         conn, ts=ts, ok=result.ok, latency_ms=result.latency_ms,

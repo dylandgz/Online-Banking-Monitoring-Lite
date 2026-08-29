@@ -1,5 +1,5 @@
 """Presentation-layer time formatting (CLAUDE.md v3.1). Storage stays UTC ISO-8601
-(Rule 6) everywhere in SQLite -- this module only converts for display: dashboard,
+(Rule 15 "every probe writes a checks row") everywhere in SQLite -- this module only converts for display: dashboard,
 email bodies, /api responses, CSV export."""
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo

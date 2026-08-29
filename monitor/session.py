@@ -1,7 +1,7 @@
 """Stage 8: session persistence for the sign-in journey. A single storageState file
 (cookies + localStorage, including Cloudflare's cf_clearance) is saved after a
 successful full login and reused by cheap checks so they don't need to submit
-credentials/TOTP again. Rule 7: this file is a real secret, same tier as TOTP_SECRET --
+credentials/TOTP again. Rule 16 "secrets from .env only": this file is a real secret, same tier as TOTP_SECRET --
 gitignored, chmod 600, never logged or screenshotted.
 """
 from __future__ import annotations
@@ -44,7 +44,7 @@ def is_session_fresh(path: str, max_age_s: int) -> bool:
     exactly the false positive this project ranks above every other concern.
 
     Returning False here routes the cycle down the already-correct path instead: no fresh
-    session -> the budgeted recovery login runs (Rule 11) -> a valid session is written ->
+    session -> the budgeted recovery login runs (Rule 5 "the login budget is a hard limit") -> a valid session is written ->
     the condition self-heals with no page and no human. So the fix is also the cheapest
     possible one; it just has to happen here, before anything trusts the file.
 
@@ -52,7 +52,7 @@ def is_session_fresh(path: str, max_age_s: int) -> bool:
     file is intact, which is the failure mode being guarded. Validating Playwright's
     storage_state shape would couple this module to that format for no additional safety --
     a structurally-valid-but-wrong session simply fails auth and routes to session_expired,
-    which Rule 17 already handles."""
+    which Rule 3 "session_expired never scores" already handles."""
     p = Path(path)
     try:
         age_s = time.time() - p.stat().st_mtime
@@ -67,7 +67,7 @@ def is_session_fresh(path: str, max_age_s: int) -> bool:
             json.load(handle)
     except (OSError, ValueError):
         # ValueError covers json.JSONDecodeError. A file we can't read or can't parse is
-        # not a session -- say so plainly (no contents echoed: Rule 7).
+        # not a session -- say so plainly (no contents echoed: Rule 16 "secrets from .env only").
         print(f"[session] {path} is unreadable or not valid JSON -- treating as no session "
               f"so the recovery login can replace it.", flush=True)
         return False

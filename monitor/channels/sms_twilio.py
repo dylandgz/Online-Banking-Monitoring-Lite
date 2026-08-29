@@ -2,7 +2,7 @@
 monitor/channels/base.py -- see CONTRIBUTING.md for the contract this was built against.
 
 Reads its own TWILIO_*/SMS_TO_NUMBER env vars directly -- config.py never reads SMS_*
-(Rule 15 / CONTRIBUTING.md's "files you may touch").
+(Rule 18 "alert channels are plug-ins" / CONTRIBUTING.md's "files you may touch").
 
 TWILIO_CONTENT_SID is optional: trial Twilio accounts reject freeform `body` sends and
 require an approved Content Template instead. When set, the whole formatted message is

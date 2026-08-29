@@ -1,6 +1,6 @@
 """Alert channels: plug-ins that each implement AlertChannel.send(event). Dispatch fans an
 event out to every enabled channel, with a per-channel try/except so one channel's failure
-never blocks another or the check loop (Rule 15)."""
+never blocks another or the check loop (Rule 18 "alert channels are plug-ins")."""
 import asyncio
 
 from monitor.channels.base import AlertChannel

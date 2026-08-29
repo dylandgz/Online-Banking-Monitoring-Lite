@@ -19,7 +19,7 @@ Each capture writes, per frame:
   page.html    -- that frame's full serialized DOM
 
 Output goes to data/dom_dumps/<run timestamp>/NN_<label>/. Input values are stripped
-from both outputs (Rule 7: a value can hold the password or a live OTP).
+from both outputs (Rule 16 "secrets from .env only": a value can hold the password or a live OTP).
 
 Usage: .venv/bin/python -m scripts.dump_dom
 """
@@ -109,7 +109,7 @@ def _locator_line(el: dict) -> str:
         return f'page.get_by_role("{el["role"]}")   # unnamed -- needs scoping'
     if el["name"]:
         return f'page.get_by_text("{el["name"]}")'
-    return "# no role and no accessible name -- not addressable under Rule 3"
+    return "# no role and no accessible name -- not addressable under Rule 11 'locators'"
 
 
 async def capture(page, run_dir: Path, step: int, label: str) -> None:

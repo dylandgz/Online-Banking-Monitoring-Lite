@@ -122,7 +122,7 @@ def healthz():
 @app.get("/api/status", dependencies=[Depends(require_auth)])
 def api_status(conn=Depends(get_conn)):
     """[v3.8 / Stage R] platform_status = worst_of(main, auth) -- the banner and every
-    field here speak platform-level, not just the pulse/render track, per Rule 16/the
+    field here speak platform-level, not just the pulse/render track, per the "Verdict" section / the
     "one platform, one verdict" realignment."""
     main_state = db.get_state(conn, track="main")
     auth_state = db.get_state(conn, track="auth")
@@ -133,7 +133,7 @@ def api_status(conn=Depends(get_conn)):
     fail_wording = None
     screenshot_path = None
     if verdict != "UP":
-        # Whichever track is at least as severe explains the verdict (Rule 4: name the
+        # Whichever track is at least as severe explains the verdict (Rule 10 "every DOWN names its layer": name the
         # failed layer). Ties (both DOWN, say) favor main -- it's the precursor.
         responsible_track = "main" if severity(main_state.status) >= severity(auth_state.status) else "auth"
         responsible_state = main_state if responsible_track == "main" else auth_state
@@ -206,7 +206,7 @@ def api_cycle_probes(cycle_id: str, conn=Depends(get_conn)):
 
 
 # CSV export column order, per table. Kept as (header, row-key) pairs so the header and the
-# values can't drift apart -- Rule 6 requires the export to be row-for-row faithful.
+# values can't drift apart -- Rule 15 "every probe writes a checks row" requires the export to be row-for-row faithful.
 _EXPORT_COLUMNS = {
     "cycles": [
         ("cycle_id", "cycle_id"), ("ts_eastern", "ts"), ("pulse_ok", "pulse_ok"),
@@ -233,7 +233,7 @@ def _csv_lines(table: str, rows: list[dict]):
     for row in rows:
         buf.seek(0)
         buf.truncate(0)
-        # ts is the only converted column (Rule 6: storage UTC, presentation Eastern).
+        # ts is the only converted column (Rule 15 "every probe writes a checks row": storage UTC, presentation Eastern).
         writer.writerow([to_eastern(row[key]) if key == "ts" else row[key] for _, key in columns])
         yield buf.getvalue()
 
@@ -250,7 +250,7 @@ def api_export(
     table=all zips both together as a single download -- what the dashboard's "Download
     Logs" button uses. The two tables are deliberately NOT merged into one CSV: they have
     different schemas and different grains (one row per minute vs. one row per probe), and
-    Rule 6 requires each export to stay row-for-row faithful to its table. A zip keeps both
+    Rule 15 "every probe writes a checks row" requires each export to stay row-for-row faithful to its table. A zip keeps both
     intact and keeps them reconcilable against each other, which a flattened join would
     destroy.
 
@@ -287,7 +287,7 @@ def api_export(
 # 4GB VM, while refusing the unbounded "export everything, forever" request that the
 # dashboard's default (empty filters) used to send. Not a silent truncation: exceeding it
 # is a 413 naming the count and telling the operator to narrow the range, because quietly
-# returning a partial audit export would be worse than refusing (Rule 6).
+# returning a partial audit export would be worse than refusing (Rule 15 "every probe writes a checks row").
 _MAX_ZIP_ROWS_PER_TABLE = 200_000
 
 

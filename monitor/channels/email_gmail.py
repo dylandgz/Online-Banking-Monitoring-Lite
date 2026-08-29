@@ -26,12 +26,12 @@ def down_message(event: DownEvent) -> str:
         [MONITOR] {name} DOWN since {eastern} — {layer wording} (confidence {n}: {reasons}).
         Dashboard: {url}
 
-    where the layer wording is Rule 4's exact operator phrasing for the failed layer --
+    where the layer wording is Rule 10's exact operator phrasing for the failed layer --
     "login screen unreachable / not rendering" for a precursor (pulse/render) failure,
     "online banking behind login not rendering" for an authed one. Before this, the email
     said "{trigger_layer} failed" plus a hand-written hint, so an operator paged at 3am read
     "render failed / page loads, content missing" while the dashboard (which they'd have to
-    open) showed Rule 4's wording. Rule 4 exists precisely so they don't need the browser.
+    open) showed Rule 10's wording. Rule 10 "every DOWN names its layer" exists precisely so they don't need the browser.
 
     The fallback covers a trigger_layer this vocabulary doesn't know: name it plainly and
     still send, rather than let an unmapped layer suppress the page entirely."""
@@ -51,7 +51,7 @@ def recovery_message(event: RecoveryEvent) -> str:
 
 def config_message(event: ConfigErrorEvent) -> str:
     # "Sign-in checks paused" per v3.8's locked copy -- and it's also the accurate
-    # statement: a CONFIG_ERROR halts the auth track (Rule 10), while the pulse/render
+    # statement: a CONFIG_ERROR halts the auth track (Rule 4 "never retry a credential rejection"), while the pulse/render
     # precursor keeps checking every cycle. The old "Checks paused" read as though the
     # whole monitor had stopped.
     return (

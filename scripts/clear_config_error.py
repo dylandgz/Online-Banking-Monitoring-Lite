@@ -1,8 +1,8 @@
 """Clears a stuck CONFIG_ERROR so the track resumes checking -- the "human clears it"
-half of Rule 10, which until now had no implementation (CLAUDE.md backlog: "the only way
+half of Rule 4 "never retry a credential rejection", which until now had no implementation (CLAUDE.md backlog: "the only way
 to clear a stuck track is a manual DB edit or a passing manual drill run").
 
-Rule 10 is deliberate: a credential rejection, bot challenge or MFA failure halts logins
+Rule 4 "never retry a credential rejection" is deliberate: a credential rejection, bot challenge or MFA failure halts logins
 until a person has looked at it, precisely so the monitor can never retry its way into a
 lockout. This script is that person saying "I looked, I fixed the cause, resume" -- it is
 not a retry mechanism, and nothing automated may ever call it.

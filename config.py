@@ -2,9 +2,69 @@
 import os
 import sys
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
+from dotenv.parser import parse_stream
 
-load_dotenv()
+
+def _load_env_or_exit() -> None:
+    """[B33, 2026-08-29] Refuse to start on a .env containing any line python-dotenv
+    cannot parse, instead of load_dotenv()'s default behaviour of printing a warning to
+    stderr and carrying on.
+
+    Why this is worth a startup guard rather than a warning: dotenv treats every
+    unparseable line identically -- warn once, skip it, continue. A stray note missing its
+    '#' is harmless that way, but a REAL assignment that got mangled is silently dropped
+    and os.getenv() then falls through to the hardcoded default below, so the monitor comes
+    up looking healthy while running on a value nobody chose, with one line on stderr as
+    the only evidence. That is the same class of silent misconfiguration this file already
+    refuses to allow for missing required settings and for LOGIN_INTERVAL_S below its
+    floor; an unreadable config line gets the same treatment.
+
+    Verified shapes dotenv rejects: a line whose '=' is missing entirely (LOGIN_PASSWORD
+    "x" -- easy to produce by pasting out of a document), an unterminated quote
+    (KEY='value with no closing quote), and any prose line. Note it does NOT reject
+    'KEY =value' -- surrounding whitespace is tolerated -- so this catches structural
+    damage, not every possible typo.
+
+    Rule 16 "secrets from .env only": the offending line's CONTENT is never echoed. A
+    mangled line is most likely a mangled assignment, and the value half of it may well be
+    LOGIN_PASSWORD or TOTP_SECRET. Line numbers are enough to find it and are safe to print
+    into a log or a terminal someone else can see.
+
+    One subtlety, found while verifying this function and worth keeping: the path is
+    resolved ONCE and both the check and the load use it. Bare load_dotenv() runs its own
+    discovery that walks up from the calling frame's file (this config.py's directory),
+    while find_dotenv(usecwd=True) walks up from the process working directory. Those
+    resolve to different files whenever the monitor is started from outside the repo root,
+    which would let this guard hand a clean bill of health to a file that was never
+    loaded -- exactly the failure it exists to prevent."""
+    path = find_dotenv(usecwd=True)
+    if not path:
+        return  # no .env anywhere; the environment alone must supply everything
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            bad_lines = [b.original.line for b in parse_stream(handle) if b.error]
+    except OSError as exc:
+        sys.exit(f"Could not read {path}: {exc.strerror}")
+
+    if bad_lines:
+        numbers = ", ".join(str(n) for n in bad_lines)
+        plural = "s" if len(bad_lines) > 1 else ""
+        sys.exit(
+            f"{path} has {len(bad_lines)} line{plural} that could not be parsed as a "
+            f"setting: line{plural} {numbers}.\n"
+            "Refusing to start: an unparseable line is skipped silently, so a mangled "
+            "assignment would fall back to a hardcoded default and the monitor would run "
+            "misconfigured while looking healthy.\n"
+            "Fix it, or prefix it with '#' if it was meant to be a comment. (The line's "
+            "contents are deliberately not shown here -- it may contain a credential.)"
+        )
+
+    load_dotenv(path)
+
+
+_load_env_or_exit()
 
 TARGET_NAME = os.getenv("TARGET_NAME")
 TARGET_URL = os.getenv("TARGET_URL")
@@ -37,7 +97,7 @@ ARTIFACTS_DIR = "./data/artifacts"
 
 ALERT_CHANNELS = [c.strip() for c in os.getenv("ALERT_CHANNELS", "email").split(",") if c.strip()]
 
-# Rule 14: headless is the only mode the scheduler may run; HEADLESS=false is a local-debug
+# Rule 14 "headless is the scheduler's mode": headless is the only mode the scheduler may run; HEADLESS=false is a local-debug
 # escape hatch only, never scheduled. Recorded on every check row (checks.browser_mode).
 HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"
 BROWSER_MODE = "headless" if HEADLESS else "headed"
@@ -47,11 +107,11 @@ BROWSER_MODE = "headless" if HEADLESS else "headed"
 # own distinct value that can't collide with the scheduler's "headless"/"headed".
 JOURNEY_BROWSER_MODE = "headed-xvfb"
 
-# Rule 12: only a real branded browser binary + a polite UA are permitted bot-challenge mitigations.
+# Rule 6 "bot challenges: detect, never defeat": only a real branded browser binary + a polite UA are permitted bot-challenge mitigations.
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome")
 
 # --- Stage 6: sign-in journey ---
-# [v3.2] patchright is a named, scoped exception to Rule 12 for this journey only.
+# [v3.2] patchright is a named, scoped exception to Rule 6 "bot challenges: detect, never defeat" for this journey only.
 # [v3.3] the journey always runs headed under xvfb, never honors HEADLESS -- see journey.py.
 LOGIN_URL = os.getenv("LOGIN_URL")
 # [v3.8 / Stage R] The cheap session-reuse check (run_authed_check) navigates directly
@@ -59,7 +119,8 @@ LOGIN_URL = os.getenv("LOGIN_URL")
 # authed-home route are different paths with different dependencies (auth service, MFA
 # backend, login UI bundle, Cloudflare challenge vs. just session-cookie validation), so
 # a login-route outage and a home-route outage are genuinely independent evidence. See
-# CLAUDE.md Rule 16.
+# CLAUDE.md's "The three layers" section (AUTHED_URL is navigated directly,
+# configured, never derived from LOGIN_URL).
 AUTHED_URL = os.getenv("AUTHED_URL")
 LOGIN_USER = os.getenv("LOGIN_USER")
 LOGIN_PASSWORD = os.getenv("LOGIN_PASSWORD")
@@ -81,7 +142,7 @@ MASKING_ENABLED = os.getenv("MASKING_ENABLED", "true").lower() != "false"
 CHALLENGE_TIMEOUT_MS = int(os.getenv("CHALLENGE_TIMEOUT_MS", "25000"))
 
 # NOTE: LOGIN_STRESS_MODE is deliberately absent. v3's sanctioned stress-mode exception to
-# Rule 11 is a Stage 7 task and the logic behind it was never built, so the setting existed
+# Rule 5 "the login budget is a hard limit" is a Stage 7 task and the logic behind it was never built, so the setting existed
 # only as an unread module attribute -- removed here rather than left looking implemented.
 # Stage 7 reintroduces it together with the code that actually reads it.
 
@@ -90,7 +151,13 @@ CHALLENGE_TIMEOUT_MS = int(os.getenv("CHALLENGE_TIMEOUT_MS", "25000"))
 # (cookies + localStorage, including cf_clearance) saved after a successful full login,
 # reused by the cheap every-CHECK_INTERVAL_S authed check so it needs zero logins.
 SESSION_STATE_PATH = os.getenv("SESSION_STATE_PATH", "./data/session_state.json")
-SESSION_MAX_AGE_S = int(os.getenv("SESSION_MAX_AGE_S", "1800"))
+# [B30, 2026-08-29] Default was 1800, equal to LOGIN_INTERVAL_S's old default -- the
+# exact pairing Rule 5 "the login budget is a hard limit" forbids. v3.9 fixed .env and
+# .env.example to 600/120 but missed the fallbacks behind them, so anyone running
+# without these two variables set got the forbidden config silently. Now matches the
+# shipped example, and the headroom guard below enforces the rule rather than just
+# avoiding one violation of it.
+SESSION_MAX_AGE_S = int(os.getenv("SESSION_MAX_AGE_S", "600"))
 
 # Minimum gap between full login attempts (credentials + TOTP) -- a deliberately
 # conservative, hand-picked value since there's no measured safe rate yet (that's Stage
@@ -107,20 +174,55 @@ SESSION_MAX_AGE_S = int(os.getenv("SESSION_MAX_AGE_S", "1800"))
 # It must stay meaningfully longer than one cycle or it stops limiting anything (a
 # cooldown shorter than CHECK_INTERVAL_S is always already satisfied by the time the
 # next cycle asks), hence the startup floor below rather than a daily counter.
-LOGIN_INTERVAL_S = int(os.getenv("LOGIN_INTERVAL_S", "1800"))
+LOGIN_INTERVAL_S = int(os.getenv("LOGIN_INTERVAL_S", "120"))  # [B30] was 1800; see SESSION_MAX_AGE_S above
 MIN_LOGIN_INTERVAL_S = 60
 if LOGIN_INTERVAL_S < MIN_LOGIN_INTERVAL_S:
     sys.exit(
         f"LOGIN_INTERVAL_S={LOGIN_INTERVAL_S} is below the {MIN_LOGIN_INTERVAL_S}s floor. "
-        "It is the only limit on full credential+MFA logins (Rule 11) -- a lower value "
+        "It is the only limit on full credential+MFA logins (Rule 5 'the login budget is a hard limit') -- a lower value "
         "lets a persistently failing login retry every cycle indefinitely."
+    )
+
+# [B30, 2026-08-29] The two clocks must not converge. SESSION_MAX_AGE_S is measured from
+# when the session FILE is written (inside run_journey, before it returns);
+# LOGIN_INTERVAL_S is measured from when the login ROW is recorded (after run_journey
+# returns). The gap between those two moments is post-login browser/driver teardown, and
+# it is not bounded by anything we control -- so the session can go stale while the budget
+# still refuses to authorise the login that would refresh it. Every second of that window
+# is a cycle reporting session_expired on a perfectly healthy session, with no authed
+# evidence behind the platform verdict.
+#
+# Observed live 2026-08-26: a 300.1s teardown stall on a SUCCESSFUL login, with both
+# values at 600, produced five consecutive dead minutes. Normal overhead is 0.3-0.5s.
+#
+# The invariant is headroom, not a ratio: the window opens when
+#   LOGIN_INTERVAL_S + teardown_skew >= SESSION_MAX_AGE_S
+# so what must be reserved is SESSION_MAX_AGE_S - LOGIN_INTERVAL_S, and it must cover the
+# worst teardown we have actually measured. 300s is therefore a floor derived from
+# evidence, not a round number -- and it is a floor, not a target. The shipped 600/120
+# leaves 480s.
+MIN_SESSION_HEADROOM_S = 300
+_headroom = SESSION_MAX_AGE_S - LOGIN_INTERVAL_S
+if _headroom < MIN_SESSION_HEADROOM_S:
+    sys.exit(
+        f"SESSION_MAX_AGE_S={SESSION_MAX_AGE_S} and LOGIN_INTERVAL_S={LOGIN_INTERVAL_S} "
+        f"leave only {_headroom}s of headroom; at least {MIN_SESSION_HEADROOM_S}s is "
+        "required.\n"
+        "The session clock starts when the session file is written and the login clock "
+        "when the login row is recorded, so post-login teardown time sits between them. "
+        "Too little headroom opens a window where the session is stale but the budget "
+        "still refuses the login that would refresh it -- observed live 2026-08-26 as five "
+        "minutes of false session_expired on a healthy session (300.1s teardown at "
+        "600/600).\n"
+        f"Lower LOGIN_INTERVAL_S or raise SESSION_MAX_AGE_S. Shipped values are "
+        "SESSION_MAX_AGE_S=600 / LOGIN_INTERVAL_S=120 (480s of headroom)."
     )
 
 # [v3.8 / Stage R] The auth track's own confidence thresholds -- now matched to the main
 # track's (v3.6's AUTH_DOWN_CONFIDENCE=2/AUTH_MIN_FAILED_PROBES=1 shortcut is retired: it
 # was only safe because the old design never actually bursted the auth track. Since
 # every cheap session-reuse re-probe costs zero logins, the auth track can afford the
-# same 3-probe floor as pulse/render -- see CLAUDE.md Rule 2/16.
+# same 3-probe floor as pulse/render -- see CLAUDE.md Rule 2 "alert only on transitions"/16.
 AUTH_DOWN_CONFIDENCE = int(os.getenv("AUTH_DOWN_CONFIDENCE", "4"))
 AUTH_MIN_FAILED_PROBES = int(os.getenv("AUTH_MIN_FAILED_PROBES", "3"))
 

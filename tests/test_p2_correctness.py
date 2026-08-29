@@ -2,9 +2,9 @@
 one -- the authed layer regaining the ability to report an outage.
 
 The authed-detection tests are the important ones. Before this change run_authed_check
-mapped every "loaded but the marker is missing" to session_expired, which Rule 17 makes
+mapped every "loaded but the marker is missing" to session_expired, which Rule 3 "session_expired never scores" makes
 completely inert: no score, no probe-floor credit, and it never set burst_started_ts so
-the auth burst never even began. The effect was that Rule 4's authed wording -- "online
+the auth burst never even began. The effect was that Rule 10's authed wording -- "online
 banking behind login not rendering", which IS v3.8's definition of the platform being
 down -- could not be produced by the check whose whole job is to detect it. These pin both
 halves: a real platform failure now scores, and a genuinely expired session still doesn't.
@@ -46,7 +46,7 @@ def test_uptime_ignores_config_error_cycles(conn):
 
 
 def test_uptime_ignores_degraded_cycles(conn):
-    """Rule 18's self-health rows mean 'we could not measure', not 'the platform was down'."""
+    """Rule 9's "no minute may vanish" self-health rows mean 'we could not measure', not 'the platform was down'."""
     for n in range(5):
         _cycle(conn, n, "DEGRADED")
     for n in range(5, 10):
@@ -88,7 +88,7 @@ def test_uptime_is_none_on_an_empty_window(conn):
 # --- authed_ok NULL semantics ------------------------------------------------------
 
 def test_cycles_authed_ok_accepts_null(conn):
-    """Rule 16: NULL means the auth track didn't run. Pinning that the column really is
+    """the "Cross-track suppression" section: NULL means the auth track didn't run. Pinning that the column really is
     nullable, since main.py now writes None for 'never looked'."""
     db.append_cycle(conn, cycle_id="x", ts="2026-08-24T10:00:00+00:00",
                     pulse_ok=True, render_ok=True, authed_ok=None, verdict="UP")
