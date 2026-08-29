@@ -15,7 +15,9 @@ CREATE TABLE IF NOT EXISTS checks (
     fail_reason TEXT,
     browser_mode TEXT,
     layer TEXT,
-    burst_id TEXT
+    burst_id TEXT,
+    page_url TEXT,
+    screenshot_path TEXT
 );
 
 CREATE TABLE IF NOT EXISTS incidents (
@@ -185,6 +187,19 @@ def _migrate_stage6_tracks(conn: sqlite3.Connection) -> None:
     _add_missing_columns(conn, "incidents", {"track": "TEXT NOT NULL DEFAULT 'main'"})
 
 
+def _migrate_evidence_columns(conn: sqlite3.Connection) -> None:
+    """[B16/B35] checks gains page_url and screenshot_path. Additive, no backfill --
+    historic rows carry NULL because the values were never captured.
+
+    screenshot_path closes a real evidence gap rather than adding a nicety. A screenshot is
+    written on EVERY browser-layer failure, but until now the path survived only when
+    open_incident() ran -- i.e. only on the probe that crossed the DOWN threshold. Measured
+    on the live DB: 204 files on disk, 9 reachable from any surface. Flaps, burst re-probes
+    2-4, CONFIG_ERROR failures and suppressed auth failures all captured an image whose
+    location was then dropped when _process_probe returned."""
+    _add_missing_columns(conn, "checks", {"page_url": "TEXT", "screenshot_path": "TEXT"})
+
+
 def _migrate_stage_r_cycles(conn: sqlite3.Connection) -> None:
     """[v3.8 / Stage R] Additive only, per the amendment: checks gains cycle_id (nullable
     FK, no backfill -- historic rows predate the cycles table and simply have no cycle to
@@ -198,6 +213,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _migrate_stage5_burst_columns(conn)
     _migrate_stage6_tracks(conn)
     _migrate_stage_r_cycles(conn)
+    _migrate_evidence_columns(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_burst_id ON checks(burst_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_cycle_id ON checks(cycle_id)")
@@ -221,11 +237,15 @@ def append_check(
     layer: str = "render",
     burst_id: str | None = None,
     cycle_id: str | None = None,
+    page_url: str | None = None,
+    screenshot_path: str | None = None,
 ) -> None:
     conn.execute(
-        "INSERT INTO checks (ts, ok, http_status, latency_ms, fail_reason, browser_mode, layer, burst_id, cycle_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (ts, int(ok), http_status, latency_ms, fail_reason, browser_mode, layer, burst_id, cycle_id),
+        "INSERT INTO checks (ts, ok, http_status, latency_ms, fail_reason, browser_mode, layer, "
+        "burst_id, cycle_id, page_url, screenshot_path) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (ts, int(ok), http_status, latency_ms, fail_reason, browser_mode, layer, burst_id, cycle_id,
+         page_url, screenshot_path),
     )
     conn.commit()
 

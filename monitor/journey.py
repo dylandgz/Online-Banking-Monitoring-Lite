@@ -511,6 +511,18 @@ def unexpected_fail_reason(exc: BaseException) -> str:
     return "nav_error"
 
 
+def safe_page_url(page: Page) -> Optional[str]:
+    """[B16] page.url for the record, never raising. This is only ever called on the failure
+    path, and the likeliest moment for the property to raise is precisely the failure most
+    worth reporting -- a crashed target or a closed context. Losing the URL is acceptable;
+    losing the CheckResult that describes the failure is not. Same rule capture_masked_screenshot
+    follows."""
+    try:
+        return page.url
+    except (PatchrightTimeoutError, PatchrightError):
+        return None
+
+
 async def _fail(
     page: Page,
     layer: str,
@@ -534,6 +546,7 @@ async def _fail(
         latency_ms=latency_ms,
         fail_reason=fail_reason,
         screenshot_path=screenshot_path,
+        page_url=safe_page_url(page),
         layer=layer,
     )
 
