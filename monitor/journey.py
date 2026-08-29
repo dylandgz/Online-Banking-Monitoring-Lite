@@ -28,7 +28,6 @@ import asyncio
 import re
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, Optional, Sequence
 from urllib.parse import urlsplit
@@ -46,6 +45,7 @@ from patchright.async_api import (
 
 from monitor.check import CheckResult
 from monitor.session import save_session_state
+from monitor.timeutil import artifact_stamp
 
 TOTP_INTERVAL_S = 30
 
@@ -378,7 +378,7 @@ async def capture_masked_screenshot(
     swallows PlaywrightError for the same reason. Losing the evidence image is acceptable;
     losing the fail_reason is not."""
     Path(artifacts_dir).mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ts = artifact_stamp()
     path = str(Path(artifacts_dir) / f"{ts}_{step}_{fail_reason}.png")
 
     try:

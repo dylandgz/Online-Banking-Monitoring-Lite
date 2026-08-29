@@ -1,13 +1,14 @@
 """Pulse (curl_cffi) + browser (Playwright) checks. Returns a CheckResult; no DB or email I/O here."""
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from curl_cffi import requests as curl_requests
 from curl_cffi.requests.exceptions import DNSError, ConnectionError as CurlConnectionError, Timeout as CurlTimeout, RequestException as CurlRequestException
 from playwright.async_api import async_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
+
+from monitor.timeutil import artifact_stamp
 
 
 @dataclass
@@ -88,7 +89,7 @@ async def browser_check(
 async def _save_screenshot(page, artifacts_dir: str) -> Optional[str]:
     try:
         Path(artifacts_dir).mkdir(parents=True, exist_ok=True)
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        ts = artifact_stamp()
         path = str(Path(artifacts_dir) / f"{ts}.png")
         await page.screenshot(path=path)
         return path
