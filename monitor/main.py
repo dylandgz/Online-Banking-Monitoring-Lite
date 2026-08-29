@@ -113,8 +113,42 @@ async def _sleep_until_offset(start: datetime, delay_s: float) -> None:
         await asyncio.sleep(sleep_s)
 
 
+def _fold_layer(outcomes: dict, layer: str, ok: bool) -> None:
+    """[B9] Folds one probe's outcome into the cycle's per-layer summary.
+
+    `cycles.pulse_ok` / `render_ok` answer "did every check of this kind pass this minute?"
+    -- None when no check of that kind ran, False if any failed, True when at least one ran
+    and all passed. A minute is the unit here, not a probe: a burst runs three more probes
+    after the one that opened it, and all four belong to the same minute.
+
+    Before this, both columns were derived from the cycle's FIRST probe alone and every
+    burst probe was discarded from the summary. Worked example from the live DB, cycle
+    fc32039c: the opening pulse failed (so render was correctly not attempted, render_ok
+    NULL), the burst then ran a render probe at +19s which PASSED, and the row still
+    reported render_ok NULL -- "never measured" -- for a minute in which render was measured
+    and passed. That is exactly the fact an operator wants during a DOWN incident: the login
+    page itself was fine, the failure was elsewhere. Rule 15 requires the export to be
+    row-for-row faithful, and a column that reports "not measured" about a measurement it
+    made is not."""
+    previous = outcomes[layer]
+    outcomes[layer] = ok if previous is None else (previous and ok)
+
+
+def _fold_combined_probe(outcomes: dict, result: "check.CheckResult") -> None:
+    """Folds perform_check()'s result, which evaluates two layers in one call. layer=="pulse"
+    is returned only when the pulse itself failed -- render is then deliberately skipped, so
+    it records no render outcome at all. layer=="render" means the pulse passed and render
+    ran, whatever its verdict."""
+    if result.layer == "pulse":
+        _fold_layer(outcomes, "pulse", result.ok)
+        return
+    _fold_layer(outcomes, "pulse", True)
+    _fold_layer(outcomes, "render", result.ok)
+
+
 async def _run_burst_reprobes(
     conn, channels, state: MonitorState, burst_start_ts: str, cycle_id: str,
+    outcomes: dict,
 ) -> tuple[MonitorState, "check.CheckResult", str]:
     """Runs the rest of the main-track confirmation burst inline (Stage 5): re-probes at
     the remaining BURST_DELAYS_S offsets, varying the probe (render, then pulse) so each
@@ -124,7 +158,10 @@ async def _run_burst_reprobes(
     burst is in flight -- the human's call: reliability over a strict 60s cadence.
     Returns the final state, the last probe's CheckResult (for the cycles row's
     fail_layer), and the burst_id every probe in this burst was tagged with (so the cycles
-    row can carry it too -- see run_cycle)."""
+    row can carry it too -- see run_cycle).
+
+    outcomes [B9] is folded in place -- every re-probe here belongs to the same minute as the
+    probe that opened the burst, and the cycles row summarises the minute, not the opener."""
     burst_id = str(uuid.uuid4())
     last_result = None
     probe_kinds = list(itertools.islice(itertools.cycle(["render", "pulse"]), len(config.BURST_DELAYS_S) - 1))
@@ -145,6 +182,7 @@ async def _run_burst_reprobes(
             result = await check.pulse_only_probe(config.TARGET_URL)
 
         last_result = result
+        _fold_layer(outcomes, result.layer, result.ok)  # single-layer probe: its own layer only
         state = await _process_probe(conn, channels, state, result, now_iso(), burst_id, cycle_id=cycle_id)
 
     return state, last_result, burst_id
@@ -386,6 +424,11 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
         artifacts_dir=config.ARTIFACTS_DIR,
         headless=config.HEADLESS,
     )
+    # [B9] Per-layer outcome for the whole minute, folded across the opening probe and every
+    # burst re-probe -- not inferred from whichever probe happened to be first.
+    layer_outcomes: dict = {"pulse": None, "render": None}
+    _fold_combined_probe(layer_outcomes, main_result)
+
     ts_main = now_iso()
     new_main_state = await _process_probe(conn, channels, prev_main_state, main_result, ts_main, burst_id=None, cycle_id=cycle_id)
     last_main_result = main_result
@@ -393,7 +436,8 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
     main_burst_id = None
     if new_main_state.status == "UP" and new_main_state.burst_started_ts == ts_main and prior_main_burst_ts != ts_main:
         new_main_state, burst_last_result, main_burst_id = await _run_burst_reprobes(
-            conn, channels, new_main_state, burst_start_ts=ts_main, cycle_id=cycle_id
+            conn, channels, new_main_state, burst_start_ts=ts_main, cycle_id=cycle_id,
+            outcomes=layer_outcomes,
         )
         if burst_last_result is not None:
             last_main_result = burst_last_result
@@ -462,8 +506,12 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
         conn,
         cycle_id=cycle_id,
         ts=ts,
-        pulse_ok=(main_result.layer != "pulse"),
-        render_ok=(main_result.ok if main_result.layer == "render" else None),
+        # [B9] Measured across every main-track probe in this cycle, not inferred from the
+        # first one. Latency below deliberately still reports the opening probe's timing --
+        # "the latency of a minute containing four probes" is a separate question with no
+        # obvious answer (first? worst? mean?) and is not what B9 asked.
+        pulse_ok=layer_outcomes["pulse"],
+        render_ok=layer_outcomes["render"],
         authed_ok=authed_ok,
         verdict=verdict,
         # session_reused: the authed check passed without spending this cycle's one
