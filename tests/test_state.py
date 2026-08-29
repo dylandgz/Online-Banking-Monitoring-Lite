@@ -279,7 +279,7 @@ def test_restart_keeps_state_recovery_uses_persisted_since_ts():
     assert state.status == "UP"
 
 
-# --- CONFIG_ERROR routing (Rule 10: never burst-retried, distinct from DOWN) ---
+# --- CONFIG_ERROR routing (Rule 4 "never retry a credential rejection" -- never burst-retried, distinct from DOWN) ---
 
 def test_config_reason_never_scored_routes_straight_to_config_error():
     state, events = run(UP_INITIAL, [(False, "bot_challenge", BTS[0], "render")])
@@ -318,7 +318,7 @@ def test_config_error_recovers_on_first_pass_like_down_does():
     assert state.status == "UP"
 
 
-# --- [v3.8 / Stage R] session_expired never scores (Rule 17) ---
+# --- [v3.8 / Stage R] session_expired never scores (Rule 3 "session_expired never scores") ---
 
 def test_classify_session_expired_is_its_own_zero_weight_class():
     assert classify("session_expired") == ("session", 0)
@@ -366,7 +366,7 @@ def test_session_expired_inert_during_an_open_down_incident():
     assert state2 == state
 
 
-# --- [v3.8 / Stage R] Rule 16: precursor_down suppresses auth-track paging ---
+# --- [v3.8 / Stage R] the "Cross-track suppression" section: precursor_down suppresses auth-track paging ---
 
 def test_precursor_down_suppresses_auth_down_event():
     state, events = run(UP_INITIAL, [
@@ -375,7 +375,7 @@ def test_precursor_down_suppresses_auth_down_event():
         (False, "conn_refused", BTS[2], "authed"),
     ], precursor_down=True)
     assert events == []
-    assert state.status == "UP"  # held -- Rule 16: auth-track DOWN can't open while precursor is down
+    assert state.status == "UP"  # held -- the "Cross-track suppression" section: auth-track DOWN can't open while precursor is down
     assert state.confidence == 6
     assert len(state.fail_reasons) == 3
 

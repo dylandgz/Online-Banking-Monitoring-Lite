@@ -8,7 +8,7 @@ is what keeps the dashboard from killing the monitor it reports on:
   1. /docs, /redoc, /openapi.json are not served;
   2. unset dashboard credentials deny everyone instead of admitting everyone;
   3. WAL + busy_timeout are actually set on every connection;
-  4. the export streams lazily, stays byte-identical to the materialised path (Rule 6),
+  4. the export streams lazily, stays byte-identical to the materialised path (Rule 15 "every probe writes a checks row"),
      and refuses an oversized zip rather than truncating it.
 
 starlette's TestClient needs httpx2, which isn't a project dependency (CLAUDE.md requires
@@ -180,7 +180,7 @@ def test_iter_export_rejects_a_table_not_on_the_allowlist(seeded_db):
 
 @pytest.mark.parametrize("table", ["cycles", "checks"])
 def test_streamed_export_is_byte_identical_to_the_materialised_path(seeded_db, table):
-    """Rule 6: the export stays row-for-row faithful. Streaming is an implementation
+    """Rule 15 "every probe writes a checks row": the export stays row-for-row faithful. Streaming is an implementation
     change, so it must produce exactly the bytes the old fetchall+join produced."""
     conn, _ = seeded_db
     materialised = "".join(web_app._csv_lines(

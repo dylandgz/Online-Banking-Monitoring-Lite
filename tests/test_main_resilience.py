@@ -7,7 +7,7 @@ that a future refactor could plausibly break silently:
 
   1. a crashed cycle still writes an audit row, and writes it as a NON-paging verdict;
   2. a crashed cycle's row reuses the cycle_id its probe rows were tagged with;
-  3. a login attempt is recorded even when the journey raises (Rule 11's budget is
+  3. a login attempt is recorded even when the journey raises (Rule 5's budget is
      derived from that table, so an unrecorded attempt makes the budget unenforceable);
   4. an unexpected browser exception maps onto the closed fail_reason taxonomy.
 
@@ -56,10 +56,10 @@ def test_crashed_cycle_writes_degraded_row_and_never_pages(tmp_path, monkeypatch
 
     rows = _cycles(conn)
     assert len(rows) == 1, "a crashed cycle must still write exactly one cycles row"
-    assert rows[0]["verdict"] == "DEGRADED", "must not be DOWN -- Rule 13: DEGRADED never pages"
+    assert rows[0]["verdict"] == "DEGRADED", "must not be DOWN -- Rule 7 'only DOWN pages': DEGRADED never pages"
     assert rows[0]["fail_layer"] == "monitor"
     assert rows[0]["fail_reason"] == "internal_error"
-    # Rule 6: the row exists, but the layer columns are honestly NULL -- nothing was probed.
+    # Rule 15 "every probe writes a checks row": the row exists, but the layer columns are honestly NULL -- nothing was probed.
     assert rows[0]["pulse_ok"] is None
     assert rows[0]["render_ok"] is None
     assert rows[0]["authed_ok"] is None
@@ -125,10 +125,10 @@ def test_lock_is_released_after_a_crashed_cycle(tmp_path, monkeypatch):
     assert not lock.locked()
 
 
-# --- 3: Rule 11's ledger must be written even when the journey raises ---------------
+# --- 3: Rule 5's ledger must be written even when the journey raises ---------------
 
 def test_login_attempt_is_recorded_even_when_the_journey_raises(tmp_path, monkeypatch):
-    """Rule 11's budget is computed from login_events. If a raising journey writes no
+    """Rule 5's budget is computed from login_events. If a raising journey writes no
     row, the budget reads as untouched and the next cycle logs in again -- unbounded
     credentialed attempts against a real account. The finally: clause is what stops that.
     """

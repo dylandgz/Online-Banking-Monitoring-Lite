@@ -59,11 +59,11 @@ CREATE TABLE IF NOT EXISTS login_events (
 -- (including burst re-probes) still lives in `checks`, linked back here via cycle_id --
 -- `cycles` is the audit-primary, one-line-per-minute view; `checks` is the detail.
 -- authed_ok carries the initiating auth probe's real True/False whenever the auth track ran
--- that cycle -- INCLUDING while its own alert was suppressed per Rule 16, since suppression
+-- that cycle -- INCLUDING while its own alert was suppressed per the "Cross-track suppression" section, since suppression
 -- withholds the page, never the evidence. It is NULL only when the auth track didn't run at
--- all: journey unconfigured, the track sitting in its own CONFIG_ERROR per Rule 10, or
+-- all: journey unconfigured, the track sitting in its own CONFIG_ERROR per Rule 4 "never retry a credential rejection", or
 -- [v3.9] nothing actually contacted the platform because there was no usable session AND
--- the recovery login was paused (Rule 16) or refused by the budget (Rule 11). That last
+-- the recovery login was paused (the "Cross-track suppression" section) or refused by the budget (Rule 5 "the login budget is a hard limit"). That last
 -- case used to write False, which read on the dashboard and in the CSV as "the authed
 -- layer failed" when the truth was "we never looked" -- see main.py's _run_auth_probe.
 CREATE TABLE IF NOT EXISTS cycles (
@@ -102,7 +102,7 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     # one-year DB (~1M checks rows): the writer stalled 1.42s behind a large export, and a
     # 7s export made it fail outright with "database is locked" once the 5s default
     # busy_timeout expired. That exception lands in append_check -- BEFORE apply_check --
-    # so the probe was lost. Rule 18's net now records such a minute as DEGRADED instead of
+    # so the probe was lost. Rule 9's "no minute may vanish" net now records such a minute as DEGRADED instead of
     # dropping it silently, but recording a self-inflicted blind minute is damage control,
     # not a fix: the point of WAL is that the minute never goes blind at all.
     #
@@ -362,9 +362,9 @@ def uptime_pct(conn: sqlite3.Connection, since_ts: str) -> float | None:
     the backlog the only way to clear it today is a manual DB edit). The dashboard then
     reported 0.0% uptime for 24h/7d/30d while pulse and render passed every single minute
     and the platform was entirely healthy -- an audit-grade number describing a total
-    outage that never happened. Rule 13 says CONFIG_ERROR is not an outage; this makes the
-    arithmetic agree with the rule. DEGRADED is excluded on the same grounds: Rule 18's
-    self-health row means "the monitor broke, we do not know what the platform was doing",
+    outage that never happened. Rule 7 "only DOWN pages" says CONFIG_ERROR is not an outage; this makes the
+    arithmetic agree with the rule. DEGRADED is excluded on the same grounds: Rule 9's
+    "no minute may vanish" self-health row means "the monitor broke, we do not know what the platform was doing",
     and a minute we could not measure is not a minute of downtime.
 
     The honest consequence, accepted deliberately: a window containing ONLY excluded
@@ -496,7 +496,7 @@ def iter_export(
 
     Why this exists: the export route used to .fetchall() the whole table into a list of
     dicts and then "".join() the entire CSV into one string, inside the monitor's own
-    process (Rule 8 -- uvicorn and the cycle loop share it, there is no second process to
+    process (Rule 17 "single asyncio process" -- uvicorn and the cycle loop share it, there is no second process to
     absorb the cost). Measured on a one-year DB (525,600 cycles / 1,051,200 checks): 715MB
     peak RSS for the fetch, 736MB once the CSV string existed, and ~35s of GIL-bound work
     that starves the asyncio cycle loop meanwhile. The dashboard's "Download Logs" button

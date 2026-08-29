@@ -1,18 +1,24 @@
 """Stage 6/8: authenticated sign-in journey -- locators, TOTP, the submit_*/classify_*
 step functions, run_journey() (full login -> TOTP -> authed -> optional logout), and
 run_authed_check() (Stage 8: a cheap check reusing a saved session, zero logins
-consumed). Ported from the signin_lab sandbox handoff (MONITOR_LITE_HANDOFF.md) and
-converted from patchright's sync API to its async API to match this project's asyncio
-architecture (Rule 8). run_journey() is new -- the handoff's own run.py (the only place
-this sequencing previously lived) was explicitly not shipped because it assumed a human
-was watching (see handoff section 3); this rebuilds that control flow without any
+consumed). Originally ported from the `signin_lab` prototype and converted from
+patchright's sync API to its async API to match this project's asyncio architecture
+(Rule 17 "single asyncio process"). run_journey() is new -- the prototype's own run.py
+(the only place this sequencing previously lived) was explicitly not shipped because it
+assumed a human was watching; this rebuilds that control flow without any
 print()/input() calls, reporting through CheckResult like every other check layer.
 
+NOTE ON PROVENANCE: comments here used to cite "handoff section N" of the prototype's
+MONITOR_LITE_HANDOFF.md. That document is not in this repository, so those pointers were
+unfollowable and have been removed -- the reasoning they carried is inlined instead.
+Nothing in this file should be treated as verified because the prototype did it that way;
+the live-target evidence lives in data/dom_dumps/ and personal/ISSUES.md.
+
 Browser automation uses patchright (not vanilla Playwright), always headed under xvfb
-(CLAUDE.md v3.2/v3.3, named exceptions to Rules 12/14). Session persistence uses a
+(CLAUDE.md v3.2/v3.3, named exceptions to Rules 6 "bot challenges: detect, never defeat" and 14 "headless is the scheduler's mode"). Session persistence uses a
 single storageState file (v3.4/v3.6/Stage 8) -- the earlier persistent-profile-directory
 approach (USER_DATA_DIR) has been retired, per Stage 8's acceptance criteria: it carried
-cf_clearance just as effectively (confirmed in the signin_lab sandbox's own testing) and
+cf_clearance just as effectively (confirmed in the prototype's own testing) and
 this way there's exactly one persisted, chmod-600 secret file for the whole journey, not
 two different mechanisms.
 """
@@ -92,7 +98,7 @@ async def get_fresh_totp_code(secret: str, min_remaining_seconds: int = 5) -> st
 
 # --- locators ------------------------------------------------------------
 # All site-specific -- rediscover every one of these against the real target before
-# trusting it (handoff section 6). Kept here as named factories per Rule 3.
+# trusting it. Kept here as named factories per Rule 11 "locators".
 
 def username_field(page: Page) -> Locator:
     # [v3.5] Positional exception: role/text/label locators were tried against the real
@@ -149,7 +155,7 @@ def totp_field(page: Page) -> Locator:
     # safe. The same string also appears in a <legend> inside an aria-hidden fieldset,
     # which contributes nothing to the accessible name -- no double-match risk.
     # Do NOT key off id or data-testid: the id (":r8k:") is React-generated and changes
-    # between renders, and data-testid is outside Rule 3.
+    # between renders, and data-testid is outside Rule 11 "locators".
     return page.get_by_role("textbox", name="Verification code", exact=True)
 
 
@@ -167,19 +173,26 @@ def logout_link(page: Page) -> Locator:
     return page.get_by_role("link", name="Logout", exact=True)
 
 
-# Deliberately not ported: the sandbox's register_device_button/public_device_button/
-# dismiss_device_prompt. They were built on a wrong assumption (that the post-TOTP
-# screen was a device-trust prompt; it's actually a promotional offer -- handoff
-# section 7). Resolving what that screen really is, against the real target, is an
-# open Stage 6 task, not something to carry over guessed-at.
+# Deliberately not ported: the prototype's register_device_button/public_device_button/
+# dismiss_device_prompt, which assumed the post-TOTP screen was a device-trust prompt.
+#
+# [2026-08-29] That assumption is still unresolved, and the picture has moved: the
+# 2026-08-25 capture (data/dom_dumps/20260825T194512Z/03_verification_code_screen/) shows
+# the CODE-ENTRY screen carries a real device-registration choice -- "Yes, register my
+# private device" / "No, this is a public device", both type=submit -- which submit_totp()
+# never clicks. Whether that is the same screen the prototype meant is unknown. Do not
+# resolve it from this comment: read the capture, and see B27 in personal/ISSUES.md first
+# -- registering the device plausibly suppresses future step-ups, which would make
+# classify_after_submit()'s bot_challenge fallback fire on every subsequent login.
 
 
 # --- submit / classify pairs --------------------------------------------------
 # [v3.5] "unknown" must not ship. Every fallback below resolves to a specific reason
 # from the closed taxonomy, with a comment explaining the judgment call -- these are
-# best-effort mappings made without a live site to drill against (handoff section 8)
-# and should be revisited once Stage 6's real-target drilling (integration checklist
-# step 7) confirms or corrects them.
+# best-effort mappings made without a live site to drill against, and they have NOT all
+# survived contact with one: classify_after_submit's fallback was confirmed wrong live on
+# 2026-08-25. Tracked as B1/B6/B27 in personal/ISSUES.md -- read those before trusting any
+# fallback below.
 
 async def _settle(page: Page, timeout_ms: int) -> None:
     """Best-effort 'let the destination render' pause between an action and the
@@ -211,8 +224,9 @@ async def classify_after_submit(page: Page, error_banner_text: str, challenge_ti
     try:
         await expect(mfa_marker.or_(error_marker)).to_be_visible(timeout=challenge_timeout_ms)
     except AssertionError:
-        # Neither marker showed up. Per the handoff, this is exactly what
-        # bot_challenge/auth_unavailable/rate_limited look like undifferentiated.
+        # Neither marker showed up. This is exactly what bot_challenge, auth_unavailable
+        # and rate_limited look like undifferentiated -- and, per B27, what a login that
+        # simply succeeded without a step-up looks like too.
         # bot_challenge is the closest single reason given this is the one check
         # layer deliberately built to contend with a Cloudflare challenge -- not
         # confirmed correct until drilled against the real target.
@@ -241,7 +255,7 @@ async def submit_totp(
     try:
         await expect(field).to_be_visible(timeout=challenge_timeout_ms)
     except AssertionError:
-        # handoff section 5: this was an unguarded wait that crashed the whole script.
+        # In the prototype this was an unguarded wait that crashed the whole script.
         # element_missing is the literal, honest description -- the expected field
         # genuinely never appeared.
         return "element_missing"
@@ -249,15 +263,15 @@ async def submit_totp(
     # No way to answer the code prompt (no human providing one, no captured secret) --
     # this is a config problem (a human needs to set TOTP_SECRET), not evidence about
     # the platform. Reported the same way any other "MFA could not be completed" case
-    # is (mfa_failed -> CONFIG_ERROR, Rule 10), instead of crashing pyotp.TOTP(None)
-    # deep in a background task where it would silently drop the whole probe (Rule 6
+    # is (mfa_failed -> CONFIG_ERROR, Rule 4 "never retry a credential rejection"), instead of crashing pyotp.TOTP(None)
+    # deep in a background task where it would silently drop the whole probe (Rule 15 "every probe writes a checks row"
     # requires every probe to still write a row).
     if not code_provider and not totp_secret:
         return "mfa_failed"
 
     # pyotp.TOTP(secret).now() raises binascii.Error (a ValueError subclass) on a secret
     # that isn't valid base32 -- a mistyped or padded TOTP_SECRET in .env. That's a config
-    # problem a human must fix, so it reports mfa_failed -> CONFIG_ERROR (Rule 10) exactly
+    # problem a human must fix, so it reports mfa_failed -> CONFIG_ERROR (Rule 4 "never retry a credential rejection") exactly
     # like the missing-secret case above, rather than raising out of the probe and taking
     # the whole cycle down unrecorded. The secret itself is never included in any message.
     try:
@@ -317,7 +331,7 @@ async def classify_authed(page: Page, authed_text: Optional[str], authed_role: O
     # CLAUDE.md's Stage 6 spec: authed requires the marker visible AND the error banner
     # absent. If both are visible at once, the overall assertion still fails -- reported
     # the same way as the marker missing, since from the check's perspective a valid
-    # authed state wasn't established either way. Never observed in the sandbox; revisit
+    # authed state wasn't established either way. Never observed in the prototype; revisit
     # if a real drill shows this needs its own distinct reason instead.
     if await error_marker.is_visible():
         return "element_missing"
@@ -342,7 +356,7 @@ async def classify_logout(page: Page, authed_text: Optional[str], authed_role: O
 
 
 # --- masked screenshots --------------------------------------------------------
-# Rule 5: post-login screenshots must mask PII locators. Masking works by regex pattern
+# Rule 13 "screenshots on failure only": post-login screenshots must mask PII locators. Masking works by regex pattern
 # over visible text, not by label -- a label locator only covers the label element
 # itself, not the sibling element holding the actual (dynamic) value.
 
@@ -375,7 +389,7 @@ async def capture_masked_screenshot(
             # than erroring or masking the wrong thing. That means an outdated/typo'd
             # pattern fails open (no mask, PII exposed) with no error to catch it -- and
             # note masking cannot cover <input> values at all, since get_by_text matches
-            # text nodes, so a filled username field is never redacted by this. Rule 5's
+            # text nodes, so a filled username field is never redacted by this. Rule 13's "screenshots on failure only"
             # real safety net is the review step, not this list being provably correct.
             if not mask_patterns:
                 # [v3.9 / Stage H P2] The genuinely dangerous configuration, and until now
@@ -387,7 +401,7 @@ async def capture_masked_screenshot(
                 # the accidental case too; it is the one that ships by mistake.
                 print("WARNING: MASKING_ENABLED is on but MASK_TEXT is empty -- this "
                       "authenticated screenshot has NO redactions. Set MASK_TEXT in .env "
-                      "(semicolon-separated regexes) per Rule 5.", flush=True)
+                      "(semicolon-separated regexes) per Rule 13 'screenshots on failure only'.", flush=True)
             mask_locators = [page.get_by_text(re.compile(pattern)) for pattern in mask_patterns]
         else:
             # Explicit opt-out only, never a silent default -- printed loudly so it's never
@@ -404,7 +418,7 @@ async def capture_masked_screenshot(
 
 
 # --- orchestrator --------------------------------------------------------------
-# The shape this follows (handoff section 3):
+# The shape this follows:
 #   navigate -> (nav_error)
 #   wait for login form -> (element_missing)
 #   submit credentials -> classify_after_submit -> mfa | auth_rejected | bot_challenge
@@ -444,9 +458,9 @@ async def bounced_to_login(page: Page, authed_url: str, timeout_ms: int) -> bool
 
     [v3.9 / Stage H P2] This distinction is the whole point. run_authed_check used to map
     *every* "page loaded but the authed marker is missing" to session_expired, which
-    Rule 17 makes completely inert -- no score, no probe-floor credit, and it never even
+    Rule 3 "session_expired never scores" makes completely inert -- no score, no probe-floor credit, and it never even
     sets burst_started_ts, so the auth burst never started. The consequence was that
-    "online banking behind login not rendering" -- Rule 4's exact authed wording, and
+    "online banking behind login not rendering" -- Rule 10's exact authed wording, and
     v3.8's literal definition of the platform being DOWN -- could not be reached by the
     check whose entire job is to detect it. A 500 error page or a blank authed home
     scored zero and merely spent a recovery login.
@@ -476,7 +490,7 @@ def unexpected_fail_reason(exc: BaseException) -> str:
     and the only exception type the classify_* helpers caught was AssertionError (from
     expect()). Every other Playwright call -- fill, click, press, is_visible, logout --
     could raise PatchrightError/PatchrightTimeoutError and take the whole cycle down with
-    no checks row, no cycles row, and no alert (Rule 6 violated, and a silent monitoring
+    no checks row, no cycles row, and no alert (Rule 15 "every probe writes a checks row" violated, and a silent monitoring
     blind spot on exactly the probes most likely to fail during a real outage).
 
     Mapping rationale, both deliberately Soft (weight 1) per CLAUDE.md's scoring table:
@@ -547,7 +561,7 @@ async def run_journey(
 ) -> CheckResult:
     """Runs the full login -> TOTP -> authed-assertion -> (optional) logout journey
     once and reports the outcome as a CheckResult, exactly like check.py's probes.
-    Never retries anything itself (Rule 10 is the caller's job -- this function just
+    Never retries anything itself (Rule 4 "never retry a credential rejection" is the caller's job -- this function just
     reports what happened on the one attempt it made).
 
     session_state_path, if given, is where the fresh storageState is saved immediately
@@ -597,9 +611,9 @@ async def run_journey(
                     return await _fail(page, "render", "nav_error", "navigate", latency_ms,
                                         artifacts_dir, mask_patterns, masking_enabled)
 
-                # "Wait for real content" (handoff's diagram) is folded into waiting for the
-                # login form itself -- there's no site-specific "real content" locator yet
-                # (deferred, like everything in locators.py), and wait_for(state="visible")
+                # "Wait for real content" is folded into waiting for the login form
+                # itself -- there is no site-specific "real content" locator yet
+                # (deferred; there is no separate locators module), and wait_for(state="visible")
                 # already retries past a blank mid-navigation page rather than reading it
                 # instantly, which is the actual bug that step guards against.
                 try:
@@ -703,14 +717,23 @@ async def run_authed_check(
     authed-home route are different paths with different dependencies (auth service, MFA
     backend, login UI bundle, Cloudflare challenge vs. just session-cookie validation), so
     testing the home route directly gives independent evidence from the render check,
-    exactly what CLAUDE.md's Rule 16 wants (a login-route outage can leave existing
+    exactly what CLAUDE.md's "Cross-track suppression" section wants (a login-route outage can leave existing
     sessions still served, and that distinction belongs in the incident record).
 
     A failure to even navigate/load the page (nav_error) is real platform evidence, same
-    as any other reachability failure -- it's not a session problem. Only "the page loaded
-    but the authed marker isn't there" maps to session_expired, since that's the actual
-    signature of an expired/invalid session (most often a redirect back to the login
-    page)."""
+    as any other reachability failure -- it's not a session problem. Nor is an HTTP error
+    status: a >=400 authed route reports bad_status:<code> (5xx being the only Hard-weight
+    evidence this layer can produce), read explicitly off goto's Response because Playwright
+    does not raise on error statuses.
+
+    [v3.9 / Stage H P2] A missing authed marker is NOT automatically session_expired -- that
+    mapping is what made Rule 10's "online banking behind login not rendering" unreachable by
+    the very check whose job is to detect it (session_expired is inert under Rule 3 "session_expired never scores": no
+    score, no probe-floor credit, and it never opens a burst). session_expired now requires
+    the full expired-session signature via bounced_to_login(): redirected AWAY from the
+    authed route AND a login form actually present. Still on the authed route with no marker
+    is element_missing -- Soft, scoring, burst-opening -- because that is the platform
+    serving us something wrong."""
     start = time.monotonic()
 
     # Outer guard, same rationale as run_journey's: this is the probe that runs every 60s,
