@@ -18,6 +18,13 @@ class CheckResult:
     latency_ms: float
     fail_reason: Optional[str]
     screenshot_path: Optional[str] = None
+    # [B16] Where the browser actually ENDED UP, recorded on browser-layer failures only
+    # (the pulse probe has no browser, so it stays None there). Without it, two very
+    # different failures are indistinguishable in the record: the bank's marketing site
+    # rendered inside a frame at the correct authed URL, versus a cross-origin redirect
+    # away to it. Both report element_missing, and telling them apart cost a multi-hour
+    # diagnosis on 2026-08-27 because nothing wrote down the URL.
+    page_url: Optional[str] = None
     layer: str = "render"  # "pulse" | "render" -- the strongest layer this probe actually evaluated
     # [v3.8 / Stage R] populated only by perform_check() (the combined pulse+render probe
     # that opens a cycle) -- None on burst re-probes and the auth journey, which each only
@@ -56,20 +63,24 @@ async def browser_check(
     timeout_ms: int,
     artifacts_dir: str,
     headless: bool = True,
-) -> tuple[bool, Optional[str], Optional[str]]:
-    """Loads the page and asserts the required element is visible. Returns (ok, fail_reason, screenshot_path)."""
+) -> tuple[bool, Optional[str], Optional[str], Optional[str]]:
+    """Loads the page and asserts the required element is visible.
+    Returns (ok, fail_reason, screenshot_path, page_url).
+
+    [B16] page_url is reported on failures for the same reason the authed layer reports it:
+    'element_missing' alone cannot distinguish the expected page rendering wrongly from a
+    redirect somewhere else entirely."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
         page = await browser.new_page()
         try:
             try:
                 await page.goto(url, timeout=timeout_ms)
-            except PlaywrightTimeoutError:
-                screenshot_path = await _save_screenshot(page, artifacts_dir)
-                return False, "nav_error", screenshot_path
             except PlaywrightError:
+                # PlaywrightTimeoutError is a subclass, so this one clause covers both; they
+                # produced byte-identical handling.
                 screenshot_path = await _save_screenshot(page, artifacts_dir)
-                return False, "nav_error", screenshot_path
+                return False, "nav_error", screenshot_path, _safe_url(page)
 
             if required_text:
                 locator = page.get_by_text(required_text)
@@ -78,12 +89,20 @@ async def browser_check(
 
             try:
                 await locator.first.wait_for(state="visible", timeout=timeout_ms)
-                return True, None, None
+                return True, None, None, None
             except PlaywrightTimeoutError:
                 screenshot_path = await _save_screenshot(page, artifacts_dir)
-                return False, "element_missing", screenshot_path
+                return False, "element_missing", screenshot_path, _safe_url(page)
         finally:
             await browser.close()
+
+
+def _safe_url(page) -> Optional[str]:
+    """[B16] page.url for the record, never raising -- see journey.safe_page_url."""
+    try:
+        return page.url
+    except PlaywrightError:
+        return None
 
 
 async def _save_screenshot(page, artifacts_dir: str) -> Optional[str]:
@@ -118,7 +137,7 @@ async def perform_check(
         )
 
     render_start = time.monotonic()
-    browser_ok, browser_fail_reason, screenshot_path = await browser_check(
+    browser_ok, browser_fail_reason, screenshot_path, page_url = await browser_check(
         url, required_text, required_role, required_name, browser_timeout_ms, artifacts_dir, headless=headless
     )
     render_latency_ms = (time.monotonic() - render_start) * 1000
@@ -129,6 +148,7 @@ async def perform_check(
             latency_ms=pulse_latency_ms,
             fail_reason=browser_fail_reason,
             screenshot_path=screenshot_path,
+            page_url=page_url,
             layer="render",
             pulse_latency_ms=pulse_latency_ms,
             render_latency_ms=render_latency_ms,
@@ -158,7 +178,8 @@ async def render_only_probe(
 ) -> CheckResult:
     """A burst re-probe that only re-checks the page render, in a fresh browser context --
     independent evidence from a pulse probe, per Stage 5's 'vary the probe' rule."""
-    ok, fail_reason, screenshot_path = await browser_check(
+    ok, fail_reason, screenshot_path, page_url = await browser_check(
         url, required_text, required_role, required_name, browser_timeout_ms, artifacts_dir, headless=headless
     )
-    return CheckResult(ok=ok, http_status=None, latency_ms=0.0, fail_reason=fail_reason, screenshot_path=screenshot_path, layer="render")
+    return CheckResult(ok=ok, http_status=None, latency_ms=0.0, fail_reason=fail_reason,
+                       screenshot_path=screenshot_path, page_url=page_url, layer="render")

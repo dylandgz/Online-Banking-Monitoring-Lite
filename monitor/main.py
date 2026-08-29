@@ -59,6 +59,12 @@ async def _process_probe(
         layer=result.layer,
         burst_id=burst_id,
         cycle_id=cycle_id,
+        # [B16/B35] The evidence this probe produced, recorded on the probe's own row.
+        # screenshot_path used to survive only via open_incident(), i.e. only for the one
+        # probe that crossed the DOWN threshold -- every other failure's image was written
+        # to disk and its location discarded here.
+        page_url=result.page_url,
+        screenshot_path=result.screenshot_path,
     )
     status = "OK" if result.ok else f"FAIL ({result.fail_reason}, layer={result.layer})"
     shot = f" screenshot={result.screenshot_path}" if result.screenshot_path else ""

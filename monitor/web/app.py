@@ -219,6 +219,7 @@ _EXPORT_COLUMNS = {
         ("id", "id"), ("ts_eastern", "ts"), ("ok", "ok"), ("http_status", "http_status"),
         ("latency_ms", "latency_ms"), ("fail_reason", "fail_reason"), ("browser_mode", "browser_mode"),
         ("layer", "layer"), ("burst_id", "burst_id"), ("cycle_id", "cycle_id"),
+        ("page_url", "page_url"), ("screenshot_path", "screenshot_path"),
     ],
 }
 
