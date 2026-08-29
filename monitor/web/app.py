@@ -195,13 +195,73 @@ def api_history(
     return {"rows": rows, "total": total, "page": page, "page_size": page_size}
 
 
+# [B25] `auth` was written as a layer on 3 early rows before the spelling split was settled.
+# CLAUDE.md is explicit that `authed` is the layer and `auth` is the track, so the drill-down
+# shows the layer name. Display-side only -- the CSV export reads the table directly and stays
+# byte-faithful to what was stored (Rule 15).
+_LAYER_ALIASES = {"auth": "authed"}
+
+
+def _split_main_probe(row: dict, cycle: dict) -> list[dict]:
+    """[B25] Expand one `checks` row into the probes it actually represents.
+
+    `perform_check()` runs the pulse and *then* the render and returns a single CheckResult,
+    so one row covers two layers. It is labelled `render` when the pulse passed and `pulse`
+    only when the pulse failed (render is then never attempted). The row carries one
+    latency_ms -- the pulse's -- which is why the drill-down has been showing a render line
+    with the pulse's timing on it, understating a real page load by ~10x.
+
+    Both per-leg timings are already stored on the cycles row, written from this same opening
+    probe, so each is exactly one measurement and nothing here is averaged or inferred:
+
+        pulse line   <- cycles.pulse_ok, cycles.pulse_latency_ms, and the row's http_status
+                        (the status came from the pulse's own GET)
+        render line  <- the row's ok/fail_reason, cycles.render_latency_ms, and the row's
+                        page_url/screenshot_path (only the browser leg produces those)
+
+    Rows this does NOT touch, returned unchanged: burst re-probes (already single-layer, with
+    their own measured latency), authed probes, a `pulse`-labelled opening probe (the pulse
+    failed, so there is genuinely no render probe to show), and anything from a cycle with no
+    cycles row to read timings from."""
+    if row.get("burst_id") or row.get("layer") != "render" or not cycle:
+        return [row]
+
+    pulse_line = dict(row)
+    pulse_line.update(
+        layer="pulse",
+        ok=cycle.get("pulse_ok"),
+        latency_ms=cycle.get("pulse_latency_ms"),
+        fail_reason=None,
+        # The browser leg produces these; the pulse is a plain HTTP GET.
+        page_url=None,
+        screenshot_path=None,
+    )
+
+    render_line = dict(row)
+    render_line.update(
+        layer="render",
+        latency_ms=cycle.get("render_latency_ms"),
+        # http_status belongs to the pulse's GET, not the browser navigation.
+        http_status=None,
+    )
+    return [pulse_line, render_line]
+
+
 @app.get("/api/cycle/{cycle_id}", dependencies=[Depends(require_auth)])
 def api_cycle_probes(cycle_id: str, conn=Depends(get_conn)):
     """Expandable probe-level detail for one cycle row -- bursts are first-class,
-    unhideable evidence (CLAUDE.md), surfaced here on drill-down."""
-    rows = db.get_checks_for_cycle(conn, cycle_id)
-    for row in rows:
-        row["ts"] = to_eastern(row["ts"])
+    unhideable evidence (CLAUDE.md), surfaced here on drill-down.
+
+    [B25] One line per probe actually run, which means the opening main-track row is expanded
+    into its pulse and render legs -- see _split_main_probe. Every line still carries one real
+    measurement; nothing is summarised across the minute."""
+    cycle = db.get_cycle(conn, cycle_id)
+    rows: list[dict] = []
+    for row in db.get_checks_for_cycle(conn, cycle_id):
+        for line in _split_main_probe(row, cycle):
+            line["ts"] = to_eastern(line["ts"])
+            line["layer"] = _LAYER_ALIASES.get(line["layer"], line["layer"])
+            rows.append(line)
     return {"rows": rows}
 
 

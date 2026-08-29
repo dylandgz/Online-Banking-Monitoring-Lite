@@ -556,6 +556,15 @@ def get_checks_for_cycle(conn: sqlite3.Connection, cycle_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_cycle(conn: sqlite3.Connection, cycle_id: str) -> dict | None:
+    """[B25] The cycle's own summary row. The drill-down needs it because one `checks` row can
+    represent two probes: perform_check() runs the pulse and then the render and writes a
+    single row, so the separate per-leg timings live only here, in pulse_latency_ms /
+    render_latency_ms."""
+    row = conn.execute("SELECT * FROM cycles WHERE cycle_id = ?", (cycle_id,)).fetchone()
+    return dict(row) if row else None
+
+
 def get_last_cycle(conn: sqlite3.Connection) -> dict | None:
     row = conn.execute("SELECT * FROM cycles ORDER BY ts DESC LIMIT 1").fetchone()
     return dict(row) if row else None
