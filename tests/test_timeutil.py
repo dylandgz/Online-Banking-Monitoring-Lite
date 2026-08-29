@@ -46,12 +46,43 @@ def test_now_iso_round_trips_through_fromisoformat():
 
 # --- artifact_stamp: the screenshot filename stamp ------------------------------------
 
-def test_artifact_stamp_matches_the_historical_format():
-    # Pins the format the 204 existing files in data/artifacts already use, so the
-    # consolidation into timeutil provably changed no output. B26 will change this
-    # deliberately; this assertion is what makes that change visible rather than silent.
+def test_artifact_stamp_is_eastern_and_matches_the_dashboard():
+    # [B26] The whole point: the filename must name the same wall-clock time the dashboard,
+    # CSV and email show for that failure. 14:03 UTC is 10:03 EDT.
     t = datetime(2026, 8, 27, 14, 3, 32, tzinfo=timezone.utc)
-    assert artifact_stamp(t) == "20260827T140332Z"
+    assert artifact_stamp(t) == "20260827T100332-0400"
+    assert to_eastern(t.isoformat()).startswith("2026-08-27 10:03:32")
+
+
+def test_artifact_stamp_shifts_the_date_not_just_the_hour():
+    # An evening-Eastern failure used to be filed under the NEXT day's date -- the part of
+    # B26 that actually misleads, since you look for the wrong day entirely.
+    t = datetime(2026, 1, 15, 2, 10, 5, tzinfo=timezone.utc)   # 9:10pm Jan 14 Eastern
+    assert artifact_stamp(t).startswith("20260114T211005")
+
+
+def test_no_filename_collision_on_the_dst_fallback():
+    # B26 hazard 2, the one that silently destroys evidence: 01:30 EDT and 01:30 EST are 60
+    # minutes apart and both render '20261101T013000'. Without the offset the second
+    # screenshot overwrites the first.
+    edt = artifact_stamp(datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc))
+    est = artifact_stamp(datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc))
+    assert edt != est, "two distinct failures must never share a filename"
+    assert edt.endswith("-0400") and est.endswith("-0500")
+
+
+def test_lexical_sort_still_matches_chronological_sort():
+    # B26 hazard 1. With `checks` holding no screenshot_path (B35), `ls data/artifacts` is
+    # how most of these files are found, so directory order has to stay truthful -- including
+    # across the repeated hour, where '-0400' must sort before '-0500'.
+    moments = [
+        datetime(2026, 11, 1, 4, 30, tzinfo=timezone.utc),   # 00:30 EDT
+        datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc),   # 01:30 EDT
+        datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc),   # 01:30 EST -- clock repeated
+        datetime(2026, 11, 1, 7, 30, tzinfo=timezone.utc),   # 02:30 EST
+    ]
+    stamps = [artifact_stamp(m) for m in moments]
+    assert stamps == sorted(stamps), "directory order must not lie about what happened first"
 
 
 def test_artifact_stamp_is_filename_safe():

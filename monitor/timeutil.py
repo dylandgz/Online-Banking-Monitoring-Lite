@@ -39,11 +39,43 @@ def now_iso(now: Optional[datetime] = None) -> str:
 
 
 def artifact_stamp(now: Optional[datetime] = None) -> str:
-    """Filename-safe timestamp for a screenshot in ARTIFACTS_DIR, e.g. '20260827T140332Z'.
+    """Filename-safe Eastern timestamp for a screenshot in ARTIFACTS_DIR, e.g.
+    '20260827T100332-0400'.
 
-    Filename-safe means no ':' -- illegal on Windows and awkward everywhere -- which is why
-    this is a strftime and not an isoformat()."""
-    return (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    [B26] This was UTC ('20260827T140332Z') until 2026-08-29, while the dashboard, CSV and
+    email all showed Eastern -- so the filename of a failure artifact disagreed with every
+    timestamp describing the same failure, by four hours in summer and five in winter. Worse
+    than the hour shift: any failure between 7pm and midnight Eastern was filed under the
+    NEXT day's date, so an incident remembered as Wednesday evening sat in a file named
+    Thursday. That matters more than it looks, because for most artifacts the filename is the
+    only handle there is -- `checks` has no screenshot_path column, so only the screenshot of
+    a DOWN-triggering probe is recorded anywhere (B35: 195 of 204 files are reachable by
+    nothing else).
+
+    Three properties this format deliberately keeps, all of which a naive strftime swap would
+    have broken:
+
+    1. **No collision on the DST fall-back.** On 2026-11-01, 01:30 EDT and 01:30 EST are 60
+       minutes apart and both render '20261101T013000'. Two distinct failures, one filename,
+       and the second write silently destroys the first. The numeric offset separates them:
+       ...013000-0400 and ...013000-0500.
+    2. **Lexical sort still matches chronological sort**, including through that repeated
+       hour, because '-0400' sorts before '-0500' and the EDT reading is the earlier one.
+       Load-bearing: with the artifacts directory being the only index into most of these
+       files, `ls` order is how they are read.
+    3. **Filename-safe** -- %z emits '-0400' with no colon, so this stays a strftime rather
+       than an isoformat().
+
+    The trailing token also makes the convention self-describing: a name ending in 'Z' is a
+    pre-B26 UTC file, one ending in '-0400'/'-0500' is Eastern. No migration was done (B26:
+    additive, no backfill), so data/artifacts holds both indefinitely -- and can be read
+    without ambiguity because of that suffix.
+
+    A naive `now` is treated as UTC, matching to_eastern()."""
+    dt = now or datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(EASTERN).strftime("%Y%m%dT%H%M%S%z")
 
 
 def to_eastern(ts_utc_iso: str) -> str:
