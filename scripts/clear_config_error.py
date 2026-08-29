@@ -16,11 +16,11 @@ because CONFIG_ERROR never opens an incident row there is nothing else to close.
 Usage: .venv/bin/python -m scripts.clear_config_error [--track auth|main]   (default auth)
 """
 import sys
-from datetime import datetime, timezone
 
 import config
 from monitor import db
 from monitor.state import MonitorState
+from monitor.timeutil import now_iso
 
 
 def main() -> None:
@@ -45,7 +45,7 @@ def main() -> None:
         conn,
         MonitorState(
             status="UP",
-            since_ts=datetime.now(timezone.utc).isoformat(),
+            since_ts=now_iso(),
             burst_started_ts=None,
             confidence=0,
             fail_reasons=(),

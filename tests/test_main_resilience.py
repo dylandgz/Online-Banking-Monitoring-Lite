@@ -20,6 +20,7 @@ import pytest
 
 import config
 from monitor import db, journey, main
+from monitor.timeutil import now_iso
 
 
 def _conn(tmp_path):
@@ -91,7 +92,7 @@ def test_crashed_cycle_row_reuses_the_cycle_id_given_to_run_cycle(tmp_path, monk
     async def crash_after_writing_a_probe(conn_, channels, auth_enabled, cycle_id=None):
         seen["cycle_id"] = cycle_id
         db.append_check(
-            conn_, ts=main._now_iso(), ok=False, http_status=None, latency_ms=1.0,
+            conn_, ts=now_iso(), ok=False, http_status=None, latency_ms=1.0,
             fail_reason="timeout", browser_mode="headless", layer="render",
             burst_id=None, cycle_id=cycle_id,
         )

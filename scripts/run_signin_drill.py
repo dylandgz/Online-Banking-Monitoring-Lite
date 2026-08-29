@@ -33,16 +33,11 @@ Usage: .venv/bin/python -m scripts.run_signin_drill [--keep-session]
 """
 import asyncio
 import sys
-from datetime import datetime, timezone
-
 import config
 from monitor import db, journey
 from monitor.channels import build_channels
 from monitor.main import _process_probe
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from monitor.timeutil import now_iso
 
 
 async def _manual_mfa_pause() -> None:
@@ -93,7 +88,7 @@ async def main() -> None:
         manual_mfa_pause=_manual_mfa_pause if manual_mfa else None,
     )
 
-    ts = _now_iso()
+    ts = now_iso()
 
     # Rule 15 "every probe writes a checks row" / Stage 6 spec: every sign-in attempt is its own audit row, independent of
     # the checks table (which _process_probe writes below in the same call).

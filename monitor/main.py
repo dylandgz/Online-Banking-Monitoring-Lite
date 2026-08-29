@@ -16,11 +16,8 @@ import config
 from monitor import check, db, journey, session
 from monitor.channels import build_channels, dispatch
 from monitor.state import ConfigErrorEvent, DownEvent, MonitorState, RecoveryEvent, apply_check
+from monitor.timeutil import now_iso
 from monitor.verdict import severity, unified_verdict
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 async def _process_probe(
@@ -142,7 +139,7 @@ async def _run_burst_reprobes(
             result = await check.pulse_only_probe(config.TARGET_URL)
 
         last_result = result
-        state = await _process_probe(conn, channels, state, result, _now_iso(), burst_id, cycle_id=cycle_id)
+        state = await _process_probe(conn, channels, state, result, now_iso(), burst_id, cycle_id=cycle_id)
 
     return state, last_result, burst_id
 
@@ -194,7 +191,7 @@ async def _run_full_login(conn, *, should_logout: bool) -> "check.CheckResult":
         # actually did (and must not replace the original exception on the failure path).
         try:
             db.append_login_event(
-                conn, ts=_now_iso(),
+                conn, ts=now_iso(),
                 ok=bool(result and result.ok),
                 latency_ms=result.latency_ms if result else 0.0,
                 # No result at all means run_journey raised rather than reporting -- with
@@ -322,7 +319,7 @@ async def _run_auth_burst_reprobes(
         result, _probed = await _run_auth_probe(conn, main_down, login_budget_state)
         last_result = result
         state = await _process_probe(
-            conn, channels, state, result, _now_iso(), burst_id,
+            conn, channels, state, result, now_iso(), burst_id,
             browser_mode=config.JOURNEY_BROWSER_MODE, track="auth",
             down_confidence=config.AUTH_DOWN_CONFIDENCE, burst_window_s=config.BURST_WINDOW_S,
             min_failed_probes=config.AUTH_MIN_FAILED_PROBES, precursor_down=main_down, cycle_id=cycle_id,
@@ -368,7 +365,7 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
     row), invisible to /api/history and the dashboard drill-down, which read cycles. It
     still defaults to generating one so run_cycle stays callable on its own."""
     cycle_id = cycle_id or str(uuid.uuid4())
-    ts = _now_iso()
+    ts = now_iso()
 
     # --- main track: pulse + render, with its confirmation burst ---
     prev_main_state = db.get_state(conn, track="main")
@@ -383,7 +380,7 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
         artifacts_dir=config.ARTIFACTS_DIR,
         headless=config.HEADLESS,
     )
-    ts_main = _now_iso()
+    ts_main = now_iso()
     new_main_state = await _process_probe(conn, channels, prev_main_state, main_result, ts_main, burst_id=None, cycle_id=cycle_id)
     last_main_result = main_result
 
@@ -408,14 +405,14 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
     if auth_enabled:
         prev_auth_state = db.get_state(conn, track="auth")
         if prev_auth_state.status == "CONFIG_ERROR":
-            print(f"[{_now_iso()}] [auth] skip -- track is CONFIG_ERROR ({prev_auth_state.fail_reasons}), needs a human")
+            print(f"[{now_iso()}] [auth] skip -- track is CONFIG_ERROR ({prev_auth_state.fail_reasons}), needs a human")
             new_auth_state = prev_auth_state
         else:
             prior_auth_burst_ts = prev_auth_state.burst_started_ts if prev_auth_state.status == "UP" else None
             login_budget_state = {"used": False}
 
             auth_result, auth_probed = await _run_auth_probe(conn, main_down, login_budget_state)
-            ts_auth = _now_iso()
+            ts_auth = now_iso()
             new_auth_state = await _process_probe(
                 conn, channels, prev_auth_state, auth_result, ts_auth, burst_id=None,
                 browser_mode=config.JOURNEY_BROWSER_MODE, track="auth",
@@ -510,14 +507,14 @@ async def guarded_cycle(conn, channels, lock: asyncio.Lock, auth_enabled: bool) 
             traceback.print_exc()
             try:
                 db.append_cycle(
-                    conn, cycle_id=cycle_id, ts=_now_iso(),
+                    conn, cycle_id=cycle_id, ts=now_iso(),
                     pulse_ok=None, render_ok=None, authed_ok=None,
                     verdict="DEGRADED", fail_layer="monitor", fail_reason="internal_error",
                 )
-                print(f"[{_now_iso()}] [cycle {cycle_id[:8]}] verdict=DEGRADED "
+                print(f"[{now_iso()}] [cycle {cycle_id[:8]}] verdict=DEGRADED "
                       f"(monitor: internal_error) -- cycle failed, see traceback above", flush=True)
             except Exception as exc:  # noqa: BLE001 -- the DB may be the thing that broke
-                print(f"[{_now_iso()}] CRITICAL: cycle failed AND its DEGRADED marker row "
+                print(f"[{now_iso()}] CRITICAL: cycle failed AND its DEGRADED marker row "
                       f"could not be written: {exc!r}", flush=True)
 
 
@@ -550,7 +547,7 @@ async def cycle_scheduler() -> None:
 
     while True:
         if lock.locked():
-            print(f"[{_now_iso()}] skip cycle — previous cycle (or an in-progress burst) still running")
+            print(f"[{now_iso()}] skip cycle — previous cycle (or an in-progress burst) still running")
         else:
             asyncio.create_task(guarded_cycle(conn, channels, lock, auth_enabled))
         await asyncio.sleep(config.CHECK_INTERVAL_S)

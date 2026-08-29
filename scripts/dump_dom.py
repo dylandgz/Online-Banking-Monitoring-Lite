@@ -26,11 +26,11 @@ Usage: .venv/bin/python -m scripts.dump_dom
 import asyncio
 import re
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 import config
 from monitor import journey
+from monitor.timeutil import artifact_stamp
 
 # Role inference mirrors how Playwright's get_by_role resolves an element, so the
 # suggested locator lines below are ones that will actually match. Accessible name is
@@ -146,7 +146,7 @@ async def main() -> None:
     if not (config.LOGIN_URL and config.LOGIN_USER and config.LOGIN_PASSWORD):
         raise SystemExit("LOGIN_URL, LOGIN_USER and LOGIN_PASSWORD must be set in .env.")
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = artifact_stamp()
     run_dir = Path(config.ARTIFACTS_DIR).parent / "dom_dumps" / stamp
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Writing captures to {run_dir}")
