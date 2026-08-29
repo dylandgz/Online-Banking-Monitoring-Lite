@@ -177,9 +177,19 @@ async def render_only_probe(
     headless: bool = True,
 ) -> CheckResult:
     """A burst re-probe that only re-checks the page render, in a fresh browser context --
-    independent evidence from a pulse probe, per Stage 5's 'vary the probe' rule."""
+    independent evidence from a pulse probe, per Stage 5's 'vary the probe' rule.
+
+    [B25] latency_ms is measured, not hardcoded. It used to be a literal 0.0, which is not a
+    fast probe -- it is no measurement at all, written into a column that reads as one. 102 of
+    the 3,843 render rows on the live DB carry that zero, and every one of them is a burst
+    re-probe: the minutes an operator actually studies were the only minutes with no render
+    timing. The measurement spans exactly what browser_check does (launch, navigate, assert),
+    which is the same span perform_check times for its own render leg, so burst and opening
+    render latencies are directly comparable."""
+    start = time.monotonic()
     ok, fail_reason, screenshot_path, page_url = await browser_check(
         url, required_text, required_role, required_name, browser_timeout_ms, artifacts_dir, headless=headless
     )
-    return CheckResult(ok=ok, http_status=None, latency_ms=0.0, fail_reason=fail_reason,
+    latency_ms = (time.monotonic() - start) * 1000
+    return CheckResult(ok=ok, http_status=None, latency_ms=latency_ms, fail_reason=fail_reason,
                        screenshot_path=screenshot_path, page_url=page_url, layer="render")

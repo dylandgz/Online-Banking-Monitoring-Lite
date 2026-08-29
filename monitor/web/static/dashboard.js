@@ -119,6 +119,33 @@ function sessionBadge(r) {
   return `<span class="badge-login">new login</span>`;
 }
 
+// [B25] 461 early rows were written before `layer` existed and carry NULL/empty. Rendering
+// that as a blank leaves a line whose middle is missing, which reads as a rendering bug
+// rather than as missing data -- say "unknown" instead. (The `auth`/`authed` spelling split
+// is normalised server-side, in _split_main_probe's caller.)
+function probeLayer(p) {
+  return p.layer ? p.layer : `<span class="badge-muted">unknown</span>`;
+}
+
+// Three states, not two. The pulse line reads its ok from cycles.pulse_ok, which is NULL on
+// any cycle predating that column -- and `null ? "OK" : "FAIL"` would print FAIL for a probe
+// that was never recorded either way. Matches layerBadge()'s handling in the row above.
+// Values arrive as SQLite 1/0/null, not JS booleans.
+function probeStatus(p) {
+  if (p.ok === null || p.ok === undefined) return `<span class="badge-muted">n/a</span>`;
+  return `<span class="${p.ok ? "ok" : "fail"}">${p.ok ? "OK" : "FAIL"}</span>`;
+}
+
+// [B25] A latency of exactly 0 is never a measurement. It is the old hardcoded
+// render_only_probe placeholder (102 rows, all burst re-probes) or main.py's synthetic
+// session_expired result, which records that the monitor wanted to look and could not.
+// Both mean "not timed", and "0ms" reads as "instant" -- the opposite. Show an em dash.
+// render_only_probe now measures itself, so new burst rows carry real values.
+function probeLatency(p) {
+  if (p.latency_ms == null || p.latency_ms === 0) return ` — <span class="badge-muted">—</span>`;
+  return ` — ${Math.round(p.latency_ms)}ms`;
+}
+
 async function toggleProbes(cycleId, row) {
   const existing = document.getElementById("probes-" + cycleId);
   if (existing) { existing.remove(); return; }
@@ -130,10 +157,10 @@ async function toggleProbes(cycleId, row) {
   detail.className = "probe-detail";
   detail.innerHTML = `<td colspan="7">` + data.rows.map(p => `
     <div>
-      <span title="${p.ts}">${compactTs(p.ts)}</span> — <strong>${p.layer}</strong> —
-      <span class="${p.ok ? 'ok' : 'fail'}">${p.ok ? "OK" : "FAIL"}</span>
+      <span title="${p.ts}">${compactTs(p.ts)}</span> — <strong>${probeLayer(p)}</strong> —
+      ${probeStatus(p)}
       ${p.fail_reason ? ` (${p.fail_reason})` : ""}
-      ${p.latency_ms != null ? ` — ${Math.round(p.latency_ms)}ms` : ""}
+      ${probeLatency(p)}
       ${p.burst_id ? `<span class="badge-burst">burst</span><span class="burst-id">${p.burst_id.slice(0, 8)}</span>` : ""}
     </div>
   `).join("") + `</td>`;
