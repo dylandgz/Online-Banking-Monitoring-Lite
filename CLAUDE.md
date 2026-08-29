@@ -115,7 +115,12 @@ session_expired | logout_failed
 
 There is no `"unknown"` fail_reason. `internal_error` is **not** in this list — it describes the monitor, not the platform (see [Self-health](#self-health-degraded--internal_error)).
 
-Three members are currently **unreachable** — no code path emits `auth_unavailable`, `rate_limited`, or (in the scheduler) `logout_failed`. See [Known limitations](#known-limitations) #3.
+Three members cannot be produced by the running monitor, for **two different reasons** that should not be conflated:
+
+- `auth_unavailable`† and `rate_limited`† — **no code anywhere emits them.** Dead vocabulary; closing this needs code (B20).
+- `logout_failed`‡ — **real code emits it, but only a drill script can reach that code.** `run_journey()` returns it when logout fails, and the scheduler's only caller passes `should_logout=False` deliberately: a recovery login must keep the session alive for reuse (Rule 5's zero-login burst depends on that session). Only `scripts/run_signin_drill.py`, without `--keep-session`, can produce it. Closing this needs a decision, not code — either it stays drill-only (it is, and is now labelled) or something must start logging out periodically, which nothing wants.
+
+See [Known limitations](#known-limitations) #3.
 
 Layers are `pulse | render | authed`. `monitor` is a `cycles.fail_layer` value only. Note the spelling split: **`authed`** is the layer, **`auth`** is the track.
 
@@ -124,13 +129,15 @@ Layers are `pulse | render | authed`. `monitor` is a `cycles.fail_layer` value o
 | Class | Reasons | Weight | Effect |
 |---|---|---|---|
 | Hard | `conn_refused`, `dns`, `bad_status:5xx`, `auth_unavailable`† | 2 | scores toward DOWN |
-| Soft | `timeout`, `element_missing`, `nav_error`, non-5xx `bad_status`, **anything unrecognized** | 1 | scores toward DOWN |
+| Soft | `timeout`, `element_missing`, `nav_error`, non-5xx `bad_status`, `logout_failed`‡, **anything unrecognized** | 1 | scores toward DOWN |
 | Config | `auth_rejected`, `bot_challenge`, `mfa_failed`, `rate_limited`† | 0 | → CONFIG_ERROR, halts logins |
 | Session | `session_expired` | 0 | → recovery-login path, **never scores** |
 
 Unrecognized reasons fail *safe as Soft* — ambiguous evidence stays cautious rather than paging.
 
 † Never actually emitted by any probe today — see [Known limitations](#known-limitations) #3 (tracked as B20).
+
+‡ Reachable only from `scripts/`, never from the scheduler — see the taxonomy note above (tracked as B21). Listed here explicitly rather than relying on the "anything unrecognized" fallback: it scored Soft either way, but a reason absent from this table reads as one the ladder forgot rather than one deliberately placed.
 
 ### Unexpected browser errors
 
@@ -310,7 +317,7 @@ Open and deliberate. Read this before diagnosing a bug — several "bugs" are al
 
 1. **False-UP blind spot on the authed marker (iframe scope).** The live target's banking content lives inside a separate `nxg-olb` iframe; `authed_marker()` builds **page-level locators only**, and `get_by_text` does not pierce iframes. The configured marker is outer-shell chrome, so if the iframe fails to render — which is literally "online banking behind login not rendering" — the check still reports **UP**. This contradicts the definition of UP and is a silent false negative. Fix needs `frame_locator` support in `journey.py` plus a frame-URL setting.
 2. **Three unverified `classify_*` fallback mappings.** `classify_after_submit` → `bot_challenge` (this one already fired wrongly on a live MFA screen and parked the auth track in CONFIG_ERROR); `classify_after_totp` → `mfa_failed`; `classify_authed` with marker *and* error banner both visible → `element_missing`. The MFA **locators** are now confirmed against captured DOM; these **fallbacks** are not.
-3. **The authed layer's evidence vocabulary is narrower than this spec claims.** `auth_unavailable` and `rate_limited` exist only in `state.py`'s classification sets — nothing emits them; `classify_after_submit` lumps "bot challenge / auth service down / rate limited" into `bot_challenge`, which is Config-class and **never pages**, so a genuinely unavailable auth service reads as a config problem. `logout_failed` is only reachable from the drill script (the scheduler always runs `should_logout=False`). Worse, `run_authed_check()` collapses *every* navigation exception to `nav_error`, so on the `authed` layer `dns` and `conn_refused` are unreachable too — its only Hard evidence is `bad_status:5xx`, and a hard network failure there scores Soft. Tracked as **B20/B21** in `personal/ISSUES.md`.
+3. **The authed layer's evidence vocabulary is narrower than this spec claims.** `auth_unavailable` and `rate_limited` exist only in `state.py`'s classification sets — nothing emits them; `classify_after_submit` lumps "bot challenge / auth service down / rate limited" into `bot_challenge`, which is Config-class and **never pages**, so a genuinely unavailable auth service reads as a config problem. `logout_failed`‡ is only reachable from the drill script (the scheduler always runs `should_logout=False`) — a different case from the other two, and marked separately in the taxonomy: the code exists and works, only the scheduler never calls it. Worse, `run_authed_check()` collapses *every* navigation exception to `nav_error`, so on the `authed` layer `dns` and `conn_refused` are unreachable too — its only Hard evidence is `bad_status:5xx`, and a hard network failure there scores Soft. Tracked as **B20/B21** in `personal/ISSUES.md`.
 4. **`element_missing` conflates absence with ambiguity.** A locator matching 2+ elements fails `to_be_visible` identically to one matching 0. `.first` guards the known free-text locators; anything else raises and lands on `nav_error` via `unexpected_fail_reason` — Soft, and therefore scoring.
 5. **A *persistent* monitor-side defect can page.** Unforeseen browser errors map to Soft reasons, and four Soft probes reach `DOWN_CONFIDENCE`. The 3-probe floor stops a single flake, not a systematic bug. Closing this needs a distinct non-scoring monitor-error class in the taxonomy — a spec change, not a code tweak. Do not assume it is already handled.
 6. **Masking cannot redact `<input>` values.** `get_by_text` matches text nodes, so a filled login-ID field appears in any post-submit failure screenshot. A `MASK_TEXT` pattern that matches nothing fails *open* (no mask, no error). An empty `MASK_TEXT` under `MASKING_ENABLED=true` warns loudly but does not block. The current target is a security-team test site with fake data; this must be populated before pointing at a real account.
