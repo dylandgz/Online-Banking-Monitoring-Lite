@@ -311,11 +311,14 @@ def get_state(conn: sqlite3.Connection, track: str = "main") -> MonitorState:
     else:
         # Pre-B37 row: the legacy columns described one undifferentiated run. Read them as
         # a single layer rather than inventing a split that was never recorded.
-        layers = ({"render": LayerEvidence(consecutive=len(fail_reasons),
-                                           confidence=row["confidence"] or 0,
-                                           fail_reasons=fail_reasons,
-                                           last_probe_ts=row["burst_started_ts"],
-                                           run_started_ts=row["burst_started_ts"])}
+        # Named for the layer the track actually probes: the auth track has only `authed`,
+        # so calling its legacy evidence "render" invented a layer that track never uses.
+        legacy_layer = "authed" if track == "auth" else "render"
+        layers = ({legacy_layer: LayerEvidence(consecutive=len(fail_reasons),
+                                               confidence=row["confidence"] or 0,
+                                               fail_reasons=fail_reasons,
+                                               last_probe_ts=row["burst_started_ts"],
+                                               run_started_ts=row["burst_started_ts"])}
                   if fail_reasons else {})
     return MonitorState(
         status=row["status"],

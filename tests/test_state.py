@@ -407,3 +407,26 @@ def test_a_failure_mid_recovery_extends_the_same_incident():
     assert state.status == "DOWN"
     assert state.evidence("pulse").consecutive == 5, "4 from the incident plus the relapse"
     assert state.consecutive_passes == 0
+
+
+def test_config_error_names_the_layer_it_happened_on():
+    """Without a cause_layer, state.fail_reasons fell back to "whichever layer has the most
+    failures" -- so a bot_challenge on `authed` was persisted, and logged on the cycles row,
+    as a stale element_missing from `render`."""
+    state = MonitorState(status="UP", since_ts=None, layers={
+        "render": LayerEvidence(consecutive=3, confidence=3,
+                                fail_reasons=("element_missing",) * 3, last_probe_ts=T(0))})
+    state, events = step(state, False, "bot_challenge", T(60), "authed")
+    assert state.status == "CONFIG_ERROR"
+    assert state.cause_layer == "authed"
+    assert state.fail_reasons == ("bot_challenge",)
+    assert events[0].fail_reason == "bot_challenge"
+
+
+def test_config_error_is_cleared_by_a_pass_of_its_own_layer():
+    state, _ = step(UP, False, "auth_rejected", T(0), "authed")
+    state, events = step(state, True, None, T(60), "render")
+    assert state.status == "CONFIG_ERROR", "a passing render says nothing about the credential"
+    state, events = step(state, True, None, T(120), "authed")
+    assert state.status == "UP"
+    assert isinstance(events[0], RecoveryEvent)
