@@ -64,40 +64,45 @@ def test_combined_probe_render_result_implies_the_pulse_passed():
 
 # --- the real cycle this bug was found in --------------------------------------------
 
-def test_burst_render_pass_reaches_the_summary_row(conn, monkeypatch):
-    """Replay of live cycle fc32039c. Opening pulse fails; the burst's first re-probe is a
-    render probe and it passes. render_ok must be True, not NULL."""
-    monkeypatch.setattr(config, "BURST_DELAYS_S", [0, 0, 0, 0])  # no waiting in tests
+def test_burst_probe_outcomes_reach_the_summary_row(conn, monkeypatch):
+    """Live cycle fc32039c is what opened B9: the opening pulse failed, the burst's re-probe
+    passed, and the summary row still reported that layer as never measured.
+
+    [2026-08-30] The original replay had the burst running a RENDER probe after a pulse
+    failure, because the burst alternated layers. Under the same-layer burst (B37) a pulse
+    failure is confirmed with pulse probes, so that exact sequence can no longer occur. The
+    defect being pinned is unchanged: whatever the burst learns must reach the summary."""
+    monkeypatch.setattr(config, "BURST_GAP_S", 0)
     monkeypatch.setattr(config, "BURST_JITTER_S", 0)
+
+    calls = {"n": 0}
 
     async def failing_pulse(*a, **k):
         return CheckResult(ok=False, http_status=None, latency_ms=5.0,
                            fail_reason="timeout", layer="pulse", pulse_latency_ms=5.0)
 
-    async def passing_render(*a, **k):
-        return CheckResult(ok=True, http_status=None, latency_ms=0.0, fail_reason=None, layer="render")
-
-    async def passing_pulse(*a, **k):
+    async def pulse_recovers(*a, **k):
+        calls["n"] += 1
         return CheckResult(ok=True, http_status=200, latency_ms=4.0, fail_reason=None, layer="pulse")
 
     monkeypatch.setattr(check, "perform_check", failing_pulse)
-    monkeypatch.setattr(check, "render_only_probe", passing_render)
-    monkeypatch.setattr(check, "pulse_only_probe", passing_pulse)
+    monkeypatch.setattr(check, "pulse_only_probe", pulse_recovers)
 
     asyncio.run(main.run_cycle(conn, [], auth_enabled=False))
 
     row = _cycle(conn)
-    assert row["pulse_ok"] == 0, "the opening pulse genuinely failed"
-    assert row["render_ok"] == 1, (
-        "a render probe ran during this minute and passed -- the summary must say so "
-        "instead of reporting NULL/'never measured'"
+    assert calls["n"] >= 1, "the burst must re-probe the layer that failed"
+    assert row["pulse_ok"] == 0, (
+        "the opening pulse failed this minute, and a later pass does not erase that it "
+        "happened -- the column answers 'did every pulse check pass?'"
     )
+    assert row["render_ok"] is None, "render was never attempted, so it is not measured"
 
 
 def test_render_failure_during_a_burst_is_not_hidden_by_a_later_pass(conn, monkeypatch):
     """The inverse guard: a failure that happened must survive into the summary even though
     the burst went on to clear and the cycle's verdict is UP."""
-    monkeypatch.setattr(config, "BURST_DELAYS_S", [0, 0, 0, 0])
+    monkeypatch.setattr(config, "BURST_GAP_S", 0)
     monkeypatch.setattr(config, "BURST_JITTER_S", 0)
 
     async def failing_render_probe(*a, **k):
@@ -139,7 +144,7 @@ def test_cycle_fail_layer_names_the_layer_that_opened_the_incident(conn, monkeyp
     """[B37] Once the pulse recovers, perform_check reports layer="render" again -- so
     taking fail_layer from the last probe logged a pulse-caused incident as "render: dns",
     naming a layer that was passing alongside a reason it never produced."""
-    monkeypatch.setattr(config, "BURST_DELAYS_S", [0, 0, 0, 0])
+    monkeypatch.setattr(config, "BURST_GAP_S", 0)
     monkeypatch.setattr(config, "BURST_JITTER_S", 0)
 
     async def pulse_down(*a, **k):

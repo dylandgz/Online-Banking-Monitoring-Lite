@@ -4,11 +4,10 @@ and the auth track (cheap authed-session check, budgeted recovery login) both ru
 a single tick, sharing a cycle_id, and are combined into one `cycles` summary row. See
 CLAUDE.md's v3.8 amendment and its "Cross-track suppression" section for the reasoning."""
 import asyncio
-import itertools
 import random
 import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import uvicorn
 
@@ -123,40 +122,19 @@ async def _advance_state(
     return new_state
 
 
-async def _sleep_until_offset(start: datetime, delay_s: float) -> None:
-    """Sleeps until `delay_s` (+/- jitter) has elapsed since `start`, not simply
-    `asyncio.sleep(delay_s)` -- each prior loop iteration already spent real time on
-    _process_probe's DB writes and alert dispatch, so a raw per-iteration sleep would
-    accumulate drift and push later offsets later with every probe. Measuring elapsed
-    time since the burst's actual start and sleeping only the remainder keeps every
-    probe close to its intended BURST_DELAYS_S offset regardless of how long earlier
-    iterations took. Shared by both tracks' burst loops (main and auth) since the timing
-    math is identical; only the probe each loop runs afterward differs."""
-    jitter = random.uniform(-config.BURST_JITTER_S, config.BURST_JITTER_S)
-    target_offset = max(0.0, delay_s + jitter)
-    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-    sleep_s = max(0.0, target_offset - elapsed)
-    if sleep_s:
-        await asyncio.sleep(sleep_s)
-
-
 def _fold_layer(outcomes: dict, layer: str, ok: bool) -> None:
     """[B9] Folds one probe's outcome into the cycle's per-layer summary.
 
     `cycles.pulse_ok` / `render_ok` answer "did every check of this kind pass this minute?"
     -- None when no check of that kind ran, False if any failed, True when at least one ran
-    and all passed. A minute is the unit here, not a probe: a burst runs three more probes
-    after the one that opened it, and all four belong to the same minute.
+    and all passed. A minute is the unit here, not a probe: a burst runs more probes after
+    the one that opened it, and all of them belong to the same minute.
 
-    Before this, both columns were derived from the cycle's FIRST probe alone and every
-    burst probe was discarded from the summary. Worked example from the live DB, cycle
-    fc32039c: the opening pulse failed (so render was correctly not attempted, render_ok
-    NULL), the burst then ran a render probe at +19s which PASSED, and the row still
-    reported render_ok NULL -- "never measured" -- for a minute in which render was measured
-    and passed. That is exactly the fact an operator wants during a DOWN incident: the login
-    page itself was fine, the failure was elsewhere. Rule 15 requires the export to be
-    row-for-row faithful, and a column that reports "not measured" about a measurement it
-    made is not."""
+    Before this, both columns were derived from the cycle's FIRST probe and every burst
+    probe was discarded from the summary. Worked example from the live DB, cycle fc32039c:
+    the opening pulse failed (so render was correctly not attempted, render_ok NULL), the
+    burst then ran a render probe that PASSED, and the row still reported render_ok NULL --
+    "never measured" -- for a minute in which render was measured and passed."""
     previous = outcomes[layer]
     outcomes[layer] = ok if previous is None else (previous and ok)
 
@@ -173,44 +151,108 @@ def _fold_combined_probe(outcomes: dict, result: "check.CheckResult") -> None:
     _fold_layer(outcomes, "render", result.ok)
 
 
-async def _run_burst_reprobes(
-    conn, channels, state: MonitorState, burst_start_ts: str, cycle_id: str,
-    outcomes: dict,
-) -> tuple[MonitorState, "check.CheckResult", str]:
-    """Runs the rest of the main-track confirmation burst inline (Stage 5): re-probes at
-    the remaining BURST_DELAYS_S offsets, varying the probe (render, then pulse) so each
-    is independent evidence rather than a correlated retry. Stops the moment the burst
-    resolves -- DOWN fires, or a pass clears it. Running this inline means the cycle's
-    overlap-guard lock naturally absorbs the next tick instead of double-probing while a
-    burst is in flight -- the human's call: reliability over a strict 60s cadence.
-    Returns the final state, the last probe's CheckResult (for the cycles row's
-    fail_layer), and the burst_id every probe in this burst was tagged with (so the cycles
-    row can carry it too -- see run_cycle).
+# [B7] Probes taken while the monitor demonstrably was not running are recorded but do not
+# score. A laptop resuming from suspend produces `dns` failures that are evidence about the
+# host, not the bank -- and all three main-track DOWN pages of the Stage R era were exactly
+# that. Process-level, not per-layer: during a long burst one layer legitimately goes
+# unprobed for minutes, which is the monitor working, not sleeping.
+_GRACE: dict = {"until": None}
 
-    outcomes [B9] is folded in place -- every re-probe here belongs to the same minute as the
-    probe that opened the burst, and the cycles row summarises the minute, not the opener."""
+
+def _open_grace_if_process_gap(conn) -> None:
+    """Called once per cycle. If more wall-clock passed since the newest recorded probe than
+    the monitor could possibly have taken while running, it wasn't running -- a suspend, a
+    restart, or a hung cycle (B42). Open a grace period."""
+    last_ts = db.get_last_check_ts(conn)
+    if last_ts is None:
+        return
+    gap = (datetime.now(timezone.utc) - datetime.fromisoformat(last_ts)).total_seconds()
+    if gap > 2 * config.CHECK_INTERVAL_S:
+        _GRACE["until"] = datetime.now(timezone.utc) + timedelta(seconds=config.WAKE_GRACE_S)
+        print(f"[{now_iso()}] gap of {gap:.0f}s since the last probe -- the monitor was not "
+              f"running. Probes are recorded but do not score for {config.WAKE_GRACE_S}s.")
+
+
+def _scoring_now() -> bool:
+    until = _GRACE["until"]
+    return not (until is not None and datetime.now(timezone.utc) < until)
+
+
+def _lift_grace_on_pass(ok: bool) -> None:
+    """A passing probe is positive proof the host is healthy again, so the grace can end
+    early. The WAKE_GRACE_S bound exists for the opposite case: if the monitor wakes INTO a
+    real outage no probe ever passes, and 'suppress until a pass' would leave it blind
+    indefinitely. Both halves are load-bearing; simulated."""
+    if ok and _GRACE["until"] is not None:
+        _GRACE["until"] = None
+
+
+async def _wait_burst_gap() -> None:
+    """[2026-08-30 / B38] Idle time between confirmation probes, measured from when the
+    PREVIOUS probe finished -- not from an absolute offset within the burst.
+
+    The old scheduler slept until `burst_start + BURST_DELAYS_S[i]`, which held the burst to
+    a fixed footprint only while probes were fast enough to leave idle time. Once a probe
+    ran longer than its slot the sleep clamped to zero, probes ran back to back, and the
+    schedule became fiction -- and because the window was measured from the same origin, the
+    last probe timestamped itself outside the window it was scheduled in. That is why the
+    auth track could never page for a slow failure (B13).
+
+    With a gap there is no schedule to fall behind: a slow probe delays the burst, it cannot
+    corrupt it. The burst's footprint is now BURST_PROBES x (gap + probe duration), which is
+    bounded by the probe's own timeout -- see B43 for the fact that nothing currently bounds
+    that, which is what makes a worst-case burst long rather than infinite.
+
+    Jitter is retained so that many monitors (or a restarted one) do not synchronise their
+    re-probes onto the same instants."""
+    jitter = random.uniform(-config.BURST_JITTER_S, config.BURST_JITTER_S)
+    await asyncio.sleep(max(0.0, config.BURST_GAP_S + jitter))
+
+
+async def _run_burst_reprobes(
+    conn, channels, state: MonitorState, failed_layer: str, cycle_id: str, outcomes: dict,
+) -> tuple[MonitorState, "check.CheckResult", str]:
+    """Runs the confirmation burst inline: BURST_PROBES re-probes of THE LAYER THAT FAILED,
+    each starting BURST_GAP_S after the previous one finished. Stops the moment the burst
+    resolves -- DOWN fires, or a pass of that layer clears the run.
+
+    [2026-08-30 / B37] The burst used to alternate render/pulse "so each is independent
+    evidence rather than a correlated retry". That intent was sound and the implementation
+    inverted it: the scorer then treated a pass on one layer as proof about the other, so on
+    a "server reachable, page rendering wrong" outage the burst's own pulse probe deleted
+    the render failures that opened it. Independence now comes from repetition over time on
+    the layer under suspicion, which is the thing actually in doubt. Simulated: alternating
+    with per-layer evidence is WORSE than either alone -- 69% of outages missed against the
+    old design's 48% -- because no single layer accumulates. These two changes ship together
+    or not at all.
+
+    Running inline means the cycle's overlap-guard lock absorbs the next tick rather than
+    double-probing mid-burst -- reliability over a strict 60s cadence.
+
+    Returns the final state, the last probe's CheckResult (for the cycles row's fail_layer),
+    and the burst_id every probe in this burst was tagged with."""
     burst_id = str(uuid.uuid4())
     last_result = None
-    probe_kinds = list(itertools.islice(itertools.cycle(["render", "pulse"]), len(config.BURST_DELAYS_S) - 1))
-    start = datetime.fromisoformat(burst_start_ts)
+    run_started = state.evidence(failed_layer).run_started_ts
 
-    for kind, delay_s in zip(probe_kinds, config.BURST_DELAYS_S[1:]):
-        if state.status != "UP" or state.burst_started_ts != burst_start_ts:
-            break  # already resolved: DOWN fired, or a pass cleared the burst
+    for _ in range(config.BURST_PROBES):
+        if state.status != "UP" or state.evidence(failed_layer).run_started_ts != run_started:
+            break  # already resolved: DOWN fired, or a pass cleared the run
 
-        await _sleep_until_offset(start, delay_s)
+        await _wait_burst_gap()
 
-        if kind == "render":
+        if failed_layer == "pulse":
+            result = await check.pulse_only_probe(config.TARGET_URL)
+        else:
             result = await check.render_only_probe(
                 config.TARGET_URL, config.REQUIRED_TEXT, config.REQUIRED_ROLE, config.REQUIRED_NAME,
                 config.BROWSER_TIMEOUT_MS, config.ARTIFACTS_DIR, headless=config.HEADLESS,
             )
-        else:
-            result = await check.pulse_only_probe(config.TARGET_URL)
 
         last_result = result
         _fold_layer(outcomes, result.layer, result.ok)  # single-layer probe: its own layer only
-        state = await _process_probe(conn, channels, state, result, now_iso(), burst_id, cycle_id=cycle_id)
+        state = await _process_probe(conn, channels, state, result, now_iso(), burst_id,
+                                     cycle_id=cycle_id, scoring=_scoring_now())
 
     return state, last_result, burst_id
 
@@ -367,7 +409,7 @@ async def _run_auth_probe(
 
 
 async def _run_auth_burst_reprobes(
-    conn, channels, state: MonitorState, burst_start_ts: str, cycle_id: str,
+    conn, channels, state: MonitorState, cycle_id: str,
     main_down: bool, login_budget_state: dict,
 ) -> tuple[MonitorState, "check.CheckResult", str]:
     """[v3.8 / Stage R] Auth-track confirmation burst: re-probes with the cheap
@@ -377,13 +419,13 @@ async def _run_auth_burst_reprobes(
     if this cycle's one budgeted login was already spent."""
     burst_id = str(uuid.uuid4())
     last_result = None
-    start = datetime.fromisoformat(burst_start_ts)
+    run_started = state.evidence("authed").run_started_ts
 
-    for delay_s in config.BURST_DELAYS_S[1:]:
-        if state.status != "UP" or state.burst_started_ts != burst_start_ts:
-            break  # already resolved: DOWN fired, or a pass cleared the burst
+    for _ in range(config.BURST_PROBES):
+        if state.status != "UP" or state.evidence("authed").run_started_ts != run_started:
+            break  # already resolved: DOWN fired, or a pass cleared the run
 
-        await _sleep_until_offset(start, delay_s)
+        await _wait_burst_gap()
 
         # The burst only needs the result; whether it counted as a real observation
         # matters to the cycles row, which the initiating probe already decided.
@@ -441,10 +483,10 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
     still defaults to generating one so run_cycle stays callable on its own."""
     cycle_id = cycle_id or str(uuid.uuid4())
     ts = now_iso()
+    _open_grace_if_process_gap(conn)
 
     # --- main track: pulse + render, with its confirmation burst ---
     prev_main_state = db.get_state(conn, track="main")
-    prior_main_burst_ts = prev_main_state.burst_started_ts if prev_main_state.status == "UP" else None
 
     main_result = await check.perform_check(
         url=config.TARGET_URL,
@@ -466,18 +508,26 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
     # reached and passed; record that against the pulse layer before scoring the render
     # result, or the pulse layer only ever hears about its own failures and a pulse-caused
     # incident can never recover. No extra checks row -- the one row covers both legs.
+    _lift_grace_on_pass(main_result.ok)
+    scoring = _scoring_now()
+
     if main_result.layer == "render":
         prev_main_state = await _advance_state(
-            conn, channels, prev_main_state, True, None, ts_main, "pulse", track="main")
+            conn, channels, prev_main_state, True, None, ts_main, "pulse", track="main",
+            scoring=scoring)
 
-    new_main_state = await _process_probe(conn, channels, prev_main_state, main_result, ts_main, burst_id=None, cycle_id=cycle_id)
+    new_main_state = await _process_probe(conn, channels, prev_main_state, main_result, ts_main,
+                                          burst_id=None, cycle_id=cycle_id, scoring=scoring)
     last_main_result = main_result
 
+    # [B37] Confirm the layer that actually failed, and only if the failure produced
+    # evidence -- session/config-class reasons open no run, so there is nothing to confirm.
     main_burst_id = None
-    if new_main_state.status == "UP" and new_main_state.burst_started_ts == ts_main and prior_main_burst_ts != ts_main:
+    failed_layer = None if main_result.ok else main_result.layer
+    if (failed_layer and new_main_state.status == "UP"
+            and new_main_state.evidence(failed_layer).run_started_ts):
         new_main_state, burst_last_result, main_burst_id = await _run_burst_reprobes(
-            conn, channels, new_main_state, burst_start_ts=ts_main, cycle_id=cycle_id,
-            outcomes=layer_outcomes,
+            conn, channels, new_main_state, failed_layer, cycle_id, outcomes=layer_outcomes,
         )
         if burst_last_result is not None:
             last_main_result = burst_last_result
@@ -498,7 +548,6 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
             print(f"[{now_iso()}] [auth] skip -- track is CONFIG_ERROR ({prev_auth_state.fail_reasons}), needs a human")
             new_auth_state = prev_auth_state
         else:
-            prior_auth_burst_ts = prev_auth_state.burst_started_ts if prev_auth_state.status == "UP" else None
             login_budget_state = {"used": False}
 
             auth_result, auth_probed = await _run_auth_probe(conn, main_down, login_budget_state)
@@ -507,13 +556,15 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
                 conn, channels, prev_auth_state, auth_result, ts_auth, burst_id=None,
                 browser_mode=config.JOURNEY_BROWSER_MODE, track="auth",
                 down_confidence=config.AUTH_DOWN_CONFIDENCE,
-                min_failed_probes=config.AUTH_MIN_FAILED_PROBES, precursor_down=main_down, cycle_id=cycle_id,
+                min_failed_probes=config.AUTH_MIN_FAILED_PROBES, precursor_down=main_down,
+                cycle_id=cycle_id, scoring=scoring,
             )
             last_auth_result = auth_result
 
-            if new_auth_state.status == "UP" and new_auth_state.burst_started_ts == ts_auth and prior_auth_burst_ts != ts_auth:
+            if (new_auth_state.status == "UP"
+                    and new_auth_state.evidence("authed").run_started_ts):
                 new_auth_state, burst_last_auth_result, auth_burst_id = await _run_auth_burst_reprobes(
-                    conn, channels, new_auth_state, burst_start_ts=ts_auth, cycle_id=cycle_id,
+                    conn, channels, new_auth_state, cycle_id=cycle_id,
                     main_down=main_down, login_budget_state=login_budget_state,
                 )
                 if burst_last_auth_result is not None:
