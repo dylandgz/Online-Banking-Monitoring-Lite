@@ -304,6 +304,7 @@ def get_state(conn: sqlite3.Connection, track: str = "main") -> MonitorState:
             name: LayerEvidence(
                 consecutive=d.get("n", 0), confidence=d.get("c", 0),
                 fail_reasons=tuple(d.get("r", ())), last_probe_ts=d.get("t"),
+                run_started_ts=d.get("s"),
             )
             for name, d in json.loads(raw).items()
         }
@@ -313,7 +314,8 @@ def get_state(conn: sqlite3.Connection, track: str = "main") -> MonitorState:
         layers = ({"render": LayerEvidence(consecutive=len(fail_reasons),
                                            confidence=row["confidence"] or 0,
                                            fail_reasons=fail_reasons,
-                                           last_probe_ts=row["burst_started_ts"])}
+                                           last_probe_ts=row["burst_started_ts"],
+                                           run_started_ts=row["burst_started_ts"])}
                   if fail_reasons else {})
     return MonitorState(
         status=row["status"],
@@ -326,7 +328,8 @@ def get_state(conn: sqlite3.Connection, track: str = "main") -> MonitorState:
 
 def set_state(conn: sqlite3.Connection, state: MonitorState, track: str = "main") -> None:
     layers_json = json.dumps({
-        name: {"n": e.consecutive, "c": e.confidence, "r": list(e.fail_reasons), "t": e.last_probe_ts}
+        name: {"n": e.consecutive, "c": e.confidence, "r": list(e.fail_reasons),
+         "t": e.last_probe_ts, "s": e.run_started_ts}
         for name, e in state.layers.items()
     })
     conn.execute(
