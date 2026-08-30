@@ -58,6 +58,10 @@ async def _process_probe(
         layer=result.layer,
         burst_id=burst_id,
         cycle_id=cycle_id,
+        # [B7] Whether this probe counted. False during the post-wake grace, so a failing
+        # row that did not page is distinguishable from one that simply had not reached the
+        # floor yet.
+        scored=scoring,
         # [B16/B35] The evidence this probe produced, recorded on the probe's own row.
         # screenshot_path used to survive only via open_incident(), i.e. only for the one
         # probe that crossed the DOWN threshold -- every other failure's image was written
