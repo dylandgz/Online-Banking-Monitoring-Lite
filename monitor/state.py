@@ -263,10 +263,16 @@ def apply_check(
     if cls == "config":
         if state.status == "CONFIG_ERROR":
             return state, []  # already alerted; needs a human, never re-alerts
+        # cause_layer is set even though CONFIG_ERROR is not an outage. Without it,
+        # state.fail_reasons falls back to "whichever layer has the most failures", which
+        # can be a completely different layer -- so a `bot_challenge` on `authed` was
+        # written to the state row, and logged on the cycles row, as some stale
+        # `element_missing` from `render`. It also means only a pass of the affected layer
+        # clears the latch, which is the same rule DOWN follows.
         ev = LayerEvidence(consecutive=0, confidence=0, fail_reasons=(fail_reason,), last_probe_ts=ts)
         return MonitorState(
             status="CONFIG_ERROR", since_ts=ts,
-            layers=_with_layer(state, layer, ev), cause_layer=None,
+            layers=_with_layer(state, layer, ev), cause_layer=layer,
         ), [ConfigErrorEvent(ts=ts, fail_reason=fail_reason)]
 
     if state.status == "CONFIG_ERROR":

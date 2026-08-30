@@ -413,7 +413,7 @@ async def _run_auth_burst_reprobes(
     main_down: bool, login_budget_state: dict,
 ) -> tuple[MonitorState, "check.CheckResult", str]:
     """[v3.8 / Stage R] Auth-track confirmation burst: re-probes with the cheap
-    session-reuse check at the same offsets as the main track -- zero logins per probe
+    session-reuse check, spaced by BURST_GAP_S like the main track -- zero logins per probe
     (Rule 5 "the login budget is a hard limit"). A session_expired probe mid-burst is inert (Rule 3 "session_expired never scores": doesn't count, burst
     stays open) and, per the "Cross-track suppression" section, doesn't get its own recovery login if main is down or
     if this cycle's one budgeted login was already spent."""
@@ -435,7 +435,8 @@ async def _run_auth_burst_reprobes(
             conn, channels, state, result, now_iso(), burst_id,
             browser_mode=config.JOURNEY_BROWSER_MODE, track="auth",
             down_confidence=config.AUTH_DOWN_CONFIDENCE,
-            min_failed_probes=config.AUTH_MIN_FAILED_PROBES, precursor_down=main_down, cycle_id=cycle_id,
+            min_failed_probes=config.AUTH_MIN_FAILED_PROBES, precursor_down=main_down,
+            cycle_id=cycle_id, scoring=_scoring_now(),
         )
 
     return state, last_result, burst_id
