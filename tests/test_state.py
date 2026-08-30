@@ -380,3 +380,30 @@ def test_derived_confidence_and_reasons_describe_the_causing_layer():
     assert state.status == "DOWN" and state.cause_layer == "render"
     assert state.fail_reasons == ("element_missing",) * 4
     assert state.confidence == 4, "the render run, not the pulse failure alongside it"
+
+
+def test_recovery_event_carries_the_incident_record():
+    """The closed incident row takes its confidence and reasons from the RecoveryEvent. If
+    the first pass cleared the causing layer, both arrived empty and the audit row said an
+    incident happened with no evidence behind it."""
+    state, _ = run(UP, [(False, "dns", T(i * 25), "pulse") for i in range(4)])
+    assert state.status == "DOWN"
+    events = []
+    for i in range(RECOVERY):
+        state, ev = step(state, True, None, T(200 + i * 25), "pulse", recovery_passes=RECOVERY)
+        events += ev
+    rec = [e for e in events if isinstance(e, RecoveryEvent)][0]
+    assert rec.confidence == 8, "four hard failures at weight 2"
+    assert rec.fail_reasons == ("dns",) * 4
+    assert state.evidence("pulse").consecutive == 0, "and only then is the run discarded"
+
+
+def test_a_failure_mid_recovery_extends_the_same_incident():
+    """The held evidence is the incident's, so a relapse continues it rather than starting a
+    fresh run from zero."""
+    state, _ = run(UP, [(False, "dns", T(i * 25), "pulse") for i in range(4)])
+    state, _ = step(state, True, None, T(200), "pulse", recovery_passes=RECOVERY)
+    state, _ = step(state, False, "dns", T(225), "pulse", recovery_passes=RECOVERY)
+    assert state.status == "DOWN"
+    assert state.evidence("pulse").consecutive == 5, "4 from the incident plus the relapse"
+    assert state.consecutive_passes == 0

@@ -76,6 +76,7 @@ class LayerEvidence:
     confidence: int = 0                     # weighted score for those failures
     fail_reasons: tuple[str, ...] = ()
     last_probe_ts: Optional[str] = None     # any probe, pass or fail -- drives the stale reset
+    run_started_ts: Optional[str] = None    # first failure of the CURRENT run; None when clear
 
 
 @dataclass(frozen=True)
@@ -108,9 +109,15 @@ class MonitorState:
     def burst_started_ts(self) -> Optional[str]:
         """Retained for the `state` table and for main.py's "did this probe open a burst?"
         test. Under the consecutive model a burst is open exactly while a layer holds
-        unresolved evidence, so this reports when that layer's current run began."""
+        unresolved evidence, so this reports when that layer's current run BEGAN.
+
+        It must be the run's first failure, not its most recent probe. main.py's burst loop
+        breaks when `state.burst_started_ts != burst_start_ts`, reading that as "the burst
+        resolved" -- so returning the latest timestamp made the value change on every burst
+        probe and terminated the burst after one re-probe. Caught by an integration test,
+        not by the unit tests, because state.py alone never exercises that loop."""
         w = self._worst()
-        return w.last_probe_ts if w.consecutive else None
+        return w.run_started_ts
 
     def evidence(self, layer: str) -> LayerEvidence:
         return self.layers.get(layer, LayerEvidence())
@@ -206,15 +213,21 @@ def apply_check(
         return replace(state, layers=_with_layer(state, layer, touched)), []
 
     if ok:
-        cleared = LayerEvidence(last_probe_ts=ts)
-        layers = _with_layer(state, layer, cleared)
-
         if state.status in ("DOWN", "CONFIG_ERROR"):
             # Only the layer that opened the incident can close it. A passing pulse says
             # nothing about whether the page renders -- the same confusion as B37, in the
             # opposite direction. CONFIG_ERROR has no cause layer, so any pass clears it.
             if state.cause_layer and layer != state.cause_layer:
-                return replace(state, layers=layers), []
+                touched = replace(state.evidence(layer), last_probe_ts=ts)
+                return replace(state, layers=_with_layer(state, layer, touched)), []
+
+            # The causing layer's evidence is NOT cleared yet, only timestamped. It is the
+            # incident's record -- confidence and fail_reasons on the RecoveryEvent, and the
+            # incidents row, both derive from it. Clearing on the first pass emptied them,
+            # so a closed incident reported confidence=0 and no reasons. Caught by an
+            # end-to-end run, not by the unit tests.
+            held = replace(prev, last_probe_ts=ts)
+            layers = _with_layer(state, layer, held)
 
             passes = state.consecutive_passes + 1
             if passes < recovery_passes:
@@ -227,7 +240,12 @@ def apply_check(
                 confidence=state.confidence,
                 fail_reasons=state.fail_reasons,
             )
-            return MonitorState(status="UP", since_ts=ts, layers=layers), [event]
+            # Now it is safe to discard: the event carries the record forward.
+            return MonitorState(status="UP", since_ts=ts,
+                                layers=_with_layer(state, layer, LayerEvidence(last_probe_ts=ts))), [event]
+
+        cleared = LayerEvidence(last_probe_ts=ts)
+        layers = _with_layer(state, layer, cleared)
 
         # UP and passing: clears this layer's run (a flap), logged via the check row itself.
         return replace(state, status="UP", layers=layers, consecutive_passes=0), []
@@ -262,6 +280,7 @@ def apply_check(
             confidence=prev.confidence + weight,
             fail_reasons=prev.fail_reasons + (fail_reason,),
             last_probe_ts=ts,
+            run_started_ts=prev.run_started_ts or ts,
         )
         return replace(state, layers=_with_layer(state, layer, tallied), consecutive_passes=0), []
 
@@ -278,6 +297,7 @@ def apply_check(
         confidence=base.confidence + weight,
         fail_reasons=base.fail_reasons + (fail_reason,),
         last_probe_ts=ts,
+        run_started_ts=base.run_started_ts or ts,
     )
     layers = _with_layer(state, layer, ev)
 

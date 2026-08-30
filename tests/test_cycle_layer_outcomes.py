@@ -133,3 +133,25 @@ def test_clean_cycle_reports_both_layers_passing(conn, monkeypatch):
 
     row = _cycle(conn)
     assert (row["pulse_ok"], row["render_ok"], row["verdict"]) == (1, 1, "UP")
+
+
+def test_cycle_fail_layer_names_the_layer_that_opened_the_incident(conn, monkeypatch):
+    """[B37] Once the pulse recovers, perform_check reports layer="render" again -- so
+    taking fail_layer from the last probe logged a pulse-caused incident as "render: dns",
+    naming a layer that was passing alongside a reason it never produced."""
+    monkeypatch.setattr(config, "BURST_DELAYS_S", [0, 0, 0, 0])
+    monkeypatch.setattr(config, "BURST_JITTER_S", 0)
+
+    async def pulse_down(*a, **k):
+        return CheckResult(ok=False, http_status=None, latency_ms=1.0, fail_reason="dns",
+                           layer="pulse", pulse_latency_ms=1.0)
+    monkeypatch.setattr(check, "perform_check", pulse_down)
+    monkeypatch.setattr(check, "pulse_only_probe", pulse_down)
+    monkeypatch.setattr(check, "render_only_probe", pulse_down)
+    for _ in range(2):
+        asyncio.run(main.run_cycle(conn, [], auth_enabled=False))
+
+    row = _cycle(conn)
+    assert row["verdict"] == "DOWN"
+    assert row["fail_layer"] == "pulse", "the layer that opened the incident, not the last probed"
+    assert row["fail_reason"] == "dns"

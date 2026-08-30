@@ -70,8 +70,33 @@ async def _process_probe(
     shot = f" screenshot={result.screenshot_path}" if result.screenshot_path else ""
     print(f"[{ts}] [{track}] {status}{shot}")
 
+    return await _advance_state(
+        conn, channels, prev_state, result.ok, result.fail_reason, ts, result.layer,
+        track=track, down_confidence=down_confidence, min_failed_probes=min_failed_probes,
+        precursor_down=precursor_down, scoring=scoring, screenshot_path=result.screenshot_path,
+    )
+
+
+async def _advance_state(
+    conn, channels, prev_state: MonitorState, ok: bool, fail_reason, ts: str, layer: str,
+    track: str = "main",
+    down_confidence: int | None = None,
+    min_failed_probes: int | None = None,
+    precursor_down: bool = False,
+    scoring: bool = True,
+    screenshot_path: str | None = None,
+) -> MonitorState:
+    """Advances the pure state machine, persists it, and dispatches any resulting alert.
+
+    Split out of _process_probe [2026-08-30] because one `checks` row can represent two
+    layer observations. `perform_check()` runs the pulse and then the render and reports
+    layer="pulse" ONLY when the pulse failed -- so once the pulse is healthy it always
+    reports "render", and under per-layer evidence (B37) the pulse layer would never receive
+    a passing observation again. A pulse-caused incident could then never recover. run_cycle
+    folds that implicit pulse pass in through this function, without writing a second row.
+    Same insight as B9's _fold_combined_probe, applied to state rather than the cycles row."""
     new_state, events = apply_check(
-        prev_state, result.ok, result.fail_reason, ts, result.layer,
+        prev_state, ok, fail_reason, ts, layer,
         down_confidence if down_confidence is not None else config.DOWN_CONFIDENCE,
         min_failed_probes if min_failed_probes is not None else config.MIN_FAILED_PROBES,
         stale_after_s=config.EVIDENCE_STALE_AFTER_S,
@@ -85,7 +110,7 @@ async def _process_probe(
         if isinstance(event, DownEvent):
             db.open_incident(
                 conn, event.since_ts, event.confidence, event.trigger_layer,
-                len(event.fail_reasons), result.screenshot_path, track=track,
+                len(event.fail_reasons), screenshot_path, track=track,
             )
         elif isinstance(event, RecoveryEvent):
             db.close_incident(conn, event.ended_at, event.duration_s, event.confidence,
@@ -389,7 +414,11 @@ def _cycle_fail_info(
         return None, None
     if main_state.status != "UP" and severity(main_state.status) >= severity(auth_state.status if auth_state else "UP"):
         fail_reason = main_state.fail_reasons[-1] if main_state.fail_reasons else (last_main_result.fail_reason if last_main_result else None)
-        fail_layer = last_main_result.layer if last_main_result else "pulse"
+        # [B37] Prefer the layer that actually opened the incident. Taking it from the last
+        # probe's layer mis-attributed every cycle during recovery: once the pulse is healthy
+        # the combined probe reports layer="render", so a pulse-caused incident was logged as
+        # "render: dns" -- a layer that was passing, paired with a reason it never produced.
+        fail_layer = main_state.cause_layer or (last_main_result.layer if last_main_result else "pulse")
         return fail_layer, fail_reason
     fail_reason = auth_state.fail_reasons[-1] if auth_state and auth_state.fail_reasons else (last_auth_result.fail_reason if last_auth_result else None)
     return "authed", fail_reason
@@ -432,6 +461,15 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
     _fold_combined_probe(layer_outcomes, main_result)
 
     ts_main = now_iso()
+
+    # [B37] The combined probe observed TWO layers. layer=="render" means the pulse was
+    # reached and passed; record that against the pulse layer before scoring the render
+    # result, or the pulse layer only ever hears about its own failures and a pulse-caused
+    # incident can never recover. No extra checks row -- the one row covers both legs.
+    if main_result.layer == "render":
+        prev_main_state = await _advance_state(
+            conn, channels, prev_main_state, True, None, ts_main, "pulse", track="main")
+
     new_main_state = await _process_probe(conn, channels, prev_main_state, main_result, ts_main, burst_id=None, cycle_id=cycle_id)
     last_main_result = main_result
 
