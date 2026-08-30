@@ -80,9 +80,25 @@ BROWSER_TIMEOUT_MS = int(os.getenv("BROWSER_TIMEOUT_MS", "15000"))
 # distinct failed probes in the burst window -- see CLAUDE.md's confidence-scoring section.
 BURST_DELAYS_S = [int(x) for x in os.getenv("BURST_DELAYS_S", "0,15,35,55").split(",") if x.strip()]
 BURST_JITTER_S = int(os.getenv("BURST_JITTER_S", "5"))
-BURST_WINDOW_S = int(os.getenv("BURST_WINDOW_S", "90"))
+# [2026-08-30 / B38] BURST_WINDOW_S is retired. DOWN now requires N *consecutive* failed
+# probes on one layer with no intervening pass -- no clock. The window's failure mode was
+# that a probe slower than its slot timestamped itself outside the window it was scheduled
+# in, so the count reset forever and the auth track could never page (B13). A slow probe now
+# delays detection instead of preventing it.
+#
+# EVIDENCE_STALE_AFTER_S replaces the window's one useful job. Evidence persists until a
+# pass clears it, so the case a pass cannot cover is the monitor not looking at all --
+# restart, host asleep, the B42 hang. If a layer has gone unprobed this long, its run is
+# discarded rather than completed by a much later failure. Without it the machine pages on
+# hours-old evidence; that was tested, not assumed.
+EVIDENCE_STALE_AFTER_S = int(os.getenv("EVIDENCE_STALE_AFTER_S", "600"))
+
+# [B39] Entering DOWN takes MIN_FAILED_PROBES corroborated probes; leaving it took one, so
+# every bit of the project's false-positive discipline sat on one side of the incident. A
+# premature RECOVERED tells an operator to stop looking at something still broken.
+RECOVERY_PASSES = int(os.getenv("RECOVERY_PASSES", "3"))
 DOWN_CONFIDENCE = int(os.getenv("DOWN_CONFIDENCE", "4"))
-MIN_FAILED_PROBES = int(os.getenv("MIN_FAILED_PROBES", "3"))
+MIN_FAILED_PROBES = int(os.getenv("MIN_FAILED_PROBES", "4"))
 
 RECIPIENTS_EMAIL = os.getenv("RECIPIENTS_EMAIL")
 GMAIL_USER = os.getenv("GMAIL_USER")
@@ -224,7 +240,7 @@ if _headroom < MIN_SESSION_HEADROOM_S:
 # every cheap session-reuse re-probe costs zero logins, the auth track can afford the
 # same 3-probe floor as pulse/render -- see CLAUDE.md Rule 2 "alert only on transitions"/16.
 AUTH_DOWN_CONFIDENCE = int(os.getenv("AUTH_DOWN_CONFIDENCE", "4"))
-AUTH_MIN_FAILED_PROBES = int(os.getenv("AUTH_MIN_FAILED_PROBES", "3"))
+AUTH_MIN_FAILED_PROBES = int(os.getenv("AUTH_MIN_FAILED_PROBES", "4"))
 
 
 def _collect_missing(*checks: tuple[bool, str]) -> list[str]:

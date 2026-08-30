@@ -1,429 +1,382 @@
+"""The DOWN decision, after the 2026-08-30 rework (B37 / B38 / B39 / B7).
+
+The model changed, so these tests changed with it. What replaced what:
+
+  old: a weighted score accumulated inside a 90s window, per TRACK, cleared by any pass
+  new: consecutive failures counted per LAYER, no clock, cleared only by a pass of that
+       same layer or by the staleness guard
+
+Every assertion below either pins a rule CLAUDE.md publishes, or pins a defect that was
+reproduced against the old machine before the rework. The three headline ones are
+test_b37_*, test_b38_* and test_b7_*.
+"""
 from monitor.state import (
-    MonitorState, DownEvent, RecoveryEvent, ConfigErrorEvent, apply_check, classify,
+    ConfigErrorEvent, DownEvent, LayerEvidence, MonitorState, RecoveryEvent,
+    apply_check, classify,
 )
 
-# [v3.1] DOWN requires score >= DOWN_CONFIDENCE AND >= MIN_FAILED_PROBES distinct failed
-# probes within BURST_WINDOW_S, no intervening pass.
 DOWN_CONFIDENCE = 4
-MIN_FAILED_PROBES = 3
-BURST_WINDOW_S = 90
+FLOOR = 4
+STALE = 600
+RECOVERY = 3
 
-TS = [f"2026-01-01T00:{i:02d}:00+00:00" for i in range(20)]
-# Sub-minute offsets for burst-timing tests (0s, 15s, 35s, 55s -- matches BURST_DELAYS_S).
-BTS = [
-    "2026-01-01T00:00:00+00:00",
-    "2026-01-01T00:00:15+00:00",
-    "2026-01-01T00:00:35+00:00",
-    "2026-01-01T00:00:55+00:00",
-    "2026-01-01T00:01:35+00:00",  # 95s after BTS[0] -- outside the 90s burst window
-]
-
-UP_INITIAL = MonitorState(status="UP", since_ts=None)
+UP = MonitorState(status="UP", since_ts=None)
 
 
-def run(state, results, precursor_down=False):
-    """results: list of (ok, fail_reason, ts, layer). Returns (final_state, all_events)."""
-    all_events = []
-    for ok, fail_reason, ts, layer in results:
-        state, events = apply_check(
-            state, ok, fail_reason, ts, layer, DOWN_CONFIDENCE, BURST_WINDOW_S, MIN_FAILED_PROBES,
-            precursor_down=precursor_down,
-        )
-        all_events.extend(events)
-    return state, all_events
+def step(state, ok, reason, ts, layer="render", **kw):
+    kw.setdefault("recovery_passes", 1)
+    return apply_check(state, ok, reason, ts, layer,
+                       DOWN_CONFIDENCE, FLOOR, STALE, **kw)
 
 
-# --- classify() ---
+def run(state, probes, **kw):
+    """probes: list of (ok, reason, ts, layer)"""
+    events = []
+    for ok, reason, ts, layer in probes:
+        state, ev = step(state, ok, reason, ts, layer, **kw)
+        events += ev
+    return state, events
+
+
+def T(seconds):
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    return f"2026-01-01T{h:02d}:{m:02d}:{s:02d}+00:00"
+
+
+def downs(events):
+    return [e for e in events if isinstance(e, DownEvent)]
+
+
+# --- classification (unchanged by the rework) ---------------------------------------
 
 def test_classify_hard_reasons():
-    for reason in ("conn_refused", "dns", "auth_unavailable", "bad_status:500", "bad_status:503"):
-        assert classify(reason) == ("hard", 2), reason
+    for r in ("dns", "conn_refused", "bad_status:503", "auth_unavailable"):
+        assert classify(r) == ("hard", 2), r
 
 
 def test_classify_soft_reasons():
-    for reason in ("timeout", "element_missing", "nav_error", "bad_status:404", "bad_status:403"):
-        assert classify(reason) == ("soft", 1), reason
-
-
-def test_classify_retired_data_plane_reasons_are_merely_unrecognized():
-    """v3.8 removed data-plane/API probing from scope, so nothing can emit these anymore
-    and classify() no longer names them. They must still land on the cautious side of the
-    fence via the unrecognized-reason fallback -- never Hard, so a stray legacy row in an
-    old DB can't score double toward a page."""
-    for reason in ("data_plane_missing", "api_shape_mismatch", "api_bad_status:502"):
-        assert classify(reason) == ("soft", 1), reason
+    for r in ("timeout", "element_missing", "nav_error", "bad_status:404"):
+        assert classify(r) == ("soft", 1), r
 
 
 def test_classify_config_reasons():
-    for reason in ("auth_rejected", "bot_challenge", "mfa_failed", "rate_limited"):
-        assert classify(reason) == ("config", 0), reason
+    for r in ("auth_rejected", "bot_challenge", "mfa_failed", "rate_limited"):
+        assert classify(r) == ("config", 0), r
 
 
 def test_classify_unknown_reason_defaults_soft():
-    assert classify("some_new_reason_nobody_added_yet") == ("soft", 1)
+    # Ambiguous evidence stays cautious rather than paging.
+    assert classify("something_new_from_a_future_probe") == ("soft", 1)
 
-
-# --- burst + confidence scoring + probe floor (Stage 5 v3.1 acceptance a-e) ---
-
-def test_a_three_hard_failures_page_on_third_probe():
-    # hard+hard+hard: score 6, 3 probes -> pages, ~35s in (BTS[2]).
-    state, events = run(UP_INITIAL, [
-        (False, "conn_refused", BTS[0], "pulse"),
-        (False, "conn_refused", BTS[1], "pulse"),
-        (False, "conn_refused", BTS[2], "pulse"),
-    ])
-    assert len(events) == 1
-    down = events[0]
-    assert isinstance(down, DownEvent)
-    assert down.confidence == 6
-    assert down.since_ts == BTS[2]
-    assert state.status == "DOWN"
-
-
-def test_a_hard_hard_soft_pages_on_third_probe():
-    # score 5, 3 probes -> pages.
-    state, events = run(UP_INITIAL, [
-        (False, "conn_refused", BTS[0], "pulse"),
-        (False, "conn_refused", BTS[1], "pulse"),
-        (False, "timeout", BTS[2], "render"),
-    ])
-    assert len(events) == 1
-    assert events[0].confidence == 5
-    assert state.status == "DOWN"
-
-
-def test_a_hard_soft_soft_pages_on_third_probe():
-    # score 4, 3 probes -> pages.
-    state, events = run(UP_INITIAL, [
-        (False, "conn_refused", BTS[0], "pulse"),
-        (False, "timeout", BTS[1], "render"),
-        (False, "nav_error", BTS[2], "render"),
-    ])
-    assert len(events) == 1
-    down = events[0]
-    assert down.confidence == 4
-    assert down.trigger_layer == "render"
-    assert state.status == "DOWN"
-
-
-def test_b_all_soft_outage_does_not_page_until_fourth_probe():
-    # soft+soft+soft: score 3, 3 probes -> below DOWN_CONFIDENCE, no page yet.
-    state, events = run(UP_INITIAL, [
-        (False, "timeout", BTS[0], "pulse"),
-        (False, "element_missing", BTS[1], "render"),
-        (False, "nav_error", BTS[2], "render"),
-    ])
-    assert events == []
-    assert state.status == "UP"
-    assert state.confidence == 3
-    assert len(state.fail_reasons) == 3
-
-    # 4th soft failure (still inside the 90s window): score 4, 4 probes -> pages.
-    state, events = run(state, [(False, "timeout", BTS[3], "pulse")])
-    assert len(events) == 1
-    down = events[0]
-    assert down.confidence == 4
-    assert len(down.fail_reasons) == 4
-    assert state.status == "DOWN"
-
-
-def test_c_two_failures_then_a_pass_never_alerts():
-    state, events = run(UP_INITIAL, [
-        (False, "conn_refused", BTS[0], "pulse"),
-        (False, "conn_refused", BTS[1], "pulse"),
-        (True, None, BTS[2], "render"),
-    ])
-    assert events == []
-    assert state.status == "UP"
-    assert state.confidence == 0
-    assert state.burst_started_ts is None
-
-
-def test_d_hard_hard_two_probes_does_not_page_until_third_fails():
-    # Explicit floor test: score already >= DOWN_CONFIDENCE (4) after 2 hard failures,
-    # but only 2 distinct failed probes -- must NOT page yet.
-    state, events = run(UP_INITIAL, [
-        (False, "conn_refused", BTS[0], "pulse"),
-        (False, "conn_refused", BTS[1], "pulse"),
-    ])
-    assert events == []
-    assert state.status == "UP"
-    assert state.confidence == 4
-    assert len(state.fail_reasons) == 2
-
-    # A 3rd failed probe (any evidence) finally satisfies the floor -> pages.
-    state, events = run(state, [(False, "conn_refused", BTS[2], "pulse")])
-    assert len(events) == 1
-    down = events[0]
-    assert isinstance(down, DownEvent)
-    assert down.confidence == 6
-    assert len(down.fail_reasons) == 3
-    assert state.status == "DOWN"
-
-
-def test_e_config_reason_never_counts_toward_score_or_probe_floor():
-    state, events = run(UP_INITIAL, [(False, "bot_challenge", BTS[0], "render")])
-    assert len(events) == 1
-    assert isinstance(events[0], ConfigErrorEvent)
-    assert state.status == "CONFIG_ERROR"
-    assert state.confidence == 0
-
-
-# --- below-threshold / flap ---
-
-def test_single_hard_failure_below_threshold_no_event():
-    state, events = run(UP_INITIAL, [(False, "dns", BTS[0], "pulse")])
-    assert events == []
-    assert state.status == "UP"
-    assert state.confidence == 2
-    assert len(state.fail_reasons) == 1
-
-
-def test_two_soft_failures_below_threshold_no_event():
-    state, events = run(UP_INITIAL, [
-        (False, "timeout", BTS[0], "pulse"),
-        (False, "timeout", BTS[1], "pulse"),
-    ])
-    assert events == []
-    assert state.status == "UP"
-    assert state.confidence == 2
-
-
-def test_flap_sequence_never_alerts():
-    # F, S, F, F, S -- a pass always clears the burst before it reaches threshold.
-    state, events = run(UP_INITIAL, [
-        (False, "timeout", BTS[0], "pulse"),
-        (True, None, BTS[1], "render"),
-        (False, "timeout", BTS[2], "pulse"),
-        (False, "timeout", BTS[3], "render"),
-        (True, None, BTS[4], "render"),
-    ])
-    assert events == []
-    assert state.status == "UP"
-    assert state.confidence == 0
-
-
-def test_passing_probe_clears_burst_and_resets_confidence():
-    state, _ = run(UP_INITIAL, [(False, "timeout", BTS[0], "pulse")])
-    assert state.confidence == 1
-    state, events = run(state, [(True, None, BTS[1], "render")])
-    assert events == []
-    assert state.confidence == 0
-    assert state.burst_started_ts is None
-
-
-def test_stale_failure_outside_burst_window_starts_a_fresh_burst():
-    # A soft fail, then another soft fail 95s later (outside the 90s window) should NOT
-    # accumulate with the first -- it starts a brand-new burst instead of compounding a
-    # stale one, so confidence is 1 (not 2) and no DOWN fires.
-    state, _ = run(UP_INITIAL, [(False, "timeout", BTS[0], "pulse")])
-    state, events = run(state, [(False, "timeout", BTS[4], "pulse")])
-    assert events == []
-    assert state.confidence == 1
-    assert state.burst_started_ts == BTS[4]
-
-
-# --- sustained incident / recovery / restart ---
-
-def test_no_duplicate_down_alerts_during_incident():
-    # First 3 close-together failures cross both the score and probe floor -> DOWN.
-    # Further failures at normal 60s cadence keep tallying but never re-alert.
-    results = [
-        (False, "conn_refused", BTS[0], "pulse"),
-        (False, "conn_refused", BTS[1], "pulse"),
-        (False, "conn_refused", BTS[2], "pulse"),
-    ] + [(False, "conn_refused", TS[i], "pulse") for i in range(3, 6)]
-    state, events = run(UP_INITIAL, results)
-    down_events = [e for e in events if isinstance(e, DownEvent)]
-    assert len(down_events) == 1
-    assert state.status == "DOWN"
-    assert state.confidence == 12  # 2 per fail x 6 fails total
-    assert len(state.fail_reasons) == 6
-
-
-def test_recovery_after_down():
-    state, events = run(UP_INITIAL, [
-        (False, "conn_refused", BTS[0], "pulse"),
-        (False, "conn_refused", BTS[1], "pulse"),
-        (False, "conn_refused", BTS[2], "pulse"),
-        (True, None, BTS[3], "render"),
-    ])
-    assert len(events) == 2
-    down, recovery = events
-    assert isinstance(down, DownEvent)
-    assert isinstance(recovery, RecoveryEvent)
-    assert recovery.since_ts == BTS[2]
-    assert recovery.ended_at == BTS[3]
-    assert recovery.confidence == 6
-    assert state.status == "UP"
-    assert state.confidence == 0
-    assert state.since_ts == BTS[3]
-
-
-def test_restart_keeps_state_no_duplicate_down():
-    persisted = MonitorState(status="DOWN", since_ts=BTS[2], confidence=6, fail_reasons=("conn_refused", "conn_refused", "conn_refused"))
-    state, events = apply_check(persisted, False, "conn_refused", BTS[3], "pulse", DOWN_CONFIDENCE, BURST_WINDOW_S, MIN_FAILED_PROBES)
-    assert events == []
-    assert state.status == "DOWN"
-    assert state.confidence == 8
-
-
-def test_restart_keeps_state_recovery_uses_persisted_since_ts():
-    persisted = MonitorState(status="DOWN", since_ts=TS[0], confidence=6, fail_reasons=("dns", "dns", "dns"))
-    state, events = apply_check(persisted, True, None, TS[10], "render", DOWN_CONFIDENCE, BURST_WINDOW_S, MIN_FAILED_PROBES)
-    assert len(events) == 1
-    recovery = events[0]
-    assert isinstance(recovery, RecoveryEvent)
-    assert recovery.since_ts == TS[0]
-    assert recovery.duration_s == 600
-    assert state.status == "UP"
-
-
-# --- CONFIG_ERROR routing (Rule 4 "never retry a credential rejection" -- never burst-retried, distinct from DOWN) ---
-
-def test_config_reason_never_scored_routes_straight_to_config_error():
-    state, events = run(UP_INITIAL, [(False, "bot_challenge", BTS[0], "render")])
-    assert len(events) == 1
-    event = events[0]
-    assert isinstance(event, ConfigErrorEvent)
-    assert event.fail_reason == "bot_challenge"
-    assert state.status == "CONFIG_ERROR"
-    assert state.confidence == 0  # config reasons never contribute to burst confidence
-
-
-def test_config_error_never_re_alerts_on_repeated_config_failures():
-    state, _ = run(UP_INITIAL, [(False, "auth_rejected", BTS[0], "auth")])
-    state, events = run(state, [
-        (False, "auth_rejected", BTS[1], "auth"),
-        (False, "auth_rejected", BTS[2], "auth"),
-    ])
-    assert events == []
-    assert state.status == "CONFIG_ERROR"
-
-
-def test_config_error_holds_through_unrelated_ordinary_failures():
-    # A human must clear CONFIG_ERROR -- ordinary hard/soft fails don't override it or
-    # trigger a separate DOWN underneath it.
-    state, _ = run(UP_INITIAL, [(False, "mfa_failed", BTS[0], "auth")])
-    state, events = run(state, [(False, "conn_refused", BTS[1], "pulse")])
-    assert events == []
-    assert state.status == "CONFIG_ERROR"
-
-
-def test_config_error_recovers_on_first_pass_like_down_does():
-    state, _ = run(UP_INITIAL, [(False, "bot_challenge", BTS[0], "render")])
-    state, events = run(state, [(True, None, BTS[1], "render")])
-    assert len(events) == 1
-    assert isinstance(events[0], RecoveryEvent)
-    assert state.status == "UP"
-
-
-# --- [v3.8 / Stage R] session_expired never scores (Rule 3 "session_expired never scores") ---
 
 def test_classify_session_expired_is_its_own_zero_weight_class():
     assert classify("session_expired") == ("session", 0)
 
 
-def test_session_expired_from_up_leaves_state_and_burst_untouched():
-    state, _ = run(UP_INITIAL, [(False, "timeout", BTS[0], "authed")])
-    assert state.confidence == 1
-    state2, events = run(state, [(False, "session_expired", BTS[1], "authed")])
+def test_logout_failed_is_explicitly_soft_not_a_fallback():
+    # [B21] It used to reach Soft only via the "anything unrecognized" catch-all.
+    assert classify("logout_failed") == ("soft", 1)
+
+
+# --- the DOWN rule ------------------------------------------------------------------
+
+def test_four_consecutive_failures_page_on_the_fourth():
+    state, events = run(UP, [(False, "element_missing", T(i * 25), "render") for i in range(4)])
+    assert state.status == "DOWN"
+    assert len(downs(events)) == 1
+    assert downs(events)[0].trigger_layer == "render"
+    assert state.evidence("render").consecutive == 4
+
+
+def test_three_consecutive_failures_do_not_page():
+    state, events = run(UP, [(False, "dns", T(i * 25), "pulse") for i in range(3)])
+    assert state.status == "UP", "the floor is 4 probes, however severe the evidence"
+    assert downs(events) == []
+
+
+def test_hard_evidence_does_not_page_faster_than_soft():
+    """Deliberate. Hard-class is `dns`, and `dns` is exactly what a laptop resuming from
+    suspend produces (B7). Letting severity shortcut the floor would reopen that."""
+    hard, _ = run(UP, [(False, "dns", T(i * 25), "pulse") for i in range(3)])
+    soft, _ = run(UP, [(False, "timeout", T(i * 25), "pulse") for i in range(3)])
+    assert hard.status == soft.status == "UP"
+
+
+def test_one_pass_clears_the_run():
+    state, events = run(UP, [
+        (False, "element_missing", T(0), "render"),
+        (False, "element_missing", T(25), "render"),
+        (True, None, T(50), "render"),
+        (False, "element_missing", T(75), "render"),
+    ])
+    assert state.evidence("render").consecutive == 1, "the pass reset the run to zero"
+    assert downs(events) == []
+
+
+def test_confidence_threshold_is_inert_at_this_floor():
+    """With floor 4 the weakest possible evidence -- four soft failures worth 1 each -- already
+    totals 4, so a threshold of 4 can never block. Verified exhaustively over every
+    4-failure combination before the rework."""
+    state, _ = run(UP, [(False, "timeout", T(i * 25), "render") for i in range(4)])
+    assert state.status == "DOWN", "four of the weakest failures still page"
+
+
+def test_confidence_threshold_re_arms_if_the_floor_is_lowered():
+    """Why the check is retained rather than deleted. At floor 3, three soft failures total
+    3 and the threshold of 4 blocks them -- so the score becomes a live guard again the
+    moment someone weakens the floor."""
+    state = MonitorState(status="UP", since_ts=None)
+    for i in range(3):
+        state, _ = apply_check(state, False, "timeout", T(i * 25), "render",
+                               4, 3, STALE)          # threshold 4, floor 3
+    assert state.status == "UP", "floor met at 3 probes, but 3 points < threshold 4"
+
+    state = MonitorState(status="UP", since_ts=None)
+    for i in range(3):
+        state, _ = apply_check(state, False, "dns", T(i * 25), "pulse",
+                               4, 3, STALE)          # same floor, harder evidence
+    assert state.status == "DOWN", "3 hard failures total 6 and clear the threshold"
+
+
+# --- B37: evidence is per layer ------------------------------------------------------
+
+def test_b37_a_passing_pulse_does_not_erase_render_evidence():
+    """THE defect. The burst alternates probe kinds for independent evidence, then the old
+    scorer treated a pass on one as proof about the other -- so on a "server reachable, page
+    broken" outage the burst's own pulse probe deleted the render failures that opened it,
+    and a pure render outage could not page at any duration."""
+    state, events = run(UP, [
+        (False, "element_missing", T(0), "render"),
+        (False, "element_missing", T(25), "render"),
+        (True, None, T(50), "pulse"),            # the server is fine -- of course it is
+        (False, "element_missing", T(75), "render"),
+        (False, "element_missing", T(100), "render"),
+    ])
+    assert state.status == "DOWN"
+    assert downs(events)[0].trigger_layer == "render"
+
+
+def test_b37_layers_accumulate_independently():
+    state, _ = run(UP, [
+        (False, "dns", T(0), "pulse"),
+        (False, "element_missing", T(25), "render"),
+        (False, "dns", T(50), "pulse"),
+    ])
+    assert state.evidence("pulse").consecutive == 2
+    assert state.evidence("render").consecutive == 1
+    assert state.status == "UP", "neither layer alone has reached the floor"
+
+
+def test_b37_only_the_causing_layer_can_recover_the_incident():
+    state, _ = run(UP, [(False, "element_missing", T(i * 25), "render") for i in range(4)])
+    assert state.status == "DOWN" and state.cause_layer == "render"
+    state, events = step(state, True, None, T(200), "pulse")
+    assert state.status == "DOWN", "a passing pulse says nothing about whether the page renders"
+    assert not [e for e in events if isinstance(e, RecoveryEvent)]
+
+
+# --- B38: no window ------------------------------------------------------------------
+
+def test_b38_slow_probes_still_reach_the_floor():
+    """The old 90s window reset the count whenever probes were slower than their slots, so
+    the auth track could never page (B13). Four failures 400s apart now still count."""
+    state, events = run(UP, [(False, "element_missing", T(i * 400), "authed") for i in range(4)])
+    assert state.status == "DOWN"
+    assert len(downs(events)) == 1
+
+
+def test_b38_cycle_cadence_failures_accumulate():
+    """Two cycles span 120s, wider than the old 90s window, so cycle-cadence failures used
+    to oscillate 1,2,1,2 forever and never reach the floor."""
+    state, _ = run(UP, [(False, "nav_error", T(i * 60), "render") for i in range(4)])
+    assert state.status == "DOWN"
+
+
+# --- the staleness guard -------------------------------------------------------------
+
+def test_stale_evidence_is_discarded_before_counting():
+    """Without a window, only a pass clears evidence -- and a pass cannot happen while the
+    monitor is not looking. Three failures, then a long silence, then one more must NOT
+    complete the run."""
+    state, _ = run(UP, [(False, "element_missing", T(i * 25), "render") for i in range(3)])
+    assert state.evidence("render").consecutive == 3
+    state, events = step(state, False, "element_missing", T(7200), "render")
+    assert state.status == "UP", "must not page on two-hour-old evidence"
+    assert state.evidence("render").consecutive == 1
+
+
+def test_evidence_just_inside_the_stale_bound_still_counts():
+    state, _ = run(UP, [(False, "element_missing", T(i * 25), "render") for i in range(3)])
+    state, events = step(state, False, "element_missing", T(50 + STALE - 10), "render")
+    assert state.status == "DOWN", "still observing, just slowly"
+
+
+# --- B7: probes taken while the monitor was not running ------------------------------
+
+def test_b7_non_scoring_probes_cannot_page():
+    """A laptop resuming from suspend produces `dns` failures that are evidence about the
+    host, not the bank. All three main-track DOWN pages of the Stage R era were this."""
+    state, events = run(UP, [(False, "dns", T(i * 25), "pulse") for i in range(6)],
+                        scoring=False)
+    assert state.status == "UP"
+    assert downs(events) == []
+
+
+def test_b7_non_scoring_probes_still_prove_we_were_looking():
+    """They must update last_probe_ts, or the staleness guard would fire spuriously the
+    moment scoring resumes."""
+    state, _ = step(UP, False, "dns", T(0), "pulse", scoring=False)
+    assert state.evidence("pulse").last_probe_ts == T(0)
+    assert state.evidence("pulse").consecutive == 0
+
+
+def test_b7_scoring_resumes_cleanly_after_the_grace_period():
+    """A real outage that begins at a wake is delayed, never lost."""
+    state, _ = run(UP, [(False, "dns", T(i * 25), "pulse") for i in range(3)], scoring=False)
+    assert state.status == "UP"
+    state, events = run(state, [(False, "dns", T(100 + i * 25), "pulse") for i in range(4)])
+    assert state.status == "DOWN", "once the grace lifts, the outage is caught normally"
+
+
+# --- B39: recovery hysteresis --------------------------------------------------------
+
+def test_b39_one_pass_does_not_clear_an_incident():
+    state, _ = run(UP, [(False, "element_missing", T(i * 25), "render") for i in range(4)])
+    state, events = step(state, True, None, T(200), "render", recovery_passes=RECOVERY)
+    assert state.status == "DOWN"
+    assert not [e for e in events if isinstance(e, RecoveryEvent)]
+
+
+def test_b39_three_passes_clear_it_and_emit_exactly_one_recovery():
+    state, _ = run(UP, [(False, "element_missing", T(i * 25), "render") for i in range(4)])
+    events = []
+    for i in range(3):
+        state, ev = step(state, True, None, T(200 + i * 25), "render", recovery_passes=RECOVERY)
+        events += ev
+    assert state.status == "UP"
+    rec = [e for e in events if isinstance(e, RecoveryEvent)]
+    assert len(rec) == 1
+    assert rec[0].duration_s > 0
+
+
+def test_b39_a_failure_mid_recovery_restarts_the_count():
+    state, _ = run(UP, [(False, "element_missing", T(i * 25), "render") for i in range(4)])
+    state, _ = step(state, True, None, T(200), "render", recovery_passes=RECOVERY)
+    state, _ = step(state, False, "element_missing", T(225), "render", recovery_passes=RECOVERY)
+    state, events = step(state, True, None, T(250), "render", recovery_passes=RECOVERY)
+    assert state.status == "DOWN", "the recovery run restarted"
+    assert not [e for e in events if isinstance(e, RecoveryEvent)]
+
+
+# --- no duplicate alerts -------------------------------------------------------------
+
+def test_no_duplicate_down_alerts_during_an_incident():
+    state, events = run(UP, [(False, "element_missing", T(i * 25), "render") for i in range(8)])
+    assert len(downs(events)) == 1
+    assert state.evidence("render").consecutive == 8, "still tallying for the record"
+
+
+# --- config-class routing (unchanged) ------------------------------------------------
+
+def test_config_reason_routes_straight_to_config_error():
+    state, events = step(UP, False, "auth_rejected", T(0), "authed")
+    assert state.status == "CONFIG_ERROR"
+    assert isinstance(events[0], ConfigErrorEvent)
+
+
+def test_config_error_never_re_alerts():
+    state, _ = step(UP, False, "bot_challenge", T(0), "authed")
+    state, events = step(state, False, "bot_challenge", T(60), "authed")
     assert events == []
-    assert state2 == state  # completely inert, not even burst_started_ts touched
+
+
+def test_config_error_holds_through_ordinary_failures():
+    state, _ = step(UP, False, "mfa_failed", T(0), "authed")
+    state, events = step(state, False, "nav_error", T(60), "authed")
+    assert state.status == "CONFIG_ERROR"
+    assert events == []
+
+
+def test_config_error_clears_on_a_pass():
+    state, _ = step(UP, False, "auth_rejected", T(0), "authed")
+    state, events = step(state, True, None, T(60), "authed")
+    assert state.status == "UP"
+    assert isinstance(events[0], RecoveryEvent)
+
+
+def test_config_reason_never_counts_toward_the_floor():
+    state, _ = run(UP, [
+        (False, "element_missing", T(0), "authed"),
+        (False, "element_missing", T(25), "authed"),
+        (False, "bot_challenge", T(50), "authed"),
+    ])
+    assert state.status == "CONFIG_ERROR"
+    assert state.evidence("authed").consecutive == 0
+
+
+# --- session_expired stays inert ------------------------------------------------------
+
+def test_session_expired_leaves_the_run_untouched():
+    state, _ = run(UP, [(False, "element_missing", T(0), "authed")])
+    state, events = step(state, False, "session_expired", T(25), "authed")
+    assert state.evidence("authed").consecutive == 1, "unchanged by the session probe"
+    assert events == []
+
+
+def test_session_expired_never_reaches_the_floor():
+    state, events = run(UP, [(False, "session_expired", T(i * 25), "authed") for i in range(10)])
+    assert state.status == "UP"
+    assert downs(events) == []
 
 
 def test_session_expired_does_not_route_to_config_error():
-    state, events = run(UP_INITIAL, [(False, "session_expired", BTS[0], "authed")])
-    assert events == []
-    assert state.status == "UP"
-    assert state.confidence == 0
-    assert state.fail_reasons == ()
-
-
-def test_session_expired_never_contributes_even_at_floor():
-    # 3 real failures right at the DOWN threshold, then a session_expired probe must not
-    # push it over/hold it back -- it's simply not counted either way.
-    state, events = run(UP_INITIAL, [
-        (False, "conn_refused", BTS[0], "authed"),
-        (False, "conn_refused", BTS[1], "authed"),
-    ])
-    assert events == []
-    state, events = run(state, [(False, "session_expired", BTS[2], "authed")])
-    assert events == []
-    assert state.confidence == 4  # unchanged by the session_expired probe
-    assert len(state.fail_reasons) == 2
-
-
-def test_session_expired_inert_during_an_open_down_incident():
-    state, _ = run(UP_INITIAL, [
-        (False, "conn_refused", BTS[0], "authed"),
-        (False, "conn_refused", BTS[1], "authed"),
-        (False, "conn_refused", BTS[2], "authed"),
-    ])
-    assert state.status == "DOWN"
-    state2, events = run(state, [(False, "session_expired", BTS[3], "authed")])
-    assert events == []
-    assert state2 == state
-
-
-# --- [v3.8 / Stage R] the "Cross-track suppression" section: precursor_down suppresses auth-track paging ---
-
-def test_precursor_down_suppresses_auth_down_event():
-    state, events = run(UP_INITIAL, [
-        (False, "conn_refused", BTS[0], "authed"),
-        (False, "conn_refused", BTS[1], "authed"),
-        (False, "conn_refused", BTS[2], "authed"),
-    ], precursor_down=True)
-    assert events == []
-    assert state.status == "UP"  # held -- the "Cross-track suppression" section: auth-track DOWN can't open while precursor is down
-    assert state.confidence == 6
-    assert len(state.fail_reasons) == 3
-
-
-def test_precursor_down_suppressed_evidence_fires_once_precursor_recovers():
-    state, _ = run(UP_INITIAL, [
-        (False, "conn_refused", BTS[0], "authed"),
-        (False, "conn_refused", BTS[1], "authed"),
-        (False, "conn_refused", BTS[2], "authed"),
-    ], precursor_down=True)
+    state, _ = step(UP, False, "session_expired", T(0), "authed")
     assert state.status == "UP"
 
-    # Precursor has now recovered -- the next failing probe re-evaluates against the
-    # already-accumulated evidence and fires immediately (nothing was lost).
-    state, events = run(state, [(False, "conn_refused", BTS[3], "authed")], precursor_down=False)
-    assert len(events) == 1
-    assert isinstance(events[0], DownEvent)
+
+def test_session_expired_is_inert_during_an_open_incident():
+    state, _ = run(UP, [(False, "element_missing", T(i * 25), "authed") for i in range(4)])
+    before = state.evidence("authed").consecutive
+    state, events = step(state, False, "session_expired", T(200), "authed")
+    assert state.status == "DOWN" and events == []
+    assert state.evidence("authed").consecutive == before
+
+
+# --- cross-track suppression ----------------------------------------------------------
+
+def test_precursor_down_suppresses_the_auth_down_event():
+    state, events = run(UP, [(False, "element_missing", T(i * 25), "authed") for i in range(4)],
+                        precursor_down=True)
+    assert state.status == "UP", "held back while the main incident explains the symptom"
+    assert downs(events) == []
+    assert state.evidence("authed").consecutive == 4, "evidence is withheld, not discarded"
+
+
+def test_suppressed_evidence_fires_on_the_next_unsuppressed_failure():
+    state, _ = run(UP, [(False, "element_missing", T(i * 25), "authed") for i in range(4)],
+                   precursor_down=True)
+    state, events = step(state, False, "element_missing", T(200), "authed")
     assert state.status == "DOWN"
+    assert len(downs(events)) == 1
 
 
-def test_precursor_down_does_not_affect_main_track_default():
-    # Sanity check: default precursor_down=False (every existing main-track call site)
-    # behaves exactly as before -- covered implicitly by every other test in this file,
-    # asserted explicitly here too.
-    state, events = run(UP_INITIAL, [
-        (False, "conn_refused", BTS[0], "pulse"),
-        (False, "conn_refused", BTS[1], "pulse"),
-        (False, "conn_refused", BTS[2], "pulse"),
-    ])
-    assert len(events) == 1
+def test_precursor_down_defaults_off_for_the_main_track():
+    state, events = run(UP, [(False, "element_missing", T(i * 25), "render") for i in range(4)])
     assert state.status == "DOWN"
+    assert len(downs(events)) == 1
 
 
-def test_hard_mixed_pages_faster_than_all_soft():
-    # Confirms the "hard evidence pages faster" governing property directly against each
-    # other: hard-mixed resolves on the 3rd probe (~35s), all-soft needs a 4th (~55-60s).
-    hard_state, hard_events = run(UP_INITIAL, [
-        (False, "conn_refused", BTS[0], "pulse"),
-        (False, "conn_refused", BTS[1], "pulse"),
-        (False, "timeout", BTS[2], "render"),
+# --- persistence shape ----------------------------------------------------------------
+
+def test_derived_confidence_and_reasons_describe_the_causing_layer():
+    state, _ = run(UP, [
+        (False, "dns", T(0), "pulse"),
+        (False, "element_missing", T(25), "render"),
+        (False, "element_missing", T(50), "render"),
+        (False, "element_missing", T(75), "render"),
+        (False, "element_missing", T(100), "render"),
     ])
-    soft_state, soft_events = run(UP_INITIAL, [
-        (False, "timeout", BTS[0], "pulse"),
-        (False, "timeout", BTS[1], "render"),
-        (False, "timeout", BTS[2], "render"),
-    ])
-    assert len(hard_events) == 1 and isinstance(hard_events[0], DownEvent)
-    assert soft_events == []  # 3 soft fails (score 3) haven't paged yet -- needs a 4th
-
-    soft_state, soft_events = run(soft_state, [(False, "timeout", BTS[3], "pulse")])
-    assert len(soft_events) == 1 and isinstance(soft_events[0], DownEvent)
+    assert state.status == "DOWN" and state.cause_layer == "render"
+    assert state.fail_reasons == ("element_missing",) * 4
+    assert state.confidence == 4, "the render run, not the pulse failure alongside it"

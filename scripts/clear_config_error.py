@@ -43,13 +43,7 @@ def main() -> None:
           f"since {current.since_ts})")
     db.set_state(
         conn,
-        MonitorState(
-            status="UP",
-            since_ts=now_iso(),
-            burst_started_ts=None,
-            confidence=0,
-            fail_reasons=(),
-        ),
+        MonitorState(status="UP", since_ts=now_iso(), layers={}),
         track=track,
     )
     conn.close()

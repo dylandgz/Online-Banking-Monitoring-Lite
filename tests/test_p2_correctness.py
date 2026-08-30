@@ -117,10 +117,13 @@ def test_a_5xx_behind_login_is_hard_evidence_not_a_session_problem():
     cls, weight = classify("bad_status:500")
     assert (cls, weight) == ("hard", 2)
 
-    # Two hard probes reach DOWN_CONFIDENCE, so the 3-probe floor is what still governs
-    # timing -- exactly as CLAUDE.md's outcome table describes for a hard-heavy burst.
+    # [2026-08-30 / B37] The probe floor is what governs timing, and now solely so: two hard
+    # probes still reach DOWN_CONFIDENCE, but with the floor at 4 the score can never be the
+    # binding constraint. Deliberate -- hard-class is `dns`, and `dns` is what a laptop
+    # resuming from suspend produces (B7), so letting severity shortcut the floor would
+    # reopen the false-positive class that produced every page this monitor has ever sent.
     assert weight * 2 >= config.AUTH_DOWN_CONFIDENCE
-    assert config.AUTH_MIN_FAILED_PROBES == 3
+    assert config.AUTH_MIN_FAILED_PROBES == 4
 
 
 def test_missing_authed_content_now_scores_instead_of_being_inert():
