@@ -78,7 +78,28 @@ BROWSER_TIMEOUT_MS = int(os.getenv("BROWSER_TIMEOUT_MS", "15000"))
 # Stage 5: confirmation burst + confidence scoring (replaces the old FAILS_TO_DOWN rule).
 # [v3.1] defaults updated: DOWN requires score >= DOWN_CONFIDENCE AND >= MIN_FAILED_PROBES
 # distinct failed probes in the burst window -- see CLAUDE.md's confidence-scoring section.
-BURST_DELAYS_S = [int(x) for x in os.getenv("BURST_DELAYS_S", "0,15,35,55").split(",") if x.strip()]
+# [2026-08-30 / B38] BURST_DELAYS_S is retired. Confirmation probes are no longer scheduled
+# at absolute offsets from the burst's start -- each one waits BURST_GAP_S after the previous
+# probe FINISHED. The offsets only held the burst to a fixed footprint while probes were fast
+# enough to leave idle time; once a probe overran its slot the sleep clamped to zero, probes
+# ran back to back, and the last one timestamped itself outside the window it was scheduled
+# in. A gap cannot fall behind a schedule it does not have.
+#
+# 25s was chosen by simulation over 1,200 randomised worlds. It is the false-positive dial:
+# at 10s six nuisance events paged, at 15s three, at 25s none. Shorter gaps crowd four probes
+# into a span a brief wobble can survive.
+BURST_GAP_S = int(os.getenv("BURST_GAP_S", "25"))
+
+# Confirmation probes after the one that opened the run. With MIN_FAILED_PROBES=4 the floor
+# is reached on the 4th probe, so the burst resolves before exhausting these.
+BURST_PROBES = int(os.getenv("BURST_PROBES", "4"))
+
+# [B7] How long probes are recorded but not scored after the monitor notices it was not
+# running. Lifts early on the first passing probe. The bound matters for the opposite case:
+# if the monitor wakes INTO a real outage no probe ever passes, and "suppress until a pass"
+# alone would leave it blind indefinitely -- so a real outage beginning at a wake is delayed
+# by about two cycles, never lost.
+WAKE_GRACE_S = int(os.getenv("WAKE_GRACE_S", "120"))
 BURST_JITTER_S = int(os.getenv("BURST_JITTER_S", "5"))
 # [2026-08-30 / B38] BURST_WINDOW_S is retired. DOWN now requires N *consecutive* failed
 # probes on one layer with no intervening pass -- no clock. The window's failure mode was
