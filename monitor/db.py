@@ -1,9 +1,10 @@
 """SQLite schema init and check-row writes. Parameterized SQL only."""
+import json
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
 
-from monitor.state import MonitorState
+from monitor.state import LayerEvidence, MonitorState
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS checks (
@@ -187,6 +188,15 @@ def _migrate_stage6_tracks(conn: sqlite3.Connection) -> None:
     _add_missing_columns(conn, "incidents", {"track": "TEXT NOT NULL DEFAULT 'main'"})
 
 
+def _migrate_layer_state(conn: sqlite3.Connection) -> None:
+    """[B37] state gains layers_json: the per-layer evidence the consecutive model needs.
+    Additive with no backfill -- a row written before this carries NULL and is read back as
+    a single synthetic layer built from the legacy confidence/fail_reasons columns, which is
+    the honest reading of what those columns meant."""
+    _add_missing_columns(conn, "state", {"layers_json": "TEXT", "consecutive_passes": "INTEGER",
+                                         "cause_layer": "TEXT"})
+
+
 def _migrate_evidence_columns(conn: sqlite3.Connection) -> None:
     """[B16/B35] checks gains page_url and screenshot_path. Additive, no backfill --
     historic rows carry NULL because the values were never captured.
@@ -214,6 +224,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _migrate_stage6_tracks(conn)
     _migrate_stage_r_cycles(conn)
     _migrate_evidence_columns(conn)
+    _migrate_layer_state(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_burst_id ON checks(burst_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_cycle_id ON checks(cycle_id)")
@@ -283,28 +294,56 @@ def count_login_events_since(conn: sqlite3.Connection, since_ts: str) -> int:
 
 def get_state(conn: sqlite3.Connection, track: str = "main") -> MonitorState:
     row = conn.execute(
-        "SELECT status, since_ts, burst_started_ts, confidence, fail_reasons FROM state WHERE track = ?",
+        "SELECT * FROM state WHERE track = ?",
         (track,),
     ).fetchone()
     fail_reasons = tuple(row["fail_reasons"].split(",")) if row["fail_reasons"] else ()
+    raw = row["layers_json"] if "layers_json" in row.keys() else None
+    if raw:
+        layers = {
+            name: LayerEvidence(
+                consecutive=d.get("n", 0), confidence=d.get("c", 0),
+                fail_reasons=tuple(d.get("r", ())), last_probe_ts=d.get("t"),
+            )
+            for name, d in json.loads(raw).items()
+        }
+    else:
+        # Pre-B37 row: the legacy columns described one undifferentiated run. Read them as
+        # a single layer rather than inventing a split that was never recorded.
+        layers = ({"render": LayerEvidence(consecutive=len(fail_reasons),
+                                           confidence=row["confidence"] or 0,
+                                           fail_reasons=fail_reasons,
+                                           last_probe_ts=row["burst_started_ts"])}
+                  if fail_reasons else {})
     return MonitorState(
         status=row["status"],
         since_ts=row["since_ts"],
-        burst_started_ts=row["burst_started_ts"],
-        confidence=row["confidence"],
-        fail_reasons=fail_reasons,
+        layers=layers,
+        consecutive_passes=(row["consecutive_passes"] if "consecutive_passes" in row.keys() else 0) or 0,
+        cause_layer=(row["cause_layer"] if "cause_layer" in row.keys() else None),
     )
 
 
 def set_state(conn: sqlite3.Connection, state: MonitorState, track: str = "main") -> None:
+    layers_json = json.dumps({
+        name: {"n": e.consecutive, "c": e.confidence, "r": list(e.fail_reasons), "t": e.last_probe_ts}
+        for name, e in state.layers.items()
+    })
     conn.execute(
-        "UPDATE state SET status = ?, since_ts = ?, burst_started_ts = ?, confidence = ?, fail_reasons = ? WHERE track = ?",
+        "UPDATE state SET status = ?, since_ts = ?, burst_started_ts = ?, confidence = ?, "
+        "fail_reasons = ?, layers_json = ?, consecutive_passes = ?, cause_layer = ? WHERE track = ?",
         (
             state.status,
             state.since_ts,
+            # burst_started_ts / confidence / fail_reasons are now DERIVED from the layer
+            # that explains the status. Kept as columns because the dashboard and the CSV
+            # read them, and because a human reading the table should not have to parse JSON.
             state.burst_started_ts,
             state.confidence,
             ",".join(state.fail_reasons) if state.fail_reasons else None,
+            layers_json,
+            state.consecutive_passes,
+            state.cause_layer,
             track,
         ),
     )

@@ -100,7 +100,6 @@ async def main() -> None:
     await _process_probe(conn, channels, prev_state, result, ts, burst_id=None,
                           browser_mode=config.JOURNEY_BROWSER_MODE, track="auth",
                           down_confidence=config.AUTH_DOWN_CONFIDENCE,
-                          burst_window_s=config.BURST_WINDOW_S,
                           min_failed_probes=config.AUTH_MIN_FAILED_PROBES)
 
     if result.ok:

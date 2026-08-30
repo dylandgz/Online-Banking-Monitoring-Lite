@@ -63,20 +63,24 @@ def test_a_damaged_session_cannot_reach_the_probe_that_would_page(tmp_path):
 
 
 def test_four_repeated_soft_failures_would_have_paged(tmp_path):
-    """Documents WHY the above matters, and guards the floor/threshold that make it
-    dangerous: four identical Soft probes on the auth track do reach DOWN. If this ever
-    stops being true the guard above is less critical -- but so is the 3-probe floor, so
-    this asserting is a feature, not redundancy."""
+    """Documents WHY the above matters, and guards the floor that makes it dangerous: four
+    identical Soft probes on the auth track do reach DOWN. If this ever stops being true the
+    guard above is less critical -- but so is the probe floor, so asserting it is a feature,
+    not redundancy.
+
+    [2026-08-30] Updated for the consecutive model: the probes no longer need to land inside
+    a window, they need to be consecutive on the same layer with no pass between them."""
     state = MonitorState(status="UP", since_ts="2026-08-24T10:00:00+00:00")
     events_seen = []
-    for offset in (0, 15, 35, 55):
+    for offset in (0, 25, 50, 55):
         state, events = apply_check(
             state, False, "nav_error", f"2026-08-24T10:00:{offset:02d}+00:00", "authed",
-            config.AUTH_DOWN_CONFIDENCE, config.BURST_WINDOW_S, config.AUTH_MIN_FAILED_PROBES,
+            config.AUTH_DOWN_CONFIDENCE, config.AUTH_MIN_FAILED_PROBES,
+            config.EVIDENCE_STALE_AFTER_S,
         )
         events_seen.extend(events)
 
     assert state.status == "DOWN"
     assert len(events_seen) == 1
     # ...and nothing paged before the floor was met.
-    assert config.AUTH_MIN_FAILED_PROBES == 3
+    assert config.AUTH_MIN_FAILED_PROBES == 4

@@ -25,10 +25,10 @@ async def _process_probe(
     browser_mode: str | None = None,
     track: str = "main",
     down_confidence: int | None = None,
-    burst_window_s: int | None = None,
     min_failed_probes: int | None = None,
     precursor_down: bool = False,
     cycle_id: str | None = None,
+    scoring: bool = True,
 ) -> MonitorState:
     """Writes the check row (Rule 15 "every probe writes a checks row" -- pass or fail), advances
     the pure state machine, persists it, and dispatches any resulting alert.
@@ -38,7 +38,7 @@ async def _process_probe(
     v3.3) must pass their own, so the audit trail doesn't misreport how the check
     actually ran.
 
-    track/down_confidence/burst_window_s/min_failed_probes default to the main track's
+    track/down_confidence/min_failed_probes default to the main track's
     config values -- the auth-track caller passes its own track name and thresholds.
 
     precursor_down [v3.8, the "Cross-track suppression" section]: only meaningful for the auth track, when the main
@@ -73,9 +73,11 @@ async def _process_probe(
     new_state, events = apply_check(
         prev_state, result.ok, result.fail_reason, ts, result.layer,
         down_confidence if down_confidence is not None else config.DOWN_CONFIDENCE,
-        burst_window_s if burst_window_s is not None else config.BURST_WINDOW_S,
         min_failed_probes if min_failed_probes is not None else config.MIN_FAILED_PROBES,
+        stale_after_s=config.EVIDENCE_STALE_AFTER_S,
+        recovery_passes=config.RECOVERY_PASSES,
         precursor_down=precursor_down,
+        scoring=scoring,
     )
     db.set_state(conn, new_state, track=track)
 
@@ -365,7 +367,7 @@ async def _run_auth_burst_reprobes(
         state = await _process_probe(
             conn, channels, state, result, now_iso(), burst_id,
             browser_mode=config.JOURNEY_BROWSER_MODE, track="auth",
-            down_confidence=config.AUTH_DOWN_CONFIDENCE, burst_window_s=config.BURST_WINDOW_S,
+            down_confidence=config.AUTH_DOWN_CONFIDENCE,
             min_failed_probes=config.AUTH_MIN_FAILED_PROBES, precursor_down=main_down, cycle_id=cycle_id,
         )
 
@@ -466,7 +468,7 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
             new_auth_state = await _process_probe(
                 conn, channels, prev_auth_state, auth_result, ts_auth, burst_id=None,
                 browser_mode=config.JOURNEY_BROWSER_MODE, track="auth",
-                down_confidence=config.AUTH_DOWN_CONFIDENCE, burst_window_s=config.BURST_WINDOW_S,
+                down_confidence=config.AUTH_DOWN_CONFIDENCE,
                 min_failed_probes=config.AUTH_MIN_FAILED_PROBES, precursor_down=main_down, cycle_id=cycle_id,
             )
             last_auth_result = auth_result
