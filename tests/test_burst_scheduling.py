@@ -184,3 +184,32 @@ def test_no_grace_on_a_normal_cadence(conn, monkeypatch):
     asyncio.run(main.run_cycle(conn, [], auth_enabled=False))
 
     assert db.get_state(conn, track="main").status == "DOWN"
+
+
+def test_a_suppressed_probe_is_recorded_as_unscored(conn, monkeypatch):
+    """Without this, a failing row that did not page looks identical to one that simply had
+    not reached the floor. The only trace was a log line, which dies with the terminal."""
+    _seed_stale_probe(conn)
+    monkeypatch.setattr(check, "perform_check", _fail("pulse", "dns"))
+    monkeypatch.setattr(check, "pulse_only_probe", _fail("pulse", "dns"))
+
+    asyncio.run(main.run_cycle(conn, [], auth_enabled=False))
+
+    row = conn.execute("SELECT ok, fail_reason, scored FROM checks WHERE fail_reason='dns' "
+                       "ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["scored"] == 0, "the row must say it did not count"
+    assert row["ok"] == 0 and row["fail_reason"] == "dns", "and still record what happened"
+
+
+def test_a_normal_probe_is_recorded_as_scored(conn, monkeypatch):
+    from monitor.timeutil import now_iso
+    conn.execute("INSERT INTO checks (ts, ok, latency_ms, layer) VALUES (?, 1, 1.0, 'render')",
+                 (now_iso(),))
+    conn.commit()
+    monkeypatch.setattr(check, "perform_check", _fail("render"))
+    monkeypatch.setattr(check, "render_only_probe", _fail("render"))
+    monkeypatch.setattr(check, "pulse_only_probe", _pass_pulse)
+
+    asyncio.run(main.run_cycle(conn, [], auth_enabled=False))
+
+    assert all(r["scored"] == 1 for r in conn.execute("SELECT scored FROM checks WHERE fail_reason IS NOT NULL"))

@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS checks (
     layer TEXT,
     burst_id TEXT,
     page_url TEXT,
-    screenshot_path TEXT
+    screenshot_path TEXT,
+    scored INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS incidents (
@@ -210,6 +211,16 @@ def _migrate_evidence_columns(conn: sqlite3.Connection) -> None:
     _add_missing_columns(conn, "checks", {"page_url": "TEXT", "screenshot_path": "TEXT"})
 
 
+def _migrate_scored(conn: sqlite3.Connection) -> None:
+    """[B7] checks gains `scored`. A probe taken while the monitor demonstrably was not
+    running is recorded but does not count toward DOWN -- and without this column the row
+    looks identical to one that did count. An operator seeing `pulse_ok=0, verdict=UP` had
+    no way to tell whether the failure was suppressed or simply below the floor, and the
+    only trace was a log line that dies with the terminal (the same class of loss as B17's
+    vanished tracebacks). Additive; historic rows read as scored, which is what they were."""
+    _add_missing_columns(conn, "checks", {"scored": "INTEGER NOT NULL DEFAULT 1"})
+
+
 def _migrate_stage_r_cycles(conn: sqlite3.Connection) -> None:
     """[v3.8 / Stage R] Additive only, per the amendment: checks gains cycle_id (nullable
     FK, no backfill -- historic rows predate the cycles table and simply have no cycle to
@@ -225,6 +236,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _migrate_stage_r_cycles(conn)
     _migrate_evidence_columns(conn)
     _migrate_layer_state(conn)
+    _migrate_scored(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_burst_id ON checks(burst_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_cycle_id ON checks(cycle_id)")
@@ -250,13 +262,14 @@ def append_check(
     cycle_id: str | None = None,
     page_url: str | None = None,
     screenshot_path: str | None = None,
+    scored: bool = True,
 ) -> None:
     conn.execute(
         "INSERT INTO checks (ts, ok, http_status, latency_ms, fail_reason, browser_mode, layer, "
-        "burst_id, cycle_id, page_url, screenshot_path) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "burst_id, cycle_id, page_url, screenshot_path, scored) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (ts, int(ok), http_status, latency_ms, fail_reason, browser_mode, layer, burst_id, cycle_id,
-         page_url, screenshot_path),
+         page_url, screenshot_path, int(scored)),
     )
     conn.commit()
 
