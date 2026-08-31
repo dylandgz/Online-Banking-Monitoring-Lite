@@ -86,6 +86,10 @@ async def main() -> None:
         seed_from_existing_session=False,  # always a genuinely fresh login -- see run_journey's docstring
         should_logout=not keep_session,
         manual_mfa_pause=_manual_mfa_pause if manual_mfa else None,
+        frame_url=config.AUTHED_FRAME_URL,
+        frame_text=config.AUTHED_FRAME_TEXT,
+        frame_role=config.AUTHED_FRAME_ROLE,
+        frame_name=config.AUTHED_FRAME_NAME,
     )
 
     ts = now_iso()

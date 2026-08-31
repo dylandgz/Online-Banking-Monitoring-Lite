@@ -174,6 +174,25 @@ AUTHED_REQUIRED_TEXT = os.getenv("AUTHED_REQUIRED_TEXT")
 AUTHED_REQUIRED_ROLE = os.getenv("AUTHED_REQUIRED_ROLE")
 AUTHED_REQUIRED_NAME = os.getenv("AUTHED_REQUIRED_NAME")
 ERROR_BANNER_TEXT = os.getenv("ERROR_BANNER_TEXT")
+
+# --- [B10] the second authed marker, inside the banking iframe -------------------------
+# The authed page is two documents stacked: an outer shell (logo, nav, Logout, the RTN
+# footer) and a separate `nxg-olb` document holding the actual banking content -- the
+# account list and balances. AUTHED_REQUIRED_ROLE/NAME above can only see the shell, because
+# get_by_role does not pierce an iframe. So the shell could be perfectly intact while the
+# banking app is blank or broken, and the check would report UP -- which is precisely the
+# state CLAUDE.md defines as DOWN.
+#
+# Set AUTHED_FRAME_URL to a glob matching that inner document and the check additionally
+# requires a marker inside it. Leave it empty and behaviour is exactly as before.
+#
+# A GLOB, not a literal URL, deliberately: the frame moved from /nxg-olb/beta/home-page to
+# /nxg-olb/live/#home-page between 2026-08-25 and 2026-08-31 -- a path change AND a fragment.
+# A literal would have silently become a permanent false DOWN.
+AUTHED_FRAME_URL = os.getenv("AUTHED_FRAME_URL")
+AUTHED_FRAME_TEXT = os.getenv("AUTHED_FRAME_TEXT")
+AUTHED_FRAME_ROLE = os.getenv("AUTHED_FRAME_ROLE")
+AUTHED_FRAME_NAME = os.getenv("AUTHED_FRAME_NAME")
 MASK_TEXT = [t.strip() for t in os.getenv("MASK_TEXT", "").split(";") if t.strip()]
 MASKING_ENABLED = os.getenv("MASKING_ENABLED", "true").lower() != "false"
 CHALLENGE_TIMEOUT_MS = int(os.getenv("CHALLENGE_TIMEOUT_MS", "25000"))
@@ -309,6 +328,11 @@ def validate_stage6(require_totp: bool = True, require_authed_url: bool = True) 
         (not AUTHED_REQUIRED_TEXT and not (AUTHED_REQUIRED_ROLE and AUTHED_REQUIRED_NAME),
          "AUTHED_REQUIRED_TEXT (or AUTHED_REQUIRED_ROLE + AUTHED_REQUIRED_NAME)"),
     )
+    if AUTHED_FRAME_URL and not AUTHED_FRAME_TEXT and not (AUTHED_FRAME_ROLE and AUTHED_FRAME_NAME):
+        # A frame with no marker would be configured-but-inert: the frame is located and then
+        # nothing is asserted inside it, which reads like a deeper check and is not one.
+        missing.append("AUTHED_FRAME_TEXT (or AUTHED_FRAME_ROLE + AUTHED_FRAME_NAME), "
+                       "required because AUTHED_FRAME_URL is set")
     if require_totp and MFA_ENABLED and not TOTP_SECRET and not ALLOW_MFA_UNCONFIGURED:
         missing.append("TOTP_SECRET (or set ALLOW_MFA_UNCONFIGURED=true for testing)")
 
