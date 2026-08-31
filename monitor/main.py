@@ -301,6 +301,10 @@ async def _run_full_login(conn, *, should_logout: bool) -> "check.CheckResult":
             # of the login form (see journey.run_journey's docstring, fix 2026-08-11).
             seed_from_existing_session=False,
             should_logout=should_logout,
+            frame_url=config.AUTHED_FRAME_URL,
+            frame_text=config.AUTHED_FRAME_TEXT,
+            frame_role=config.AUTHED_FRAME_ROLE,
+            frame_name=config.AUTHED_FRAME_NAME,
         )
         return result
     finally:
@@ -384,6 +388,10 @@ async def _run_auth_probe(
             artifacts_dir=config.ARTIFACTS_DIR,
             mask_patterns=config.MASK_TEXT,
             masking_enabled=config.MASKING_ENABLED,
+            frame_url=config.AUTHED_FRAME_URL,
+            frame_text=config.AUTHED_FRAME_TEXT,
+            frame_role=config.AUTHED_FRAME_ROLE,
+            frame_name=config.AUTHED_FRAME_NAME,
         )
 
     # The cheap check ran and produced a real observation if we got a result at all.

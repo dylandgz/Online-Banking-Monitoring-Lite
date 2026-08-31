@@ -25,6 +25,7 @@ two different mechanisms.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import re
 import time
 from contextlib import asynccontextmanager
@@ -167,6 +168,51 @@ def authed_marker(page: Page, *, text: Optional[str], role: Optional[str], name:
     if role and name:
         return page.get_by_role(role, name=name, exact=True).first
     return page.get_by_text(text).first
+
+
+async def find_authed_frame(page: Page, url_glob: str, timeout_ms: int):
+    """[B10] The banking iframe, found by URL glob. Returns the Frame, or None if it never
+    attaches within the budget.
+
+    Matched by URL rather than by a CSS selector on the <iframe> element, for two reasons.
+    Rule 11 restricts locators to get_by_role/get_by_text/get_by_label, and an
+    `iframe[src*=...]` selector is neither. And the frame's own URL is the stabler identity:
+    observed live it is `.../nxg-olb/live/#home-page`, while the same frame in a DOM dump six
+    days earlier was `.../nxg-olb/beta/home-page` -- a path change and an added fragment. A
+    glob survives both; a literal URL would have become a permanent false DOWN.
+
+    Polls rather than waiting on an event: the frame is attached during page load, and by the
+    time the shell marker has resolved it is almost always already present (measured live:
+    frame attached at ~2.3s, shell marker at ~2.3s)."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while True:
+        try:
+            frames = list(page.frames)
+        except PatchrightError:
+            frames = []            # page gone; the caller's own guards report it
+        for frame in frames:
+            try:
+                url = frame.url
+            except PatchrightError:
+                continue           # detached between listing and reading -- skip, do not raise
+            # fnmatchcase, not fnmatch: fnmatch runs the inputs through os.path.normcase,
+            # which is identity on POSIX but lowercases on Windows -- so the same glob could
+            # match on one platform and not another. A URL is not a path; case-fold it never.
+            if fnmatch.fnmatchcase(url, url_glob):
+                return frame
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(0.25)
+
+
+def frame_marker(frame, *, text: Optional[str], role: Optional[str], name: Optional[str]) -> Locator:
+    """The required element INSIDE the banking iframe. Same `.first` guard as authed_marker:
+    these are free-form .env values with no arity validation, and Playwright's strict mode
+    raises Error -- not AssertionError -- on multiple matches, which no classify_* helper
+    catches."""
+    if role and name:
+        return frame.get_by_role(role, name=name, exact=True).first
+    return frame.get_by_text(text).first
 
 
 def logout_link(page: Page) -> Locator:
@@ -318,15 +364,63 @@ async def classify_after_totp(page: Page, challenge_timeout_ms: int, browser_tim
 
 async def classify_authed(page: Page, authed_text: Optional[str], authed_role: Optional[str],
                            authed_name: Optional[str], error_banner_text: str,
-                           challenge_timeout_ms: int) -> str:
-    """Returns "authed" or "element_missing"."""
+                           challenge_timeout_ms: int,
+                           frame_url: Optional[str] = None,
+                           frame_text: Optional[str] = None,
+                           frame_role: Optional[str] = None,
+                           frame_name: Optional[str] = None) -> str:
+    """Returns "authed", "shell_missing", or "content_missing".
+
+    Two markers, answering two different questions, because the authed page is two documents:
+
+      shell  (page-level)  -- ARE WE AUTHENTICATED? On this target that is the `Logout` link,
+                              which is a role=link only once fully signed in (it is a
+                              role=button on the MFA screens, so it cannot match mid-flow).
+      frame  (iframe)      -- DID THE BANKING CONTENT RENDER? The account list lives in a
+                              separate `nxg-olb` document that page-level locators cannot
+                              reach, so without this the shell can be perfectly intact while
+                              the banking app is blank -- reported UP, when CLAUDE.md defines
+                              exactly that state as DOWN. [B10]
+
+    Distinguishing the two failures is the point, not decoration. `shell_missing` might be an
+    expired session, so the caller still has to check. `content_missing` cannot be: we are
+    demonstrably authenticated, so it is the platform serving us something wrong, and the
+    caller must not spend a recovery login on it.
+
+    The frame check is skipped entirely when frame_url is unset -- behaviour is then exactly
+    as before this was added."""
     marker = authed_marker(page, text=authed_text, role=authed_role, name=authed_name)
     error_marker = error_banner(page, error_banner_text)
 
     try:
         await expect(marker).to_be_visible(timeout=challenge_timeout_ms)
     except AssertionError:
-        return "element_missing"
+        return "shell_missing"
+
+    if frame_url:
+        # ONE budget for the whole frame phase -- finding the frame and asserting inside it --
+        # not a fresh challenge_timeout_ms for each. Giving each step its own allowance
+        # tripled the worst case of a FAILING probe from ~25s to ~75s, measured: a missing
+        # frame cost 29s and a missing marker 35s against 7.8s healthy. That matters well
+        # beyond this function: burst duration is BURST_PROBES x (gap + probe cost), so a
+        # 75s probe makes a single burst run nearly 7 minutes, and a burst that long is
+        # indistinguishable in the log from the hang of B42. An overall per-probe budget is
+        # B43; this at least stops the frame check from being the thing that blows it.
+        frame_deadline = time.monotonic() + challenge_timeout_ms / 1000
+        frame = await find_authed_frame(page, frame_url, challenge_timeout_ms)
+        if frame is None:
+            return "content_missing"
+        remaining_ms = max(1000.0, (frame_deadline - time.monotonic()) * 1000)
+        try:
+            await expect(frame_marker(frame, text=frame_text, role=frame_role,
+                                      name=frame_name)).to_be_visible(timeout=remaining_ms)
+        except AssertionError:
+            return "content_missing"
+        except PatchrightError:
+            # The frame detached between being found and being asserted on -- a real
+            # possibility on an SPA. Not an AssertionError, so without this it would escape
+            # every classify_* handler and surface as nav_error from the outer guard.
+            return "content_missing"
 
     # CLAUDE.md's Stage 6 spec: authed requires the marker visible AND the error banner
     # absent. If both are visible at once, the overall assertion still fails -- reported
@@ -334,7 +428,7 @@ async def classify_authed(page: Page, authed_text: Optional[str], authed_role: O
     # authed state wasn't established either way. Never observed in the prototype; revisit
     # if a real drill shows this needs its own distinct reason instead.
     if await error_marker.is_visible():
-        return "element_missing"
+        return "content_missing"
 
     return "authed"
 
@@ -571,6 +665,10 @@ async def run_journey(
     should_logout: bool = True,
     totp_code_provider: Optional[Callable[[], Awaitable[str]]] = None,
     manual_mfa_pause: Optional[Callable[[], Awaitable[None]]] = None,
+    frame_url: Optional[str] = None,
+    frame_text: Optional[str] = None,
+    frame_role: Optional[str] = None,
+    frame_name: Optional[str] = None,
 ) -> CheckResult:
     """Runs the full login -> TOTP -> authed-assertion -> (optional) logout journey
     once and reports the outcome as a CheckResult, exactly like check.py's probes.
@@ -665,9 +763,12 @@ async def run_journey(
                                             artifacts_dir, mask_patterns, masking_enabled)
 
                 authed_result = await classify_authed(
-                    page, authed_text, authed_role, authed_name, error_banner_text, challenge_timeout_ms
+                    page, authed_text, authed_role, authed_name, error_banner_text,
+                    challenge_timeout_ms,
+                    frame_url=frame_url, frame_text=frame_text,
+                    frame_role=frame_role, frame_name=frame_name,
                 )
-                if authed_result == "element_missing":
+                if authed_result != "authed":
                     latency_ms = (time.monotonic() - start) * 1000
                     return await _fail(page, "authed", "element_missing", "authed", latency_ms,
                                         artifacts_dir, mask_patterns, masking_enabled)
@@ -723,6 +824,10 @@ async def run_authed_check(
     artifacts_dir: str,
     mask_patterns: Sequence[str],
     masking_enabled: bool,
+    frame_url: Optional[str] = None,
+    frame_text: Optional[str] = None,
+    frame_role: Optional[str] = None,
+    frame_name: Optional[str] = None,
 ) -> CheckResult:
     """[v3.8 / Stage R] A cheap check reusing a saved session -- no credentials, no TOTP,
     zero logins consumed. Navigates DIRECTLY to authed_url (the authenticated home route),
@@ -781,18 +886,42 @@ async def run_authed_check(
 
                 await _settle(page, browser_timeout_ms)
                 authed_result = await classify_authed(
-                    page, authed_text, authed_role, authed_name, error_banner_text, challenge_timeout_ms
+                    page, authed_text, authed_role, authed_name, error_banner_text,
+                    challenge_timeout_ms,
+                    frame_url=frame_url, frame_text=frame_text,
+                    frame_role=frame_role, frame_name=frame_name,
                 )
                 latency_ms = (time.monotonic() - start) * 1000
-                if authed_result == "element_missing":
-                    # Two very different things look identical at this point; see
-                    # bounced_to_login for why telling them apart is the difference
-                    # between the authed layer being able to report an outage and not.
+
+                if authed_result == "shell_missing":
+                    # We are not demonstrably authenticated. Two very different things look
+                    # identical here; see bounced_to_login for why telling them apart is the
+                    # difference between the authed layer reporting an outage and not.
                     if await bounced_to_login(page, authed_url, challenge_timeout_ms):
                         return await _fail(page, "authed", "session_expired", "authed_check",
                                             latency_ms, artifacts_dir, mask_patterns, masking_enabled,
                                             http_status=http_status)
                     return await _fail(page, "authed", "element_missing", "authed_check_content",
+                                        latency_ms, artifacts_dir, mask_patterns, masking_enabled,
+                                        http_status=http_status)
+
+                if authed_result not in ("authed", "shell_missing", "content_missing"):
+                    # Fail CLOSED. Every branch below is an explicit `if`, and the function
+                    # ends by returning ok=True -- so an unrecognised value (a fourth outcome
+                    # added later, say) would be reported as the platform being UP. On a
+                    # monitor that is the one direction a bug must never fail in.
+                    return await _fail(page, "authed", "element_missing", "authed_check_unknown",
+                                        latency_ms, artifacts_dir, mask_patterns, masking_enabled,
+                                        http_status=http_status)
+
+                if authed_result == "content_missing":
+                    # [B10] The shell marker resolved, so the session is demonstrably alive --
+                    # this CANNOT be session_expired, and bounced_to_login is not consulted.
+                    # That matters: session_expired is inert under Rule 3 and would route to a
+                    # recovery login, spending a credentialed attempt on a platform failure
+                    # while recording no evidence. This is the literal definition of DOWN,
+                    # "online banking behind login not rendering", and it must score.
+                    return await _fail(page, "authed", "element_missing", "authed_check_frame",
                                         latency_ms, artifacts_dir, mask_patterns, masking_enabled,
                                         http_status=http_status)
 
