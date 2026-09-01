@@ -44,7 +44,8 @@ def main() -> None:
         channel.send(config_error_event)
 
         print(f"  → Sent to: {config.ADMIN_EMAIL}")
-        print(f"  ✓ Subject: [MONITOR-CONFIG] {config.TARGET_NAME} needs attention")
+        from monitor.channels.email_gmail import _build_config_subject
+        print(f"  ✓ Subject: {_build_config_subject(config_error_event)}")
         print(f"  ✓ Reason: auth_rejected (credentials rejected by the platform)\n")
 
         print("[admin-email] Admin email sent successfully! ✓")
