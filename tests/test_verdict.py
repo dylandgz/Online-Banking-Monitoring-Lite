@@ -64,40 +64,33 @@ def test_severity_ladder_puts_down_on_top_and_never_raises():
 def test_down_email_uses_rule_4_wording_not_the_raw_layer_name():
     from monitor.channels.email_gmail import down_message
 
+    # [B44] Email now uses plain-English layer descriptions instead of the locked technical wording.
+    # Rule 10 is still satisfied -- the layer IS named, just in customer-friendly language.
     precursor = down_message(DownEvent(
         since_ts="2026-08-11T14:00:00+00:00", confidence=4,
         fail_reasons=("dns", "dns"), trigger_layer="pulse",
     ))
-    assert PRECURSOR_WORDING in precursor
-    assert "confidence 4: dns, dns" in precursor
+    assert "website not responding" in precursor  # plain English for pulse
+    assert "Checked 2 times" in precursor
     assert "pulse failed" not in precursor  # the pre-v3.8 phrasing
 
     authed = down_message(DownEvent(
         since_ts="2026-08-11T14:00:00+00:00", confidence=4,
         fail_reasons=("nav_error",) * 4, trigger_layer="authed",
     ))
-    assert AUTHED_WORDING in authed
+    assert "not loading after sign-in" in authed  # plain English for authed
 
 
 def test_down_email_still_sends_for_an_unmapped_layer():
     from monitor.channels.email_gmail import down_message
 
+    # [B44] Unmapped layers still produce an email (not suppressed), with a fallback description.
     body = down_message(DownEvent(
         since_ts="2026-08-11T14:00:00+00:00", confidence=4,
         fail_reasons=("timeout",), trigger_layer="something_new",
     ))
-    assert "something_new layer failed" in body
-    assert "DOWN since" in body
-
-
-def test_config_email_says_sign_in_checks_paused():
-    """Rule 4 "never retry a credential rejection" halts the auth track only -- the pulse/render precursor keeps checking, so
-    the old "Checks paused" overstated the outage."""
-    from monitor.channels.email_gmail import config_message
-
-    body = config_message(ConfigErrorEvent(ts="2026-08-11T14:00:00+00:00", fail_reason="auth_rejected"))
-    assert "Sign-in checks paused." in body
-    assert "auth_rejected" in body
+    assert "online banking not available" in body  # fallback for unmapped layer
+    assert "Online Banking DOWN" in body  # subject still clear
 
 
 def test_recovery_email_copy():
@@ -107,4 +100,91 @@ def test_recovery_email_copy():
         since_ts="2026-08-11T14:00:00+00:00", ended_at="2026-08-11T14:07:30+00:00",
         duration_s=450, confidence=4, fail_reasons=("dns",),
     ))
-    assert "RECOVERED after 7m 30s." in body
+    # [B44] Recovery uses plain English and customer-friendly wording
+    assert "Online Banking Recovered" in body
+    assert "outage lasted 7m 30s" in body
+
+
+def test_config_error_goes_to_admin_email(monkeypatch):
+    """CONFIG_ERROR emails go to ADMIN_EMAIL only, not to regular RECIPIENTS_EMAIL."""
+    import monitor.channels.email_gmail as email_module
+    from monitor.channels.email_gmail import EmailGmailChannel
+
+    monkeypatch.setattr(email_module.config, "ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setattr(email_module.config, "GMAIL_USER", "sender@gmail.com")
+    monkeypatch.setattr(email_module.config, "GMAIL_APP_PASSWORD", "app_pass")
+
+    # Track what _send_email was called with
+    calls = []
+    original_send = email_module.EmailGmailChannel._send_email
+
+    @staticmethod
+    def mock_send_email(subject: str, body: str, screenshot_path=None, recipients=None) -> None:
+        calls.append({"subject": subject, "recipients": recipients})
+
+    monkeypatch.setattr(EmailGmailChannel, "_send_email", mock_send_email)
+
+    event = ConfigErrorEvent(ts="2026-01-01T00:00:00+00:00", fail_reason="auth_rejected")
+    EmailGmailChannel().send(event)
+
+    assert len(calls) == 1
+    assert calls[0]["recipients"] == ["admin@example.com"]
+    assert "MONITOR-CONFIG" in calls[0]["subject"]
+
+
+def test_config_error_skips_if_admin_email_blank(monkeypatch):
+    """If ADMIN_EMAIL is blank, CONFIG_ERROR notifications are disabled."""
+    import monitor.channels.email_gmail as email_module
+    from monitor.channels.email_gmail import EmailGmailChannel
+
+    monkeypatch.setattr(email_module.config, "ADMIN_EMAIL", "")
+    monkeypatch.setattr(email_module.config, "GMAIL_USER", "sender@gmail.com")
+    monkeypatch.setattr(email_module.config, "GMAIL_APP_PASSWORD", "app_pass")
+
+    # Track calls to _send_email
+    calls = []
+    original_send = email_module.EmailGmailChannel._send_email
+
+    @staticmethod
+    def mock_send_email(subject: str, body: str, screenshot_path=None, recipients=None) -> None:
+        calls.append({"subject": subject, "recipients": recipients})
+
+    monkeypatch.setattr(EmailGmailChannel, "_send_email", mock_send_email)
+
+    event = ConfigErrorEvent(ts="2026-01-01T00:00:00+00:00", fail_reason="auth_rejected")
+    EmailGmailChannel().send(event)
+
+    # Should not send anything
+    assert len(calls) == 0
+
+
+def test_down_email_still_goes_to_recipients_email(monkeypatch):
+    """DOWN events still go to RECIPIENTS_EMAIL, not ADMIN_EMAIL."""
+    import monitor.channels.email_gmail as email_module
+    from monitor.channels.email_gmail import EmailGmailChannel
+
+    monkeypatch.setattr(email_module.config, "RECIPIENTS_EMAIL", "ops@example.com")
+    monkeypatch.setattr(email_module.config, "RECIPIENTS_CC", "")
+    monkeypatch.setattr(email_module.config, "RECIPIENTS_BCC", "")
+    monkeypatch.setattr(email_module.config, "ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setattr(email_module.config, "GMAIL_USER", "sender@gmail.com")
+    monkeypatch.setattr(email_module.config, "GMAIL_APP_PASSWORD", "app_pass")
+
+    # Track calls
+    calls = []
+
+    @staticmethod
+    def mock_send_email(subject: str, body: str, screenshot_path=None, recipients=None) -> None:
+        calls.append({"subject": subject, "recipients": recipients})
+
+    monkeypatch.setattr(EmailGmailChannel, "_send_email", mock_send_email)
+
+    event = DownEvent(
+        since_ts="2026-01-01T00:00:00+00:00", confidence=4,
+        fail_reasons=("timeout",), trigger_layer="pulse",
+    )
+    EmailGmailChannel().send(event)
+
+    assert len(calls) == 1
+    # Should go to RECIPIENTS_EMAIL, not ADMIN_EMAIL
+    assert calls[0]["recipients"] == ["ops@example.com"]

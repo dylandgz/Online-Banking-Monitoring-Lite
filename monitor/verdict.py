@@ -31,6 +31,34 @@ _LAYER_WORDING = {
     "authed": AUTHED_WORDING,
 }
 
+# Plain-English descriptions for email notifications (B44)
+_EMAIL_LAYER_DESCRIPTION = {
+    "pulse": {
+        "subject": "website not responding",
+        "body": "website is not responding. Customers cannot reach the login page.",
+    },
+    "render": {
+        "subject": "sign-in page not loading",
+        "body": "sign-in page is not loading correctly. Customers can reach the website, but the login form is not appearing.",
+    },
+    "authed": {
+        "subject": "not loading after sign-in",
+        "body": "online banking is not loading after sign-in. Customers can sign in, but their accounts are not appearing.",
+    },
+}
+
+# Reason codes mapped to plain English for email
+_EMAIL_REASON_TEXT = {
+    "dns": "the website's address could not be looked up",
+    "conn_refused": "the server refused the connection",
+    "timeout": "the server did not respond in time",
+    "nav_error": "the page failed to load",
+    "element_missing": "the page loaded, but the expected content never appeared",
+    "bad_status:500": "the server returned an error (HTTP 500)",
+    "bad_status:502": "the server returned an error (HTTP 502)",
+    "bad_status:503": "the server returned an error (HTTP 503)",
+}
+
 
 def severity(status: str) -> int:
     """Position on the severity ladder. Unknown statuses sort as UP (0) rather than
@@ -53,3 +81,32 @@ def layer_wording(fail_layer: Optional[str]) -> Optional[str]:
     unknown/absent. Callers decide their own fallback -- an alert should still send with
     a degraded description rather than not send at all."""
     return _LAYER_WORDING.get(fail_layer) if fail_layer else None
+
+
+def email_layer_subject(fail_layer: Optional[str]) -> str:
+    """Plain-English subject line fragment for email alerts (B44)."""
+    if not fail_layer:
+        return "online banking not available"
+    desc = _EMAIL_LAYER_DESCRIPTION.get(fail_layer)
+    return desc["subject"] if desc else "online banking not available"
+
+
+def email_layer_body(fail_layer: Optional[str]) -> str:
+    """Plain-English body text for email alerts (B44)."""
+    if not fail_layer:
+        return "online banking is not available."
+    desc = _EMAIL_LAYER_DESCRIPTION.get(fail_layer)
+    return desc["body"] if desc else "online banking is not available."
+
+
+def email_reason_text(fail_reason: str) -> str:
+    """Convert a fail_reason code to plain English for email (B44)."""
+    # Try exact match first
+    if fail_reason in _EMAIL_REASON_TEXT:
+        return _EMAIL_REASON_TEXT[fail_reason]
+    # Try prefix match for bad_status codes
+    if fail_reason.startswith("bad_status:"):
+        code = fail_reason.rsplit(":", 1)[-1]
+        return f"the server returned an error (HTTP {code})"
+    # Fallback
+    return fail_reason
