@@ -27,7 +27,7 @@ zero. See personal/ISSUES.md B37/B38 for the numbers.
 """
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Union
 
 # Rule: only bad_status in the 5xx range counts as Hard evidence; other non-5xx status
 # codes aren't explicitly classified in CLAUDE.md's table, so they're treated as Soft
@@ -129,6 +129,12 @@ class DownEvent:
     confidence: int
     fail_reasons: tuple[str, ...]
     trigger_layer: str
+    # Optional fields added by main.py after DB operations
+    page_url: Optional[str] = None
+    screenshot_path: Optional[str] = None
+    incident_id: Optional[int] = None
+    track: Optional[str] = None
+    target_name: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +144,12 @@ class RecoveryEvent:
     duration_s: int
     confidence: int
     fail_reasons: tuple[str, ...]
+    # Optional fields added by main.py after DB operations
+    trigger_layer: Optional[str] = None
+    page_url: Optional[str] = None
+    incident_id: Optional[int] = None
+    track: Optional[str] = None
+    target_name: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -146,7 +158,7 @@ class ConfigErrorEvent:
     fail_reason: str
 
 
-Event = DownEvent | RecoveryEvent | ConfigErrorEvent
+Event = Union[DownEvent, RecoveryEvent, ConfigErrorEvent]
 
 
 def _seconds_between(a: str, b: str) -> float:
@@ -239,6 +251,7 @@ def apply_check(
                 duration_s=round(_seconds_between(ts, state.since_ts)),
                 confidence=state.confidence,
                 fail_reasons=state.fail_reasons,
+                trigger_layer=state.cause_layer,
             )
             # Now it is safe to discard: the event carries the record forward.
             return MonitorState(status="UP", since_ts=ts,

@@ -1,13 +1,16 @@
 """Email channel: one send on DOWN, one on RECOVERY. No re-emailing mid-incident
 (state.py enforces that by only emitting events on transitions)."""
 import smtplib
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 
 import config
 from monitor.channels.base import AlertChannel, AlertEvent
 from monitor.state import ConfigErrorEvent, DownEvent, RecoveryEvent
 from monitor.timeutil import to_eastern
-from monitor.verdict import layer_wording
+from monitor.verdict import email_layer_body, email_layer_subject, email_reason_text
 
 
 def _format_duration(duration_s: int) -> str:
@@ -20,43 +23,99 @@ def _format_duration(duration_s: int) -> str:
     return f"{seconds}s"
 
 
-def down_message(event: DownEvent) -> str:
-    """CLAUDE.md's v3.8 locked DOWN copy, verbatim:
+def _format_time_ago(ts: str) -> str:
+    """Convert ISO timestamp to human-readable 'X minutes ago' format."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    started = datetime.fromisoformat(ts)
+    diff = (now - started).total_seconds()
 
-        [MONITOR] {name} DOWN since {eastern} — {layer wording} (confidence {n}: {reasons}).
-        Dashboard: {url}
+    if diff < 60:
+        return f"{int(diff)} seconds ago"
+    minutes, _ = divmod(int(diff), 60)
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} hour{'s' if hours != 1 else ''}, {minutes} minute{'s' if minutes != 1 else ''} ago"
 
-    where the layer wording is Rule 10's exact operator phrasing for the failed layer --
-    "login screen unreachable / not rendering" for a precursor (pulse/render) failure,
-    "online banking behind login not rendering" for an authed one. Before this, the email
-    said "{trigger_layer} failed" plus a hand-written hint, so an operator paged at 3am read
-    "render failed / page loads, content missing" while the dashboard (which they'd have to
-    open) showed Rule 10's wording. Rule 10 "every DOWN names its layer" exists precisely so they don't need the browser.
 
-    The fallback covers a trigger_layer this vocabulary doesn't know: name it plainly and
-    still send, rather than let an unmapped layer suppress the page entirely."""
-    dashboard_url = f"http://localhost:{config.PORT}"
-    reasons = ", ".join(event.fail_reasons)
-    wording = layer_wording(event.trigger_layer) or f"{event.trigger_layer} layer failed"
+def _build_down_subject(event: DownEvent) -> str:
+    """Build the DOWN email subject line."""
+    target = event.target_name or config.TARGET_NAME
+    layer_desc = email_layer_subject(event.trigger_layer)
+    return f"[MONITOR] {target} Online Banking DOWN — {layer_desc}"
+
+
+def _build_down_body(event: DownEvent) -> str:
+    """Build the DOWN email body text (plain text part of multipart)."""
+    target = event.target_name or config.TARGET_NAME
+    layer_desc = email_layer_body(event.trigger_layer)
+    time_ago = _format_time_ago(event.since_ts)
+    started_eastern = to_eastern(event.since_ts)
+
+    # Reason: if there's only one fail_reason repeated, say "checked X times";
+    # otherwise list the distinct reasons
+    if event.fail_reasons:
+        first_reason = event.fail_reasons[0]
+        reason_text = email_reason_text(first_reason)
+        check_count = len(event.fail_reasons)
+    else:
+        reason_text = "unknown"
+        check_count = 0
+
+    lines = [
+        "This is Online Banking Monitor Lite — a monitor built by Francisco and Dylan from Teachers RPA team.",
+        "",
+        f"{target}'s {layer_desc}",
+        "",
+        f"Started {started_eastern}, {time_ago}.",
+        "",
+        f"Checked {check_count} times in a row — {reason_text}.",
+        "",
+        f"URL: {event.page_url or config.TARGET_URL}",
+    ]
+
+    return "\n".join(lines)
+
+
+def _build_recovery_subject(event: RecoveryEvent) -> str:
+    """Build the RECOVERY email subject line."""
+    target = event.target_name or config.TARGET_NAME
+    return f"[MONITOR] {target} Online Banking Recovered"
+
+
+def _build_recovery_body(event: RecoveryEvent) -> str:
+    """Build the RECOVERY email body text."""
+    target = event.target_name or config.TARGET_NAME
+    duration_text = _format_duration(event.duration_s)
+
+    lines = [
+        "This is Online Banking Monitor Lite — a monitor built by Francisco and Dylan from Teachers RPA team.",
+        "",
+        f"{target}'s online banking has recovered and is now loading normally.",
+        "",
+        f"The outage lasted {duration_text}.",
+        "",
+        f"URL: {event.page_url or config.TARGET_URL}",
+    ]
+
+    return "\n".join(lines)
+
+
+def _build_config_subject() -> str:
+    """Build the CONFIG_ERROR email subject line."""
+    return f"[MONITOR-CONFIG] {config.TARGET_NAME} needs attention"
+
+
+def _build_config_body(event: ConfigErrorEvent) -> str:
+    """Build the CONFIG_ERROR email body text."""
+    ts_eastern = to_eastern(event.ts)
     return (
-        f"[MONITOR] {config.TARGET_NAME} DOWN since {to_eastern(event.since_ts)} — "
-        f"{wording} (confidence {event.confidence}: {reasons}). "
-        f"Dashboard: {dashboard_url}"
-    )
-
-
-def recovery_message(event: RecoveryEvent) -> str:
-    return f"[MONITOR] {config.TARGET_NAME} RECOVERED after {_format_duration(event.duration_s)}."
-
-
-def config_message(event: ConfigErrorEvent) -> str:
-    # "Sign-in checks paused" per v3.8's locked copy -- and it's also the accurate
-    # statement: a CONFIG_ERROR halts the auth track (Rule 4 "never retry a credential rejection"), while the pulse/render
-    # precursor keeps checking every cycle. The old "Checks paused" read as though the
-    # whole monitor had stopped.
-    return (
-        f"[MONITOR-CONFIG] {config.TARGET_NAME} needs attention — {event.fail_reason}. "
-        f"Sign-in checks paused."
+        f"This is Online Banking Monitor Lite — a monitor built by Francisco and Dylan from Teachers RPA team.\n"
+        f"\n"
+        f"{config.TARGET_NAME} configuration error at {ts_eastern}: {event.fail_reason}\n"
+        f"\n"
+        f"Sign-in checks are paused until this is resolved."
     )
 
 
@@ -65,27 +124,77 @@ class EmailGmailChannel(AlertChannel):
 
     def send(self, event: AlertEvent) -> None:
         if isinstance(event, DownEvent):
-            body = down_message(event)
+            subject = _build_down_subject(event)
+            body = _build_down_body(event)
+            screenshot = event.screenshot_path
         elif isinstance(event, RecoveryEvent):
-            body = recovery_message(event)
+            subject = _build_recovery_subject(event)
+            body = _build_recovery_body(event)
+            screenshot = None  # no screenshot for recovery
         elif isinstance(event, ConfigErrorEvent):
-            body = config_message(event)
+            subject = _build_config_subject()
+            body = _build_config_body(event)
+            screenshot = None
         else:
             raise TypeError(f"unknown event type: {event!r}")
 
-        self._send_email(subject=body, body=body)
+        self._send_email(subject=subject, body=body, screenshot_path=screenshot)
 
     @staticmethod
-    def _send_email(subject: str, body: str) -> None:
+    def _send_email(subject: str, body: str, screenshot_path=None) -> None:
         if not (config.GMAIL_USER and config.GMAIL_APP_PASSWORD and config.RECIPIENTS_EMAIL):
             print(f"[email] not configured, skipping send. subject={subject!r}")
             return
 
-        msg = MIMEText(body)
+        # Build multipart message
+        msg = MIMEMultipart("mixed")
         msg["Subject"] = subject
         msg["From"] = config.GMAIL_USER
         msg["To"] = config.RECIPIENTS_EMAIL
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(config.GMAIL_USER, config.GMAIL_APP_PASSWORD)
-            server.sendmail(config.GMAIL_USER, [config.RECIPIENTS_EMAIL], msg.as_string())
+        # Attach text body
+        msg.attach(MIMEText(body, "plain"))
+
+        # Attach screenshot if present and file exists
+        if screenshot_path:
+            try:
+                path = Path(screenshot_path)
+                if path.exists() and path.is_file():
+                    with open(path, "rb") as f:
+                        img_data = f.read()
+                    img = MIMEImage(img_data, name=path.name)
+                    img.add_header("Content-Disposition", "attachment", filename=path.name)
+                    msg.attach(img)
+            except Exception as exc:
+                print(f"[email] failed to attach screenshot {screenshot_path}: {exc}")
+
+        # Send via SMTP
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                server.login(config.GMAIL_USER, config.GMAIL_APP_PASSWORD)
+                server.sendmail(config.GMAIL_USER, [config.RECIPIENTS_EMAIL], msg.as_string())
+        except Exception as exc:
+            print(f"[email] SMTP send failed: {exc}")
+            raise
+
+
+# Backward-compat wrappers for tests that expect the old combined format
+def down_message(event: DownEvent) -> str:
+    """Backward-compat wrapper combining subject + body for tests."""
+    subject = _build_down_subject(event)
+    body = _build_down_body(event)
+    return f"{subject}\n\n{body}"
+
+
+def recovery_message(event: RecoveryEvent) -> str:
+    """Backward-compat wrapper combining subject + body for tests."""
+    subject = _build_recovery_subject(event)
+    body = _build_recovery_body(event)
+    return f"{subject}\n\n{body}"
+
+
+def config_message(event: ConfigErrorEvent) -> str:
+    """Backward-compat wrapper combining subject + body for tests."""
+    subject = _build_config_subject()
+    body = _build_config_body(event)
+    return f"{subject}\n\n{body}"
