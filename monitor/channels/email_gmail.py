@@ -1,4 +1,4 @@
-"""Email channel: one send on DOWN, one on RECOVERY. No re-emailing mid-incident
+"""Email channel: one send on DOWN, one on RECOVERY. No re-emitting mid-incident
 (state.py enforces that by only emitting events on transitions)."""
 import smtplib
 from email.mime.image import MIMEImage
@@ -11,6 +11,11 @@ from monitor.channels.base import AlertChannel, AlertEvent
 from monitor.state import ConfigErrorEvent, DownEvent, RecoveryEvent
 from monitor.timeutil import to_eastern
 from monitor.verdict import email_layer_body, email_layer_subject, email_reason_text
+
+
+def _parse_email_list(emails_str: str) -> list:
+    """Parse comma-separated email list from env var. Returns empty list if not set."""
+    return [e.strip() for e in (emails_str or "").split(",") if e.strip()]
 
 
 def _format_duration(duration_s: int) -> str:
@@ -142,7 +147,12 @@ class EmailGmailChannel(AlertChannel):
 
     @staticmethod
     def _send_email(subject: str, body: str, screenshot_path=None) -> None:
-        if not (config.GMAIL_USER and config.GMAIL_APP_PASSWORD and config.RECIPIENTS_EMAIL):
+        # Parse recipient lists
+        to_list = _parse_email_list(config.RECIPIENTS_EMAIL)
+        cc_list = _parse_email_list(config.RECIPIENTS_CC)
+        bcc_list = _parse_email_list(config.RECIPIENTS_BCC)
+
+        if not (config.GMAIL_USER and config.GMAIL_APP_PASSWORD and to_list):
             print(f"[email] not configured, skipping send. subject={subject!r}")
             return
 
@@ -150,7 +160,10 @@ class EmailGmailChannel(AlertChannel):
         msg = MIMEMultipart("mixed")
         msg["Subject"] = subject
         msg["From"] = config.GMAIL_USER
-        msg["To"] = config.RECIPIENTS_EMAIL
+        msg["To"] = ", ".join(to_list)
+        if cc_list:
+            msg["Cc"] = ", ".join(cc_list)
+        # Note: BCC is NOT added to headers (stays hidden)
 
         # Attach text body
         msg.attach(MIMEText(body, "plain"))
@@ -168,11 +181,12 @@ class EmailGmailChannel(AlertChannel):
             except Exception as exc:
                 print(f"[email] failed to attach screenshot {screenshot_path}: {exc}")
 
-        # Send via SMTP
+        # Send via SMTP to all recipients (To + Cc + Bcc)
+        all_recipients = to_list + cc_list + bcc_list
         try:
             with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
                 server.login(config.GMAIL_USER, config.GMAIL_APP_PASSWORD)
-                server.sendmail(config.GMAIL_USER, [config.RECIPIENTS_EMAIL], msg.as_string())
+                server.sendmail(config.GMAIL_USER, all_recipients, msg.as_string())
         except Exception as exc:
             print(f"[email] SMTP send failed: {exc}")
             raise
