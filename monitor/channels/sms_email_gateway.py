@@ -30,7 +30,7 @@ class SmsEmailGatewayChannel(AlertChannel):
         elif isinstance(event, RecoveryEvent):
             body = recovery_message(event, config.TARGET_NAME)
         elif isinstance(event, ConfigErrorEvent):
-            body = config_message(event, config.TARGET_NAME)
+            return  # ConfigErrorEvent does not trigger SMS alerts
         else:
             raise TypeError(f"unknown event type: {event!r}")
 

@@ -137,9 +137,7 @@ class EmailGmailChannel(AlertChannel):
             body = _build_recovery_body(event)
             screenshot = None  # no screenshot for recovery
         elif isinstance(event, ConfigErrorEvent):
-            subject = _build_config_subject()
-            body = _build_config_body(event)
-            screenshot = None
+            return  # ConfigErrorEvent does not trigger email alerts
         else:
             raise TypeError(f"unknown event type: {event!r}")
 

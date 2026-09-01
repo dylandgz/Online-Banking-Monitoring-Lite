@@ -79,14 +79,6 @@ def test_send_recovery_event(fake_smtp):
     assert "RECOVERED" in _decoded_body(call["msg"])
 
 
-def test_send_config_error_event(fake_smtp):
-    event = ConfigErrorEvent(ts="2026-01-01T00:00:00+00:00", fail_reason="auth_rejected")
-    sms_gateway.SmsEmailGatewayChannel().send(event)
-
-    call = fake_smtp.last_instance.sent[0]
-    assert "MONITOR-CONFIG" in _decoded_body(call["msg"])
-
-
 def test_provider_failure_propagates(monkeypatch, fake_smtp):
     def boom(self, from_addr, to_addrs, msg):
         raise smtplib.SMTPException("gateway rejected the message")
