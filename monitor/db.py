@@ -229,6 +229,11 @@ def _migrate_stage_r_cycles(conn: sqlite3.Connection) -> None:
     _add_missing_columns(conn, "checks", {"cycle_id": "TEXT"})
 
 
+def _migrate_b44_incidents_page_url(conn: sqlite3.Connection) -> None:
+    """[B44] Track the URL being monitored when incidents occur, for email recovery messages."""
+    _add_missing_columns(conn, "incidents", {"page_url": "TEXT"})
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _migrate_browser_mode(conn)
@@ -238,6 +243,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _migrate_evidence_columns(conn)
     _migrate_layer_state(conn)
     _migrate_scored(conn)
+    _migrate_b44_incidents_page_url(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_burst_id ON checks(burst_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_cycle_id ON checks(cycle_id)")
