@@ -13,7 +13,12 @@ to plain freeform `body` sends.
 import json
 import os
 
-from twilio.rest import Client
+try:
+    from twilio.rest import Client
+    TWILIO_AVAILABLE = True
+except ImportError:
+    TWILIO_AVAILABLE = False
+    Client = None
 
 import config
 from monitor.channels.base import AlertChannel, AlertEvent
@@ -69,6 +74,8 @@ class SmsTwilioChannel(AlertChannel):
 
     @staticmethod
     def _send_sms(body: str) -> None:
+        if not TWILIO_AVAILABLE:
+            raise RuntimeError("twilio library is not installed; run `pip install twilio`")
         if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER and SMS_TO_NUMBERS):
             # Raise (not skip): dispatch()'s per-channel try/except is what logs this,
             # so email still fires and the failure is visible instead of a silent no-op.

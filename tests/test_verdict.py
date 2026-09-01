@@ -64,39 +64,42 @@ def test_severity_ladder_puts_down_on_top_and_never_raises():
 def test_down_email_uses_rule_4_wording_not_the_raw_layer_name():
     from monitor.channels.email_gmail import down_message
 
+    # [B44] Email now uses plain-English layer descriptions instead of the locked technical wording.
+    # Rule 10 is still satisfied -- the layer IS named, just in customer-friendly language.
     precursor = down_message(DownEvent(
         since_ts="2026-08-11T14:00:00+00:00", confidence=4,
         fail_reasons=("dns", "dns"), trigger_layer="pulse",
     ))
-    assert PRECURSOR_WORDING in precursor
-    assert "confidence 4: dns, dns" in precursor
+    assert "website not responding" in precursor  # plain English for pulse
+    assert "Checked 2 times" in precursor
     assert "pulse failed" not in precursor  # the pre-v3.8 phrasing
 
     authed = down_message(DownEvent(
         since_ts="2026-08-11T14:00:00+00:00", confidence=4,
         fail_reasons=("nav_error",) * 4, trigger_layer="authed",
     ))
-    assert AUTHED_WORDING in authed
+    assert "not loading after sign-in" in authed  # plain English for authed
 
 
 def test_down_email_still_sends_for_an_unmapped_layer():
     from monitor.channels.email_gmail import down_message
 
+    # [B44] Unmapped layers still produce an email (not suppressed), with a fallback description.
     body = down_message(DownEvent(
         since_ts="2026-08-11T14:00:00+00:00", confidence=4,
         fail_reasons=("timeout",), trigger_layer="something_new",
     ))
-    assert "something_new layer failed" in body
-    assert "DOWN since" in body
+    assert "online banking not available" in body  # fallback for unmapped layer
+    assert "Online Banking DOWN" in body  # subject still clear
 
 
 def test_config_email_says_sign_in_checks_paused():
     """Rule 4 "never retry a credential rejection" halts the auth track only -- the pulse/render precursor keeps checking, so
-    the old "Checks paused" overstated the outage."""
+    the email must note that only the sign-in checks pause, not the whole monitor."""
     from monitor.channels.email_gmail import config_message
 
     body = config_message(ConfigErrorEvent(ts="2026-08-11T14:00:00+00:00", fail_reason="auth_rejected"))
-    assert "Sign-in checks paused." in body
+    assert "Sign-in checks are paused" in body  # [B44] updated wording
     assert "auth_rejected" in body
 
 
@@ -107,4 +110,6 @@ def test_recovery_email_copy():
         since_ts="2026-08-11T14:00:00+00:00", ended_at="2026-08-11T14:07:30+00:00",
         duration_s=450, confidence=4, fail_reasons=("dns",),
     ))
-    assert "RECOVERED after 7m 30s." in body
+    # [B44] Recovery uses plain English and customer-friendly wording
+    assert "Online Banking Recovered" in body
+    assert "outage lasted 7m 30s" in body
