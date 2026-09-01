@@ -7,6 +7,7 @@ import asyncio
 import random
 import traceback
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import uvicorn
@@ -77,6 +78,7 @@ async def _process_probe(
         conn, channels, prev_state, result.ok, result.fail_reason, ts, result.layer,
         track=track, down_confidence=down_confidence, min_failed_probes=min_failed_probes,
         precursor_down=precursor_down, scoring=scoring, screenshot_path=result.screenshot_path,
+        page_url=result.page_url,
     )
 
 
@@ -88,6 +90,7 @@ async def _advance_state(
     precursor_down: bool = False,
     scoring: bool = True,
     screenshot_path: str | None = None,
+    page_url: str | None = None,
 ) -> MonitorState:
     """Advances the pure state machine, persists it, and dispatches any resulting alert.
 
@@ -111,13 +114,25 @@ async def _advance_state(
 
     for event in events:
         if isinstance(event, DownEvent):
-            db.open_incident(
+            incident_id = db.open_incident(
                 conn, event.since_ts, event.confidence, event.trigger_layer,
-                len(event.fail_reasons), screenshot_path, track=track,
+                len(event.fail_reasons), screenshot_path, page_url=page_url, track=track,
+            )
+            event = replace(event,
+                incident_id=incident_id,
+                page_url=page_url,
+                screenshot_path=screenshot_path,
+                track=track,
+                target_name=config.TARGET_NAME,
             )
         elif isinstance(event, RecoveryEvent):
-            db.close_incident(conn, event.ended_at, event.duration_s, event.confidence,
+            incident_page_url = db.close_incident(conn, event.ended_at, event.duration_s, event.confidence,
                                len(event.fail_reasons), track=track)
+            event = replace(event,
+                page_url=incident_page_url,
+                track=track,
+                target_name=config.TARGET_NAME,
+            )
         elif isinstance(event, ConfigErrorEvent):
             pass  # not an outage -- no incident row, just the CONFIG alert below
         print(f"[alert] [{track}] {event!r}")

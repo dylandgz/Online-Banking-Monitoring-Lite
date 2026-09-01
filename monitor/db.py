@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     confidence INTEGER,
     trigger_layer TEXT,
     screenshot_path TEXT,
+    page_url TEXT,
     track TEXT NOT NULL DEFAULT 'main'
 );
 
@@ -375,13 +376,14 @@ def open_incident(
     confidence: int,
     trigger_layer: str,
     checks_failed: int,
-    screenshot_path: str | None,
+    screenshot_path,
+    page_url=None,
     track: str = "main",
 ) -> int:
     cur = conn.execute(
-        "INSERT INTO incidents (started_at, confidence, trigger_layer, checks_failed, screenshot_path, track) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (started_at, confidence, trigger_layer, checks_failed, screenshot_path, track),
+        "INSERT INTO incidents (started_at, confidence, trigger_layer, checks_failed, screenshot_path, page_url, track) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (started_at, confidence, trigger_layer, checks_failed, screenshot_path, page_url, track),
     )
     conn.commit()
     return cur.lastrowid
@@ -394,9 +396,15 @@ def close_incident(
     confidence: int,
     checks_failed: int,
     track: str = "main",
-) -> None:
+):
     # Filtered by track: without this, two tracks each holding an open incident could
     # close each other's row (whichever is more recent by id) instead of their own.
+    incident = conn.execute(
+        "SELECT page_url FROM incidents WHERE ended_at IS NULL AND track = ? ORDER BY id DESC LIMIT 1",
+        (track,),
+    ).fetchone()
+    page_url = incident[0] if incident else None
+
     conn.execute(
         """
         UPDATE incidents SET ended_at = ?, duration_s = ?, confidence = ?, checks_failed = ?
@@ -405,6 +413,7 @@ def close_incident(
         (ended_at, duration_s, confidence, checks_failed, track),
     )
     conn.commit()
+    return page_url
 
 
 def get_last_check_ts(conn: sqlite3.Connection) -> str | None:
