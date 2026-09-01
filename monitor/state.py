@@ -255,7 +255,9 @@ def apply_check(
             )
             # Now it is safe to discard: the event carries the record forward.
             return MonitorState(status="UP", since_ts=ts,
-                                layers=_with_layer(state, layer, LayerEvidence(last_probe_ts=ts))), [event]
+                                layers=_with_layer(state, layer, LayerEvidence(last_probe_ts=ts)),
+                                consecutive_passes=0,
+                                cause_layer=None), [event]
 
         cleared = LayerEvidence(last_probe_ts=ts)
         layers = _with_layer(state, layer, cleared)
