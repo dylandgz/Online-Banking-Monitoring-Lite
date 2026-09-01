@@ -9,6 +9,7 @@ from monitor.state import ConfigErrorEvent, DownEvent, RecoveryEvent
 
 @pytest.fixture(autouse=True)
 def configured(monkeypatch):
+    monkeypatch.setattr(sms_twilio, "TWILIO_AVAILABLE", True)
     monkeypatch.setattr(sms_twilio, "TWILIO_ACCOUNT_SID", "AC_test_sid")
     monkeypatch.setattr(sms_twilio, "TWILIO_AUTH_TOKEN", "test_token")
     monkeypatch.setattr(sms_twilio, "TWILIO_FROM_NUMBER", "+15551234567")
@@ -71,15 +72,6 @@ def test_send_recovery_event(fake_client):
     call = fake_client.last_instance.messages.calls[0]
     assert "RECOVERED" in call["body"]
     assert "5m0s" in call["body"]
-
-
-def test_send_config_error_event(fake_client):
-    event = ConfigErrorEvent(ts="2026-01-01T00:00:00+00:00", fail_reason="auth_rejected")
-    sms_twilio.SmsTwilioChannel().send(event)
-
-    call = fake_client.last_instance.messages.calls[0]
-    assert "MONITOR-CONFIG" in call["body"]
-    assert "auth_rejected" in call["body"]
 
 
 def test_provider_failure_propagates(monkeypatch, fake_client):

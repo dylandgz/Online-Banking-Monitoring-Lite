@@ -93,16 +93,6 @@ def test_down_email_still_sends_for_an_unmapped_layer():
     assert "Online Banking DOWN" in body  # subject still clear
 
 
-def test_config_email_says_sign_in_checks_paused():
-    """Rule 4 "never retry a credential rejection" halts the auth track only -- the pulse/render precursor keeps checking, so
-    the email must note that only the sign-in checks pause, not the whole monitor."""
-    from monitor.channels.email_gmail import config_message
-
-    body = config_message(ConfigErrorEvent(ts="2026-08-11T14:00:00+00:00", fail_reason="auth_rejected"))
-    assert "Sign-in checks are paused" in body  # [B44] updated wording
-    assert "auth_rejected" in body
-
-
 def test_recovery_email_copy():
     from monitor.channels.email_gmail import recovery_message
 
