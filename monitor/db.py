@@ -356,9 +356,11 @@ def set_state(conn: sqlite3.Connection, state: MonitorState, track: str = "main"
         for name, e in state.layers.items()
     })
     conn.execute(
-        "UPDATE state SET status = ?, since_ts = ?, burst_started_ts = ?, confidence = ?, "
-        "fail_reasons = ?, layers_json = ?, consecutive_passes = ?, cause_layer = ? WHERE track = ?",
+        "INSERT OR REPLACE INTO state (track, status, since_ts, burst_started_ts, confidence, "
+        "fail_reasons, layers_json, consecutive_passes, cause_layer) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
+            track,
             state.status,
             state.since_ts,
             # burst_started_ts / confidence / fail_reasons are now DERIVED from the layer
@@ -370,7 +372,6 @@ def set_state(conn: sqlite3.Connection, state: MonitorState, track: str = "main"
             layers_json,
             state.consecutive_passes,
             state.cause_layer,
-            track,
         ),
     )
     conn.commit()
