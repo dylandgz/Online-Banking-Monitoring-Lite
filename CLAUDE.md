@@ -96,12 +96,14 @@ UP (0)  <  DEGRADED (1)  <  CONFIG_ERROR (2)  <  DOWN (3)
 
 `auth_status = None` (track not configured) means the main track alone decides.
 
-The dashboard banner, `/api/status` and alert subjects all speak platform-level, and always name the failing layer:
+The dashboard banner and `/api/status` speak platform-level, and always name the failing layer with Rule 10's locked operator phrasing:
 
 - precursor failure → **"login screen unreachable / not rendering"**
 - authed failure → **"online banking behind login not rendering"**
 
 The operator must never need a browser to know which wall failed. The wording lives in `monitor/verdict.py` and nowhere else. `fail_layer='monitor'` deliberately returns `None` — our own bug never gets operator phrasing.
+
+**[B44]** Email alerts use plain-English layer descriptions instead (e.g., "website not responding", "not loading after sign-in"), satisfying Rule 10's intent while optimizing for the customer-facing context of email. See [Email copy](#email-copy-b44).
 
 ## Failure classification
 
@@ -285,16 +287,32 @@ Connections open with `PRAGMA journal_mode=WAL` and `busy_timeout=15000` — rol
 
 Dashboard log is one row per minute: three layer badges (pulse / render / authed), verdict, session-reused marker, burst badge when applicable. Failed cycles expand to their probes. Bursts are first-class and cannot be hidden. Only DOWN wears alarm red; CONFIG_ERROR and DEGRADED are gold.
 
-## Email copy (locked wording)
+## Email copy [B44]
 
-```
-[MONITOR] {name} DOWN since {eastern} — login screen unreachable / not rendering (confidence {n}: {reasons}). Dashboard: {url}
-[MONITOR] {name} DOWN since {eastern} — online banking behind login not rendering (confidence {n}: {reasons}). Dashboard: {url}
-[MONITOR] {name} RECOVERED after {duration}.
-[MONITOR-CONFIG] {name} needs attention — {reason}. Sign-in checks paused.
-```
+[B44 / 2026-08-31] Redesigned for customer-friendly language and operational clarity. Emails are now multipart MIME with plain-text body + screenshot attachment on DOWN events. Rule 10 "every DOWN names its layer" is satisfied by plain-English layer descriptions rather than locked technical wording.
 
-One DOWN email and one RECOVERY email per incident, ever.
+**Subject lines** always name the platform and layer clearly:
+
+| Scenario | Subject |
+|---|---|
+| Login page unreachable or broken | `[MONITOR] {name} Online Banking DOWN — website not responding` |
+| Sign-in form not loading | `[MONITOR] {name} Online Banking DOWN — sign-in page not loading` |
+| Account area not loading (authed) | `[MONITOR] {name} Online Banking DOWN — not loading after sign-in` |
+| Recovered from outage | `[MONITOR] {name} Online Banking Recovered` |
+| Configuration error | `[MONITOR-CONFIG] {name} needs attention` |
+
+**Body text** (plain-text part) includes:
+- Monitor identification: "This is Online Banking Monitor Lite — a monitor built by [team names] from [org]."
+- Customer-facing symptom in plain English (what they would experience)
+- When it started (Eastern time) and how long ago
+- How many checks failed in a row
+- What the checks showed (translated to plain English, e.g., "the server did not respond in time" not "timeout")
+- The URL that was being monitored
+- For DOWN events: screenshot attachment (masked for PII per Rule 16)
+
+**Attachment (DOWN events only):** One screenshot from the failed check, named with Eastern timestamp and layer (e.g., `20260831T103205-0400_authed_check.png`).
+
+One DOWN email and one RECOVERY email per incident, ever. One CONFIG-ERROR email per transition to CONFIG_ERROR state, never re-emitting while latched.
 
 ## `.env`
 

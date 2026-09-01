@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     confidence INTEGER,
     trigger_layer TEXT,
     screenshot_path TEXT,
+    page_url TEXT,
     track TEXT NOT NULL DEFAULT 'main'
 );
 
@@ -228,6 +229,11 @@ def _migrate_stage_r_cycles(conn: sqlite3.Connection) -> None:
     _add_missing_columns(conn, "checks", {"cycle_id": "TEXT"})
 
 
+def _migrate_b44_incidents_page_url(conn: sqlite3.Connection) -> None:
+    """[B44] Track the URL being monitored when incidents occur, for email recovery messages."""
+    _add_missing_columns(conn, "incidents", {"page_url": "TEXT"})
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _migrate_browser_mode(conn)
@@ -237,6 +243,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _migrate_evidence_columns(conn)
     _migrate_layer_state(conn)
     _migrate_scored(conn)
+    _migrate_b44_incidents_page_url(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_burst_id ON checks(burst_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_cycle_id ON checks(cycle_id)")
@@ -349,9 +356,11 @@ def set_state(conn: sqlite3.Connection, state: MonitorState, track: str = "main"
         for name, e in state.layers.items()
     })
     conn.execute(
-        "UPDATE state SET status = ?, since_ts = ?, burst_started_ts = ?, confidence = ?, "
-        "fail_reasons = ?, layers_json = ?, consecutive_passes = ?, cause_layer = ? WHERE track = ?",
+        "INSERT OR REPLACE INTO state (track, status, since_ts, burst_started_ts, confidence, "
+        "fail_reasons, layers_json, consecutive_passes, cause_layer) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
+            track,
             state.status,
             state.since_ts,
             # burst_started_ts / confidence / fail_reasons are now DERIVED from the layer
@@ -363,7 +372,6 @@ def set_state(conn: sqlite3.Connection, state: MonitorState, track: str = "main"
             layers_json,
             state.consecutive_passes,
             state.cause_layer,
-            track,
         ),
     )
     conn.commit()
@@ -375,13 +383,14 @@ def open_incident(
     confidence: int,
     trigger_layer: str,
     checks_failed: int,
-    screenshot_path: str | None,
+    screenshot_path,
+    page_url=None,
     track: str = "main",
 ) -> int:
     cur = conn.execute(
-        "INSERT INTO incidents (started_at, confidence, trigger_layer, checks_failed, screenshot_path, track) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (started_at, confidence, trigger_layer, checks_failed, screenshot_path, track),
+        "INSERT INTO incidents (started_at, confidence, trigger_layer, checks_failed, screenshot_path, page_url, track) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (started_at, confidence, trigger_layer, checks_failed, screenshot_path, page_url, track),
     )
     conn.commit()
     return cur.lastrowid
@@ -394,9 +403,15 @@ def close_incident(
     confidence: int,
     checks_failed: int,
     track: str = "main",
-) -> None:
+):
     # Filtered by track: without this, two tracks each holding an open incident could
     # close each other's row (whichever is more recent by id) instead of their own.
+    incident = conn.execute(
+        "SELECT page_url FROM incidents WHERE ended_at IS NULL AND track = ? ORDER BY id DESC LIMIT 1",
+        (track,),
+    ).fetchone()
+    page_url = incident[0] if incident else None
+
     conn.execute(
         """
         UPDATE incidents SET ended_at = ?, duration_s = ?, confidence = ?, checks_failed = ?
@@ -405,6 +420,7 @@ def close_incident(
         (ended_at, duration_s, confidence, checks_failed, track),
     )
     conn.commit()
+    return page_url
 
 
 def get_last_check_ts(conn: sqlite3.Connection) -> str | None:

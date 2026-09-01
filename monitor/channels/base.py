@@ -1,10 +1,11 @@
 """The contract every alert channel implements. This is the seam external contributions
 (e.g. the SMS PR) code against — see CONTRIBUTING.md."""
 from abc import ABC, abstractmethod
+from typing import Union
 
 from monitor.state import ConfigErrorEvent, DownEvent, RecoveryEvent
 
-AlertEvent = DownEvent | RecoveryEvent | ConfigErrorEvent
+AlertEvent = Union[DownEvent, RecoveryEvent, ConfigErrorEvent]
 
 
 class AlertChannel(ABC):
