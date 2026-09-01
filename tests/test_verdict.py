@@ -103,3 +103,88 @@ def test_recovery_email_copy():
     # [B44] Recovery uses plain English and customer-friendly wording
     assert "Online Banking Recovered" in body
     assert "outage lasted 7m 30s" in body
+
+
+def test_config_error_goes_to_admin_email(monkeypatch):
+    """CONFIG_ERROR emails go to ADMIN_EMAIL only, not to regular RECIPIENTS_EMAIL."""
+    import monitor.channels.email_gmail as email_module
+    from monitor.channels.email_gmail import EmailGmailChannel
+
+    monkeypatch.setattr(email_module.config, "ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setattr(email_module.config, "GMAIL_USER", "sender@gmail.com")
+    monkeypatch.setattr(email_module.config, "GMAIL_APP_PASSWORD", "app_pass")
+
+    # Track what _send_email was called with
+    calls = []
+    original_send = email_module.EmailGmailChannel._send_email
+
+    @staticmethod
+    def mock_send_email(subject: str, body: str, screenshot_path=None, recipients=None) -> None:
+        calls.append({"subject": subject, "recipients": recipients})
+
+    monkeypatch.setattr(EmailGmailChannel, "_send_email", mock_send_email)
+
+    event = ConfigErrorEvent(ts="2026-01-01T00:00:00+00:00", fail_reason="auth_rejected")
+    EmailGmailChannel().send(event)
+
+    assert len(calls) == 1
+    assert calls[0]["recipients"] == ["admin@example.com"]
+    assert "MONITOR-CONFIG" in calls[0]["subject"]
+
+
+def test_config_error_skips_if_admin_email_blank(monkeypatch):
+    """If ADMIN_EMAIL is blank, CONFIG_ERROR notifications are disabled."""
+    import monitor.channels.email_gmail as email_module
+    from monitor.channels.email_gmail import EmailGmailChannel
+
+    monkeypatch.setattr(email_module.config, "ADMIN_EMAIL", "")
+    monkeypatch.setattr(email_module.config, "GMAIL_USER", "sender@gmail.com")
+    monkeypatch.setattr(email_module.config, "GMAIL_APP_PASSWORD", "app_pass")
+
+    # Track calls to _send_email
+    calls = []
+    original_send = email_module.EmailGmailChannel._send_email
+
+    @staticmethod
+    def mock_send_email(subject: str, body: str, screenshot_path=None, recipients=None) -> None:
+        calls.append({"subject": subject, "recipients": recipients})
+
+    monkeypatch.setattr(EmailGmailChannel, "_send_email", mock_send_email)
+
+    event = ConfigErrorEvent(ts="2026-01-01T00:00:00+00:00", fail_reason="auth_rejected")
+    EmailGmailChannel().send(event)
+
+    # Should not send anything
+    assert len(calls) == 0
+
+
+def test_down_email_still_goes_to_recipients_email(monkeypatch):
+    """DOWN events still go to RECIPIENTS_EMAIL, not ADMIN_EMAIL."""
+    import monitor.channels.email_gmail as email_module
+    from monitor.channels.email_gmail import EmailGmailChannel
+
+    monkeypatch.setattr(email_module.config, "RECIPIENTS_EMAIL", "ops@example.com")
+    monkeypatch.setattr(email_module.config, "RECIPIENTS_CC", "")
+    monkeypatch.setattr(email_module.config, "RECIPIENTS_BCC", "")
+    monkeypatch.setattr(email_module.config, "ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setattr(email_module.config, "GMAIL_USER", "sender@gmail.com")
+    monkeypatch.setattr(email_module.config, "GMAIL_APP_PASSWORD", "app_pass")
+
+    # Track calls
+    calls = []
+
+    @staticmethod
+    def mock_send_email(subject: str, body: str, screenshot_path=None, recipients=None) -> None:
+        calls.append({"subject": subject, "recipients": recipients})
+
+    monkeypatch.setattr(EmailGmailChannel, "_send_email", mock_send_email)
+
+    event = DownEvent(
+        since_ts="2026-01-01T00:00:00+00:00", confidence=4,
+        fail_reasons=("timeout",), trigger_layer="pulse",
+    )
+    EmailGmailChannel().send(event)
+
+    assert len(calls) == 1
+    # Should go to RECIPIENTS_EMAIL, not ADMIN_EMAIL
+    assert calls[0]["recipients"] == ["ops@example.com"]

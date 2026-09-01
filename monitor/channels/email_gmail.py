@@ -132,23 +132,36 @@ class EmailGmailChannel(AlertChannel):
             subject = _build_down_subject(event)
             body = _build_down_body(event)
             screenshot = event.screenshot_path
+            recipients = _parse_email_list(config.RECIPIENTS_EMAIL)
         elif isinstance(event, RecoveryEvent):
             subject = _build_recovery_subject(event)
             body = _build_recovery_body(event)
             screenshot = None  # no screenshot for recovery
+            recipients = _parse_email_list(config.RECIPIENTS_EMAIL)
         elif isinstance(event, ConfigErrorEvent):
-            return  # ConfigErrorEvent does not trigger email alerts
+            if not config.ADMIN_EMAIL:
+                return  # ADMIN_EMAIL not configured; CONFIG_ERROR notifications disabled
+            subject = _build_config_subject()
+            body = _build_config_body(event)
+            screenshot = None
+            recipients = [config.ADMIN_EMAIL.strip()]
         else:
             raise TypeError(f"unknown event type: {event!r}")
 
-        self._send_email(subject=subject, body=body, screenshot_path=screenshot)
+        self._send_email(subject=subject, body=body, screenshot_path=screenshot, recipients=recipients)
 
     @staticmethod
-    def _send_email(subject: str, body: str, screenshot_path=None) -> None:
-        # Parse recipient lists
-        to_list = _parse_email_list(config.RECIPIENTS_EMAIL)
-        cc_list = _parse_email_list(config.RECIPIENTS_CC)
-        bcc_list = _parse_email_list(config.RECIPIENTS_BCC)
+    def _send_email(subject: str, body: str, screenshot_path=None, recipients=None) -> None:
+        # Parse recipient lists; if recipients is provided (CONFIG_ERROR case), use only that
+        if recipients is None:
+            to_list = _parse_email_list(config.RECIPIENTS_EMAIL)
+            cc_list = _parse_email_list(config.RECIPIENTS_CC)
+            bcc_list = _parse_email_list(config.RECIPIENTS_BCC)
+        else:
+            # CONFIG_ERROR: send only to admin, no CC/BCC
+            to_list = recipients
+            cc_list = []
+            bcc_list = []
 
         if not (config.GMAIL_USER and config.GMAIL_APP_PASSWORD and to_list):
             print(f"[email] not configured, skipping send. subject={subject!r}")
