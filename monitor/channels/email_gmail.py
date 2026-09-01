@@ -48,7 +48,9 @@ def _build_down_subject(event: DownEvent) -> str:
     """Build the DOWN email subject line."""
     target = event.target_name or config.TARGET_NAME
     layer_desc = email_layer_subject(event.trigger_layer)
-    return f"[MONITOR] {target} Online Banking DOWN — {layer_desc}"
+    # Extract time from ISO timestamp (e.g., "2026-08-11T14:00:00+00:00" -> "14:00")
+    time_part = event.since_ts[11:16] if len(event.since_ts) > 10 else ""
+    return f"[MONITOR] {target} Online Banking DOWN — {layer_desc} {time_part}".strip()
 
 
 def _build_down_body(event: DownEvent) -> str:
@@ -86,7 +88,9 @@ def _build_down_body(event: DownEvent) -> str:
 def _build_recovery_subject(event: RecoveryEvent) -> str:
     """Build the RECOVERY email subject line."""
     target = event.target_name or config.TARGET_NAME
-    return f"[MONITOR] {target} Online Banking Recovered"
+    # Extract time from ISO timestamp (e.g., "2026-08-11T14:07:30+00:00" -> "14:07")
+    time_part = event.ended_at[11:16] if len(event.ended_at) > 10 else ""
+    return f"[MONITOR] {target} Online Banking Recovered {time_part}".strip()
 
 
 def _build_recovery_body(event: RecoveryEvent) -> str:
@@ -107,9 +111,11 @@ def _build_recovery_body(event: RecoveryEvent) -> str:
     return "\n".join(lines)
 
 
-def _build_config_subject() -> str:
+def _build_config_subject(event: ConfigErrorEvent) -> str:
     """Build the CONFIG_ERROR email subject line."""
-    return f"[MONITOR-CONFIG] {config.TARGET_NAME} needs attention"
+    # Extract time from ISO timestamp (e.g., "2026-08-11T14:00:00+00:00" -> "14:00")
+    time_part = event.ts[11:16] if len(event.ts) > 10 else ""
+    return f"[MONITOR-CONFIG] {config.TARGET_NAME} needs attention {time_part}".strip()
 
 
 def _build_config_body(event: ConfigErrorEvent) -> str:
@@ -141,7 +147,7 @@ class EmailGmailChannel(AlertChannel):
         elif isinstance(event, ConfigErrorEvent):
             if not config.ADMIN_EMAIL:
                 return  # ADMIN_EMAIL not configured; CONFIG_ERROR notifications disabled
-            subject = _build_config_subject()
+            subject = _build_config_subject(event)
             body = _build_config_body(event)
             screenshot = None
             recipients = [config.ADMIN_EMAIL.strip()]
@@ -220,6 +226,6 @@ def recovery_message(event: RecoveryEvent) -> str:
 
 def config_message(event: ConfigErrorEvent) -> str:
     """Backward-compat wrapper combining subject + body for tests."""
-    subject = _build_config_subject()
+    subject = _build_config_subject(event)
     body = _build_config_body(event)
     return f"{subject}\n\n{body}"

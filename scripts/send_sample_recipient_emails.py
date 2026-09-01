@@ -72,7 +72,8 @@ def main() -> None:
             print(f"     → CC: {config.RECIPIENTS_CC}")
         if config.RECIPIENTS_BCC:
             print(f"     → BCC: {config.RECIPIENTS_BCC}")
-        print(f"     ✓ Subject: [MONITOR] {config.TARGET_NAME} Online Banking DOWN — website not responding")
+        from monitor.channels.email_gmail import _build_down_subject
+        print(f"     ✓ Subject: {_build_down_subject(down_event)}")
         print(f"     ✓ Attachment: sample screenshot (1x1 PNG)\n")
 
         # 2. Sample RECOVERY event
@@ -93,7 +94,8 @@ def main() -> None:
             print(f"     → CC: {config.RECIPIENTS_CC}")
         if config.RECIPIENTS_BCC:
             print(f"     → BCC: {config.RECIPIENTS_BCC}")
-        print(f"     ✓ Subject: [MONITOR] {config.TARGET_NAME} Online Banking Recovered")
+        from monitor.channels.email_gmail import _build_recovery_subject
+        print(f"     ✓ Subject: {_build_recovery_subject(recovery_event)}")
         print(f"     ✓ No attachment (recovery emails don't include screenshots)\n")
 
         print("[sample-emails] Both emails sent successfully! ✓")
