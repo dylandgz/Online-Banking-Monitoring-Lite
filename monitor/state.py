@@ -77,6 +77,8 @@ class LayerEvidence:
     fail_reasons: tuple[str, ...] = ()
     last_probe_ts: Optional[str] = None     # any probe, pass or fail -- drives the stale reset
     run_started_ts: Optional[str] = None    # first failure of the CURRENT run; None when clear
+    # [B50] Did this run collect at least one FAILED LOGIN? Gates recovery -- see apply_check.
+    from_login: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,6 +185,7 @@ def apply_check(
     recovery_passes: int = 1,
     precursor_down: bool = False,
     scoring: bool = True,
+    is_login: bool = False,
 ) -> tuple[MonitorState, list[Event]]:
     """Advances the state machine by one probe result. Emits an event only on a status
     transition -- never re-emits while an incident is ongoing.
@@ -216,7 +219,22 @@ def apply_check(
     we were looking by then -- otherwise the stale reset would fire spuriously.
 
     `precursor_down` [the "Cross-track suppression" section]: only meaningful for the auth
-    track, when the main track's incident is already open and explains the symptom."""
+    track, when the main track's incident is already open and explains the symptom.
+
+    `is_login` [B50, 2026-09-07] says this probe was a full credentialed login rather than a
+    cheap session-reuse check. It exists for one rule: **a DOWN whose evidence includes a failed
+    login can only BEGIN recovering on a successful login.** Passes two and three may be cheap
+    checks.
+
+    Why the rule is needed at all: before B50 the auth track filed pre-credential login failures
+    on a separate `render` layer, so the two could never interact. Now they share one layer, and
+    without this a cheap check could close an outage that was raised by failed logins -- declaring
+    "sign-in works again" on the strength of a cached cookie, while customers who are not already
+    signed in still cannot get in.
+
+    In the common case the rule is close to automatic: after a login-caused DOWN there is no
+    usable session, so the cheap check cannot run at all until a login succeeds. It closes the
+    narrow case where the session file is still fresh but the bank had been rejecting it."""
     prev = state.evidence(layer)
 
     # A probe we are told not to score still proves the monitor was awake and looking.
@@ -231,6 +249,13 @@ def apply_check(
             # opposite direction. CONFIG_ERROR has no cause layer, so any pass clears it.
             if state.cause_layer and layer != state.cause_layer:
                 touched = replace(state.evidence(layer), last_probe_ts=ts)
+                return replace(state, layers=_with_layer(state, layer, touched)), []
+
+            # [B50] A DOWN built from failed logins does not start recovering on a cheap
+            # check. Only the FIRST pass is gated: once a login has proved sign-in works,
+            # passes two and three may be cheap checks.
+            if prev.from_login and not is_login and state.consecutive_passes == 0:
+                touched = replace(prev, last_probe_ts=ts)
                 return replace(state, layers=_with_layer(state, layer, touched)), []
 
             # The causing layer's evidence is NOT cleared yet, only timestamped. It is the
@@ -302,6 +327,7 @@ def apply_check(
             fail_reasons=prev.fail_reasons + (fail_reason,),
             last_probe_ts=ts,
             run_started_ts=prev.run_started_ts or ts,
+            from_login=prev.from_login or is_login,
         )
         return replace(state, layers=_with_layer(state, layer, tallied), consecutive_passes=0), []
 
@@ -319,6 +345,7 @@ def apply_check(
         fail_reasons=base.fail_reasons + (fail_reason,),
         last_probe_ts=ts,
         run_started_ts=base.run_started_ts or ts,
+        from_login=base.from_login or is_login,
     )
     layers = _with_layer(state, layer, ev)
 

@@ -324,7 +324,7 @@ def get_state(conn: sqlite3.Connection, track: str = "main") -> MonitorState:
             name: LayerEvidence(
                 consecutive=d.get("n", 0), confidence=d.get("c", 0),
                 fail_reasons=tuple(d.get("r", ())), last_probe_ts=d.get("t"),
-                run_started_ts=d.get("s"),
+                run_started_ts=d.get("s"), from_login=d.get("l", False),
             )
             for name, d in json.loads(raw).items()
         }
@@ -352,7 +352,7 @@ def get_state(conn: sqlite3.Connection, track: str = "main") -> MonitorState:
 def set_state(conn: sqlite3.Connection, state: MonitorState, track: str = "main") -> None:
     layers_json = json.dumps({
         name: {"n": e.consecutive, "c": e.confidence, "r": list(e.fail_reasons),
-         "t": e.last_probe_ts, "s": e.run_started_ts}
+         "t": e.last_probe_ts, "s": e.run_started_ts, "l": e.from_login}
         for name, e in state.layers.items()
     })
     conn.execute(
