@@ -565,3 +565,62 @@ Reviewing the above before pushing, the `totp_field()` hedge turned out to be un
 - The picker offers `send a text ...`, two `call phone number ...` rows, **and** `send code to authenticator`. So an authenticator factor is offered, which makes capturing a `TOTP_SECRET` look feasible -- but the button existing is not proof the account is enrolled.
 
 **Also traced and not fixed -- new backlog item.** An exception raised inside a cycle (as a Playwright strict-mode violation would be, if a redesign ever made two locator alternatives match at once) is not caught anywhere: `submit_totp()`'s `except AssertionError` wraps only the visibility wait, `_run_full_login()` and `guarded_cycle()` have no handler, and the cycle is launched fire-and-forget via `asyncio.create_task`. The exception dies in an orphaned task, **no `cycles` or `checks` row is written for that cycle (Rule 6), and the state machine never sees a failure so the verdict stays UP.** Silent blindness, structurally the same shape as the `MAX_LOGINS_PER_DAY` hole v3.9 closed. Independent of the locators; worth a guard.
+
+## Sign-in track: D1 decided, and the first two fixes -- 2026-09-07
+
+A week of live running (08-31 → 09-07) produced **three CONFIG_ERROR latches totalling ~21 hours
+blind, and one stuck DOWN of 12h 36m**. Reviewed end to end; none of the four was a real
+configuration problem. Full analysis and every issue reference live in `personal/ISSUES.md`
+(gitignored) -- this entry is the tracked summary.
+
+**[D1] DECIDED: a timeout, or any unrecognised screen, is never a config verdict.** The decisive
+number: all-time, the only Config-class reasons ever emitted are `bot_challenge` (8) and
+`mfa_failed` (11, ten of them from the pre-`TOTP_SECRET` era where the latch was correct).
+**`auth_rejected` -- the one reason that genuinely means "a human must look" -- has never fired.**
+Every wrongful latch came from a blind fallback. Two of the three latches this week were the bank
+announcing an outage in plain English ("We are temporarily experiencing technical difficulties",
+"Login is currently unavailable. Please try again later.") recorded as our own misconfiguration.
+Config-class becomes an allowlist: returned only when a configured pattern positively matches, or
+when the monitor positively knows it cannot act. **Needs a CLAUDE.md amendment before the
+classification work; drafted but not yet applied.**
+
+**Landed this session (three commits):**
+
+- `673aa5f` -- the 2026-09-04 machine-parsed email rework, which was sitting uncommitted in the
+  working tree, committed **separately and unmodified** so it is not mixed into the work below.
+  It has no tracker entry, and CLAUDE.md labels it `[B45]`, which collides with the tracker's
+  existing B45. Worth giving it a real ID.
+- `527fbf5` -- **[B64]** `clear_config_error.py` → `clear_config_error_and_stuck_down.py`. Clears
+  a stuck `DOWN` as well as a `CONFIG_ERROR`, closes the open incident **by id**, and derives
+  `ended_at` from the probe record rather than the clock. On the 09-04 incident that yields
+  9m 42s; closing at repair time would have written 64 hours of outage that never happened.
+  Dry-run by default, `--track` required -- it can now clear a real outage, so a careless run
+  must do nothing.
+- `da00db2` -- **[B50] + [B45]** the auth track keeps **one layer**. `run_journey` reports
+  `layer="authed"` at every stage. `render` asks "does the login page work?", which is the main
+  track's question; the journey passes *through* the login page as a means, not as its question.
+  Filing that observation on the auth track put evidence on a layer that track can never record a
+  pass against -- 22 such rows in the whole history, all failures, zero passes -- so a DOWN
+  landing on it could not be closed at any duration. Shipped with two required companions: the
+  recovery rule (a DOWN whose evidence includes a failed login only *starts* recovering on a
+  successful login) and B45's burst fix (calls the cheap check directly, and stops rather than
+  spinning when there is no usable session -- that spinning made single cycles 3h 19m and 4h 25m
+  long on 09-06 while holding the cycle lock).
+
+**Tests 188 → 206.** Both new files were validated the project's way, by running them against
+pre-fix code: three of the nine B50/B45 tests fail without the change.
+
+**Sensitivity, measured rather than assumed.** Merging the two tallies makes alarms slightly more
+likely. Replayed over 08-31 → 09-07 with a single merged tally: exactly one run reaches the floor
+-- 09-04's -- firing ~7 minutes earlier, on the correct layer, and clearing itself. No new alarms
+on real data.
+
+**Next, in order:** record the on-screen failure message + stop swallowing screenshot capture
+failures; then the wrong-password capture drill (Rule 12 -- `ERROR_BANNER_TEXT` is currently a
+guess no DOM dump has ever confirmed); then the classification rewrite plus a credential breaker,
+which is where the CLAUDE.md amendment is needed.
+
+**Known and unfixed, relevant to anyone reading this next:** the main track's `REQUIRED_TEXT` is
+the RTN footer sentence, which is present on pages where the login form is not -- on 09-04 the
+render check passed every minute while five consecutive logins could not find the username box.
+So "can the login form load?" is currently verified properly by nobody. Not filed yet.
