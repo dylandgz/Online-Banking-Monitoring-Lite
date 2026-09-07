@@ -78,7 +78,7 @@ Cheapest → strongest. Each proves strictly more than the one above it.
 
 `AUTHED_URL` is navigated **directly** — configured, never derived from `LOGIN_URL`. The login route and the authed-home route have different dependencies (auth service / MFA / login UI / Cloudflare vs. plain session-cookie validation), so they are independent evidence.
 
-A **full login** (`run_journey`: credentials → MFA → authed assertion → optional logout) is only ever the budgeted recovery path. It emits `nav_error`/`element_missing` at `layer="render"` before credentials are submitted, and `auth_rejected` · `bot_challenge` · `mfa_failed` · `element_missing` · `logout_failed` at `layer="authed"` after.
+A **full login** (`run_journey`: credentials → MFA → authed assertion → optional logout) is only ever the budgeted recovery path. Every outcome it reports is `layer="authed"`, at every stage: `nav_error`/`element_missing` before credentials are submitted, and `auth_rejected` · `bot_challenge` · `mfa_failed` · `element_missing` · `logout_failed` after. **[B50 / 2026-09-07]** It used to report `layer="render"` for the pre-credential failures. That put auth-track evidence on a layer this track can never record a *pass* on — `render` is the main track's question and is answered by its own probe every minute — so a DOWN landing on it could never be closed (12 h 36 m on 2026-09-04). The stage it failed at is still recorded, in `fail_reason` + `page_url`.
 
 ## The two tracks
 

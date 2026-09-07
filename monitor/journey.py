@@ -526,13 +526,29 @@ async def capture_masked_screenshot(
 # Every non-success arrow becomes one specific fail_reason, reported the same way every
 # other check layer reports failure: a CheckResult, no I/O beyond the screenshot.
 #
-# layer="render" for anything that fails before credentials are ever submitted (only the
-# login page's render was actually exercised); layer="authed" from submit_credentials
-# onward (the authed layer was engaged, pass or fail) -- matches CheckResult.layer's
-# meaning of "the strongest layer this probe actually evaluated," used elsewhere in
-# check.py. [v3.8] "authed" is the layer name; "auth" remains the track name (state/
-# incidents/login_events) -- the two are spelled differently on purpose so log lines
-# and dashboard columns are never ambiguous about which one they mean.
+# [B50 / 2026-09-07] EVERY outcome of this journey is layer="authed", at every stage.
+#
+# It used to report layer="render" for anything failing before credentials were submitted, on
+# the reasoning that only the login page's render had been exercised. That reading of
+# CheckResult.layer ("the strongest layer this probe actually evaluated") is defensible as a
+# DESCRIPTION and fatal as a TALLY KEY, which is what main.py feeds it to.
+#
+# `render` asks "does the login page work?" -- the MAIN track's question, answered by its own
+# probe every 60s. This journey passes THROUGH the login page as a means, not as its question.
+# Filing that observation in the auth track's scorecard put evidence on a layer that track can
+# never record a success against: run_authed_check always reports "authed", and every ok=True
+# return below is "authed", so `render` on this track was a write-only-when-broken label. The
+# state machine only lets a pass of the CAUSING layer close an incident, so a DOWN that landed
+# on it waited forever -- 12h 36m on 2026-09-04, with the authed check passing every minute.
+# Measured over the whole history: 22 auth-track `render` rows, all failures, zero passes.
+#
+# Nothing diagnostic is lost. WHERE it failed is still in fail_reason plus page_url
+# (/login/consumer vs /app/home), and browser_mode marks it as the journey. What is gained is
+# that one name now carries both directions, so the pass that follows a failure can clear it.
+#
+# [v3.8] "authed" is the layer name; "auth" remains the track name (state/incidents/
+# login_events) -- spelled differently on purpose so log lines and dashboard columns are never
+# ambiguous about which one they mean.
 
 def _same_route(url_a: str, url_b: str) -> bool:
     """Do two URLs point at the same scheme+host+path? Query and fragment are ignored --
@@ -719,7 +735,7 @@ async def run_journey(
                     await page.goto(login_url, timeout=browser_timeout_ms)
                 except (PatchrightTimeoutError, PatchrightError):
                     latency_ms = (time.monotonic() - start) * 1000
-                    return await _fail(page, "render", "nav_error", "navigate", latency_ms,
+                    return await _fail(page, "authed", "nav_error", "navigate", latency_ms,
                                         artifacts_dir, mask_patterns, masking_enabled)
 
                 # "Wait for real content" is folded into waiting for the login form
@@ -731,7 +747,7 @@ async def run_journey(
                     await username_field(page).first.wait_for(state="visible", timeout=browser_timeout_ms)
                 except (PatchrightTimeoutError, PatchrightError):
                     latency_ms = (time.monotonic() - start) * 1000
-                    return await _fail(page, "render", "element_missing", "login_form", latency_ms,
+                    return await _fail(page, "authed", "element_missing", "login_form", latency_ms,
                                         artifacts_dir, mask_patterns, masking_enabled)
 
                 await submit_credentials(page, login_user, login_password, browser_timeout_ms)
@@ -802,10 +818,9 @@ async def run_journey(
             finally:
                 await page.close()
     except (PatchrightTimeoutError, PatchrightError) as exc:
-        # layer="authed": anything reaching here got past the two explicitly-guarded
-        # pre-credential steps above (both of which report layer="render" themselves), so
-        # the authed layer was already engaged. No screenshot -- the page may not exist or
-        # may be the very thing that failed.
+        # layer="authed", like every other outcome of this journey -- see the block above
+        # run_journey for why the auth track keeps one layer. No screenshot: the page may not
+        # exist, or may be the very thing that failed.
         latency_ms = (time.monotonic() - start) * 1000
         return CheckResult(ok=False, http_status=None, latency_ms=latency_ms,
                            fail_reason=unexpected_fail_reason(exc), layer="authed")
