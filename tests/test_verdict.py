@@ -61,48 +61,93 @@ def test_severity_ladder_puts_down_on_top_and_never_raises():
 # email_gmail imports config at module scope, so these run against whatever .env is
 # present; only the wording fragments are asserted, never the target name.
 
-def test_down_email_uses_rule_4_wording_not_the_raw_layer_name():
+def test_down_email_names_the_layer_in_business_terms():
     from monitor.channels.email_gmail import down_message
 
-    # [B44] Email now uses plain-English layer descriptions instead of the locked technical wording.
-    # Rule 10 is still satisfied -- the layer IS named, just in customer-friendly language.
+    # [B45] Rule 10 is satisfied by the SERVICE/DESCRIPTION lines, in customer terms --
+    # the email never prints a layer name, a fail_reason, or a probe count.
     precursor = down_message(DownEvent(
         since_ts="2026-08-11T14:00:00+00:00", confidence=4,
         fail_reasons=("dns", "dns"), trigger_layer="pulse",
     ))
-    assert "website not responding" in precursor  # plain English for pulse
-    assert "Checked 2 times" in precursor
-    assert "pulse failed" not in precursor  # the pre-v3.8 phrasing
+    assert "Online Banking Website" in precursor
+    assert "website is not responding" in precursor
+    assert "pulse" not in precursor          # no layer name leaks to a business reader
+    assert "dns" not in precursor            # nor a fail_reason -- the screenshot carries detail
+    assert "Checked 2 times" not in precursor  # probe count removed
 
     authed = down_message(DownEvent(
         since_ts="2026-08-11T14:00:00+00:00", confidence=4,
         fail_reasons=("nav_error",) * 4, trigger_layer="authed",
     ))
-    assert "not loading after sign-in" in authed  # plain English for authed
+    assert "Online Banking Account Access" in authed
+    assert "not loading after sign-in" in authed
+
+
+def test_down_email_subject_is_pipe_delimited_and_eastern():
+    """[B45] The Power Automate contract: five subject fields, and a time in Eastern rather
+    than the raw UTC slice the pre-B45 subject printed."""
+    from monitor.channels.email_gmail import _build_down_subject
+
+    subject = _build_down_subject(DownEvent(
+        since_ts="2026-09-01T18:32:15+00:00", confidence=4,
+        fail_reasons=("dns",) * 4, trigger_layer="pulse", target_name="Example FCU",
+    ))
+    tag, status, service, stamp = subject.split("|")
+    assert tag == "[OLB MONITOR LITE]"
+    assert status == "DOWN"
+    assert service == "Example FCU Online Banking"
+    assert stamp == "2026-09-01 14:32:15 EDT"   # 18:32 UTC is 14:32 EDT
+
+
+def test_down_and_recovery_bodies_carry_the_same_fixed_keys():
+    """[B45] One Power Automate parser reads both, so both emit every key in one order --
+    N/A where the key does not apply rather than the key being omitted."""
+    from monitor.channels.email_gmail import _build_down_body, _build_recovery_body
+
+    keys = ["MONITOR:", "STATUS:", "SERVICE:", "DESCRIPTION:",
+            "START_TIME:", "END_TIME:", "DURATION:", "URL:", "SOURCE:"]
+
+    down = _build_down_body(DownEvent(
+        since_ts="2026-09-01T18:32:15+00:00", confidence=4,
+        fail_reasons=("dns",) * 4, trigger_layer="pulse",
+    ))
+    recovery = _build_recovery_body(RecoveryEvent(
+        since_ts="2026-09-01T18:32:15+00:00", ended_at="2026-09-01T18:47:45+00:00",
+        duration_s=930, confidence=4, fail_reasons=("dns",), trigger_layer="pulse",
+    ))
+    for body in (down, recovery):
+        positions = [body.index(k) for k in keys]      # raises if a key is missing
+        assert positions == sorted(positions)          # and the order is the contract
+
+    assert "END_TIME: N/A" in down and "DURATION: N/A" in down   # incident still open
+    assert "END_TIME: 2026-09-01 14:47:45 EDT" in recovery
+    assert "DURATION: 15m 30s" in recovery
 
 
 def test_down_email_still_sends_for_an_unmapped_layer():
     from monitor.channels.email_gmail import down_message
 
-    # [B44] Unmapped layers still produce an email (not suppressed), with a fallback description.
+    # [B45] Unmapped layers still produce an email (not suppressed), with a fallback description.
     body = down_message(DownEvent(
         since_ts="2026-08-11T14:00:00+00:00", confidence=4,
         fail_reasons=("timeout",), trigger_layer="something_new",
     ))
-    assert "online banking not available" in body  # fallback for unmapped layer
-    assert "Online Banking DOWN" in body  # subject still clear
+    assert "Online Banking is not available." in body   # fallback description
+    assert "|DOWN|" in body                             # subject still machine-readable
 
 
 def test_recovery_email_copy():
     from monitor.channels.email_gmail import recovery_message
 
+    # trigger_layer is Optional on RecoveryEvent; the fallback wording must still render.
     body = recovery_message(RecoveryEvent(
         since_ts="2026-08-11T14:00:00+00:00", ended_at="2026-08-11T14:07:30+00:00",
         duration_s=450, confidence=4, fail_reasons=("dns",),
     ))
-    # [B44] Recovery uses plain English and customer-friendly wording
-    assert "Online Banking Recovered" in body
-    assert "outage lasted 7m 30s" in body
+    assert "|RECOVERED|" in body
+    assert "DURATION: 7m 30s" in body
+    assert "Online Banking is available again." in body
 
 
 def test_config_error_goes_to_admin_email(monkeypatch):

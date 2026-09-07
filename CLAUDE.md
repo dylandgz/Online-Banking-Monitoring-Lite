@@ -103,7 +103,7 @@ The dashboard banner and `/api/status` speak platform-level, and always name the
 
 The operator must never need a browser to know which wall failed. The wording lives in `monitor/verdict.py` and nowhere else. `fail_layer='monitor'` deliberately returns `None` — our own bug never gets operator phrasing.
 
-**[B44]** Email alerts use plain-English layer descriptions instead (e.g., "website not responding", "not loading after sign-in"), satisfying Rule 10's intent while optimizing for the customer-facing context of email. See [Email copy](#email-copy-b44).
+**[B45]** DOWN/RECOVERED email alerts do not use this wording. They are a machine-parsed format read by a Power Automate flow that renders a Teams card, so they name the layer through their `SERVICE`/`DESCRIPTION` lines in business terms. See [Email copy](#email-copy-b45).
 
 ## Failure classification
 
@@ -287,30 +287,61 @@ Connections open with `PRAGMA journal_mode=WAL` and `busy_timeout=15000` — rol
 
 Dashboard log is one row per minute: three layer badges (pulse / render / authed), verdict, session-reused marker, burst badge when applicable. Failed cycles expand to their probes. Bursts are first-class and cannot be hidden. Only DOWN wears alarm red; CONFIG_ERROR and DEGRADED are gold.
 
-## Email copy [B44]
+## Email copy [B45]
 
-[B44 / 2026-08-31] Redesigned for customer-friendly language and operational clarity. Emails are now multipart MIME with plain-text body + screenshot attachment on DOWN events. Rule 10 "every DOWN names its layer" is satisfied by plain-English layer descriptions rather than locked technical wording.
+[B45 / 2026-09-04] DOWN and RECOVERED emails are a **machine-parsed format**, not prose. A Power Automate flow in M365 reads them and renders a Teams card, so the subject's field order and the body's key names are a contract — changing either breaks the card. Treat this section as a schema.
 
-**Subject lines** always name the platform and layer clearly:
+Both events emit a multipart MIME message: plain-text body, plus the screenshot attachment on DOWN. Rule 10 "every DOWN names its layer" is satisfied by the `SERVICE` and `DESCRIPTION` lines, which name the failed layer the way a business reader would name it.
 
-| Scenario | Subject |
-|---|---|
-| Login page unreachable or broken | `[MONITOR] {name} Online Banking DOWN — website not responding` |
-| Sign-in form not loading | `[MONITOR] {name} Online Banking DOWN — sign-in page not loading` |
-| Account area not loading (authed) | `[MONITOR] {name} Online Banking DOWN — not loading after sign-in` |
-| Recovered from outage | `[MONITOR] {name} Online Banking Recovered` |
-| Configuration error | `[MONITOR-CONFIG] {name} needs attention` |
+**Subject — four pipe-delimited fields:**
 
-**Body text** (plain-text part) includes:
-- Monitor identification: "This is Online Banking Monitor Lite — a monitor built by [team names] from [org]."
-- Customer-facing symptom in plain English (what they would experience)
-- When it started (Eastern time) and how long ago
-- How many checks failed in a row
-- What the checks showed (translated to plain English, e.g., "the server did not respond in time" not "timeout")
-- The URL that was being monitored
-- For DOWN events: screenshot attachment (masked for PII per Rule 16)
+```
+[OLB MONITOR LITE]|{STATUS}|{TARGET_NAME} Online Banking|{Eastern stamp}
+```
 
-**Attachment (DOWN events only):** One screenshot from the failed check, named with Eastern timestamp and layer (e.g., `20260831T103205-0400_authed_check.png`).
+`STATUS` is `DOWN` or `RECOVERED`. The stamp is `to_eastern_without_offset()` — `2026-09-01 14:32:15 EDT`, Eastern with the zone abbreviation and no parenthetical, because the parenthetical would read as a fifth field. DOWN stamps the incident start; RECOVERED stamps its end.
+
+**Body — nine keys, always all nine, always this order.** A key that does not apply to the event carries `N/A` rather than being omitted, so one parser reads both event types without branching:
+
+```
+MONITOR: Online Banking Monitor Lite
+
+STATUS: DOWN
+
+SERVICE: {name} Online Banking Website
+
+DESCRIPTION:
+{name}'s website is not responding. Customers may be unable to access Online Banking.
+
+START_TIME: 2026-09-01 14:32:15 EDT
+
+END_TIME: N/A
+
+DURATION: N/A
+
+URL: https://...
+
+SOURCE: Teachers RPA Team
+```
+
+On DOWN, `END_TIME` and `DURATION` are `N/A` — the incident is still open. On RECOVERED all three time fields are filled.
+
+**`SERVICE` and `DESCRIPTION` are the only lines that vary by layer.** The wording lives in `monitor/verdict.py` (`email_service_name`, `email_description`) and nowhere else:
+
+| Layer | SERVICE | DOWN description |
+|---|---|---|
+| `pulse` | `{name} Online Banking Website` | website is not responding; customers may be unable to access Online Banking |
+| `render` | `{name} Online Banking Login Page` | sign-in page is not loading; customers reach the site but the login form never appears |
+| `authed` | `{name} Online Banking Account Access` | not loading after sign-in; customers sign in but accounts do not appear |
+| unmapped / `None` | `{name} Online Banking` | Online Banking is not available |
+
+The fallback row is load-bearing, not padding: `RecoveryEvent.trigger_layer` is `Optional`, so an alert must still send with vaguer wording rather than not send at all.
+
+**What the email deliberately does NOT contain:** no layer name, no `fail_reason`, no probe count. The audience is business readers on a Teams card; the screenshot and the dashboard carry the diagnostic detail. `URL` follows the failed layer — `AUTHED_URL` for `authed`, `TARGET_URL` otherwise, since the authed check navigates `AUTHED_URL` directly and naming `TARGET_URL` there would cite a page that was never probed.
+
+**Attachment (DOWN only):** one screenshot from the failed check, named with an Eastern timestamp and layer (e.g. `20260831T103205-0400_authed_check.png`), masked for PII per Rule 16.
+
+**CONFIG_ERROR email is out of this format** and keeps its pre-B45 prose subject and body — it goes to `ADMIN_EMAIL` only, is not a customer-facing outage, and never pages.
 
 One DOWN email and one RECOVERY email per incident, ever. One CONFIG-ERROR email per transition to CONFIG_ERROR state, never re-emitting while latched.
 
