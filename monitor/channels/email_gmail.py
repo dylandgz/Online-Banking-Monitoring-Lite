@@ -9,8 +9,8 @@ from pathlib import Path
 import config
 from monitor.channels.base import AlertChannel, AlertEvent
 from monitor.state import ConfigErrorEvent, DownEvent, RecoveryEvent
-from monitor.timeutil import to_eastern
-from monitor.verdict import email_layer_body, email_layer_subject, email_reason_text
+from monitor.timeutil import to_eastern, to_eastern_without_offset
+from monitor.verdict import email_description, email_service_name
 
 
 def _parse_email_list(emails_str: str) -> list:
@@ -28,87 +28,80 @@ def _format_duration(duration_s: int) -> str:
     return f"{seconds}s"
 
 
-def _format_time_ago(ts: str) -> str:
-    """Convert ISO timestamp to human-readable 'X minutes ago' format."""
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc)
-    started = datetime.fromisoformat(ts)
-    diff = (now - started).total_seconds()
+# The fixed body keys, in emission order. Every DOWN and RECOVERED email carries all of
+# them so one Power Automate parser reads both without branching on STATUS; a key that does
+# not apply to the event carries NOT_APPLICABLE rather than being omitted.
+MONITOR_NAME = "Online Banking Monitor Lite"
+ALERT_SOURCE = "Teachers RPA Team"
+NOT_APPLICABLE = "N/A"
 
-    if diff < 60:
-        return f"{int(diff)} seconds ago"
-    minutes, _ = divmod(int(diff), 60)
-    if minutes < 60:
-        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours} hour{'s' if hours != 1 else ''}, {minutes} minute{'s' if minutes != 1 else ''} ago"
+
+def _default_url(fail_layer) -> str:
+    """The URL the failed layer was actually looking at. The authed check navigates
+    AUTHED_URL directly (never derived from LOGIN_URL), so an authed alert that printed
+    TARGET_URL would name a page that was never probed."""
+    if fail_layer == "authed" and config.AUTHED_URL:
+        return config.AUTHED_URL
+    return config.TARGET_URL
+
+
+def _build_subject(status: str, target_name: str, stamp_eastern: str) -> str:
+    """Pipe-delimited so a Power Automate trigger can split the subject into fields
+    without parsing prose. Field 2 is the machine-readable status."""
+    return f"[OLB MONITOR LITE]|{status}|{target_name} Online Banking|{stamp_eastern}"
+
+
+def _build_body(*, status: str, service: str, description: str,
+                start_time: str, end_time: str, duration: str, url: str) -> str:
+    """The fixed nine-key body. Order and key names are the contract the Teams flow parses
+    -- changing either breaks the card, so treat this like a schema, not like copy."""
+    return "\n".join([
+        f"MONITOR: {MONITOR_NAME}", "",
+        f"STATUS: {status}", "",
+        f"SERVICE: {service}", "",
+        "DESCRIPTION:", description, "",
+        f"START_TIME: {start_time}", "",
+        f"END_TIME: {end_time}", "",
+        f"DURATION: {duration}", "",
+        f"URL: {url}", "",
+        f"SOURCE: {ALERT_SOURCE}",
+    ])
 
 
 def _build_down_subject(event: DownEvent) -> str:
-    """Build the DOWN email subject line."""
     target = event.target_name or config.TARGET_NAME
-    layer_desc = email_layer_subject(event.trigger_layer)
-    # Extract time from ISO timestamp (e.g., "2026-08-11T14:00:00+00:00" -> "14:00")
-    time_part = event.since_ts[11:16] if len(event.since_ts) > 10 else ""
-    return f"[MONITOR] {target} Online Banking DOWN — {layer_desc} {time_part}".strip()
+    return _build_subject("DOWN", target, to_eastern_without_offset(event.since_ts))
 
 
 def _build_down_body(event: DownEvent) -> str:
-    """Build the DOWN email body text (plain text part of multipart)."""
     target = event.target_name or config.TARGET_NAME
-    layer_desc = email_layer_body(event.trigger_layer)
-    time_ago = _format_time_ago(event.since_ts)
-    started_eastern = to_eastern(event.since_ts)
-
-    # Reason: if there's only one fail_reason repeated, say "checked X times";
-    # otherwise list the distinct reasons
-    if event.fail_reasons:
-        first_reason = event.fail_reasons[0]
-        reason_text = email_reason_text(first_reason)
-        check_count = len(event.fail_reasons)
-    else:
-        reason_text = "unknown"
-        check_count = 0
-
-    lines = [
-        "This is Online Banking Monitor Lite — a monitor built by Francisco and Dylan from Teachers RPA team.",
-        "",
-        f"{target}'s {layer_desc}",
-        "",
-        f"Started {started_eastern}, {time_ago}.",
-        "",
-        f"Checked {check_count} times in a row — {reason_text}.",
-        "",
-        f"URL: {event.page_url or config.TARGET_URL}",
-    ]
-
-    return "\n".join(lines)
+    return _build_body(
+        status="DOWN",
+        service=email_service_name(event.trigger_layer, target),
+        description=email_description(event.trigger_layer, target),
+        start_time=to_eastern_without_offset(event.since_ts),
+        end_time=NOT_APPLICABLE,   # the incident is open; it has no end yet
+        duration=NOT_APPLICABLE,
+        url=event.page_url or _default_url(event.trigger_layer),
+    )
 
 
 def _build_recovery_subject(event: RecoveryEvent) -> str:
-    """Build the RECOVERY email subject line."""
     target = event.target_name or config.TARGET_NAME
-    # Extract time from ISO timestamp (e.g., "2026-08-11T14:07:30+00:00" -> "14:07")
-    time_part = event.ended_at[11:16] if len(event.ended_at) > 10 else ""
-    return f"[MONITOR] {target} Online Banking Recovered {time_part}".strip()
+    return _build_subject("RECOVERED", target, to_eastern_without_offset(event.ended_at))
 
 
 def _build_recovery_body(event: RecoveryEvent) -> str:
-    """Build the RECOVERY email body text."""
     target = event.target_name or config.TARGET_NAME
-    duration_text = _format_duration(event.duration_s)
-
-    lines = [
-        "This is Online Banking Monitor Lite — a monitor built by Francisco and Dylan from Teachers RPA team.",
-        "",
-        f"{target}'s online banking has recovered and is now loading normally.",
-        "",
-        f"The outage lasted {duration_text}.",
-        "",
-        f"URL: {event.page_url or config.TARGET_URL}",
-    ]
-
-    return "\n".join(lines)
+    return _build_body(
+        status="RECOVERED",
+        service=email_service_name(event.trigger_layer, target),
+        description=email_description(event.trigger_layer, target, recovered=True),
+        start_time=to_eastern_without_offset(event.since_ts),
+        end_time=to_eastern_without_offset(event.ended_at),
+        duration=_format_duration(event.duration_s),
+        url=event.page_url or _default_url(event.trigger_layer),
+    )
 
 
 def _build_config_subject(event: ConfigErrorEvent) -> str:
