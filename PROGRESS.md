@@ -624,3 +624,58 @@ which is where the CLAUDE.md amendment is needed.
 the RTN footer sentence, which is present on pages where the login form is not -- on 09-04 the
 render check passed every minute while five consecutive logins could not find the username box.
 So "can the login form load?" is currently verified properly by nobody. Not filed yet.
+
+## Sign-in classification rework complete -- 2026-09-08
+
+Six commits. The plan set out on 09-07 is finished bar two live drills. Full detail lives in
+`personal/ISSUES.md` (gitignored); this is the tracked summary.
+
+**What shipped**
+
+- `695375b` -- **[D1] Config-class becomes an allowlist.** Both blind fallbacks are gone.
+  `classify_after_submit` and `classify_after_totp` now answer "did sign-in progress?" from the
+  markers that mean progress; everything unrecognised is platform evidence that scores and does
+  not halt the track. Banner text only ever *downgrades* an outcome, via the configured
+  `AUTH_REJECTED_TEXT` -- confirmed against captured markup from the 09-08 wrong-password drill,
+  where the live banner reads "The Username and/or Password you entered does not match our
+  records. Try again." `MFA_REJECTED_TEXT` ships EMPTY because no capture of a refused code
+  exists and Rule 12 forbids guessing one. **`bot_challenge` is now emitted by nothing.**
+  Also [B27]: a login that succeeds with no step-up is recognised rather than latched.
+  Also **[B62] the credential breaker** -- 5 consecutive failed logins halts logins whatever the
+  cause, above the probe floor so DOWN pages first, with a 600s cooldown so the track cannot
+  freeze at DOWN after the platform recovers.
+- `5c44ecf` -- **[B41] BLIND.** No *passing* authed check for 15 minutes sends one admin email,
+  one escalation at 2 hours, one on recovery. Deliberately a notification and never a verdict --
+  it is a statement about the monitor, not the platform, so it stays out of the severity ladder,
+  `uptime_pct` and the CSV. Fires even when the host was asleep, by explicit choice.
+- `9c625d6`, `d7a00f6` -- what the page *said* is recorded (not just a reason code), screenshot
+  capture failures are no longer silent, the SMTP socket is bounded at 30s (it was unbounded
+  inside the cycle lock -- B42's mechanism), and a cleared CONFIG_ERROR no longer mails every
+  recipient that an outage recovered.
+- `527fbf5`, `da00db2` -- the clear tool, and the auth track's single layer (earlier entry).
+- Config only: the main track's render marker moved from the RTN footer sentence to the **Login
+  button**. The footer text is present on pages where sign-in is broken, so render was not
+  proving the login form existed -- observed 09-04, when render passed every minute while five
+  consecutive logins could not find the username box.
+
+**Tests 206 -> 253.** Every new file was validated by running it against pre-fix code first.
+
+**Fault injection, 09-08.** Three incidents were injected against the real target by pointing a
+marker at a name that does not exist -- #24/#25 (auth, 5m46s / 5m14s) and #26 (main, 3m06s). All
+three opened, paged and **closed themselves**. **These are test artifacts in the audit record,
+not outages.** They confirm detection, bursts, the floor, the incident lifecycle, recovery,
+screenshots, the alert path, and that a burst consumes zero logins.
+
+**What they did NOT confirm, stated plainly:** the relabel, the classification rewrite and B50's
+recovery gate are all still unexercised live -- the injected failures were the wrong shape to
+reach them. Two drills remain, recorded in the tracker: point `LOGIN_URL` at a page with no
+username box, and submit a deliberately wrong TOTP code.
+
+**Dropped deliberately.** B47's fix 3 (back off rather than latch) is superseded by D1: every
+Config-class outcome still reachable is one a retry cannot fix, and for `auth_rejected` a retry
+would fight Rule 4. The part worth keeping moved onto D2 (keep the zero-login cheap check running
+while latched) and is deferred.
+
+**Still open and worth knowing:** B42 (dispatch off the cycle lock -- the SMTP timeout bounds it
+but does not fix it), B58 (an unset `ADMIN_EMAIL` silences the channel entirely, which now also
+silences BLIND), B5/D2 above, and B46 (a restart produces either a DEGRADED row or no row at all).
