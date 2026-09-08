@@ -235,6 +235,7 @@ def _split_main_probe(row: dict, cycle: dict) -> list[dict]:
         # The browser leg produces these; the pulse is a plain HTTP GET.
         page_url=None,
         screenshot_path=None,
+        evidence_text=None,
     )
 
     render_line = dict(row)
@@ -280,7 +281,7 @@ _EXPORT_COLUMNS = {
         ("latency_ms", "latency_ms"), ("fail_reason", "fail_reason"), ("browser_mode", "browser_mode"),
         ("layer", "layer"), ("burst_id", "burst_id"), ("cycle_id", "cycle_id"),
         ("page_url", "page_url"), ("screenshot_path", "screenshot_path"),
-        ("scored", "scored"),
+        ("evidence_text", "evidence_text"), ("scored", "scored"),
     ],
 }
 

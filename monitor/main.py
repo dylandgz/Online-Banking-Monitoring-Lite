@@ -70,6 +70,8 @@ async def _process_probe(
         # to disk and its location discarded here.
         page_url=result.page_url,
         screenshot_path=result.screenshot_path,
+        # [B63] What the page said, for the operator. Never read by any classifier.
+        evidence_text=result.evidence_text,
     )
     status = "OK" if result.ok else f"FAIL ({result.fail_reason}, layer={result.layer})"
     shot = f" screenshot={result.screenshot_path}" if result.screenshot_path else ""

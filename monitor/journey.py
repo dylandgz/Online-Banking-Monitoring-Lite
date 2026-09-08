@@ -504,9 +504,17 @@ async def capture_masked_screenshot(
             mask_locators = []
 
         await page.screenshot(path=path, mask=mask_locators, full_page=True)
-    except (PatchrightTimeoutError, PatchrightError, OSError, re.error):
+    except (PatchrightTimeoutError, PatchrightError, OSError, re.error) as exc:
         # re.error: an invalid regex in MASK_TEXT (unvalidated .env free text), raised by
         # re.compile above. OSError: unwritable artifacts_dir.
+        #
+        # [B65] Swallowing stays -- losing the image must never cost the CheckResult that
+        # describes the failure. The SILENCE was the defect. On the night of 2026-09-04 all
+        # eleven real failures returned None here and nothing recorded that, or why: the
+        # DOWN email went out with no attachment, and the evidence work of B16/B35 produced
+        # nothing on the night it was most needed.
+        print(f"[journey] screenshot capture failed for {step}/{fail_reason}: "
+              f"{type(exc).__name__}: {exc}", flush=True)
         return None
     return path
 
@@ -633,6 +641,43 @@ def safe_page_url(page: Page) -> Optional[str]:
         return None
 
 
+# [B63] How much of an on-screen message is worth keeping. Long enough for a bank's error
+# sentence, short enough that a runaway page cannot bloat every row in the audit table.
+_EVIDENCE_TEXT_MAX = 300
+
+
+async def _visible_alert_text(page: Page) -> Optional[str]:
+    """The first meaningful alert on the page, or None. Best effort, never raises.
+
+    Uses role="alert", the accessibility standard for error banners, and the same technique
+    classify_after_totp already applies successfully against this target -- on 2026-09-06 it
+    read "Login is currently unavailable. Please try again later." and then discarded it,
+    which is what made that 13.7-hour blind spot undiagnosable from the record alone.
+
+    Empty text is skipped deliberately: the one role="alert" node in every captured DOM dump
+    of the authed shell is an empty sr-only live region, which would otherwise match and say
+    nothing. "verifying" is skipped for the same reason classify_after_totp skips it -- it is
+    a transient progress message, not an outcome."""
+    try:
+        alerts = page.get_by_role("alert")
+        for i in range(min(await alerts.count(), 5)):
+            element = alerts.nth(i)
+            if not await element.is_visible():
+                continue
+            text = " ".join(((await element.text_content()) or "").split())
+            if text and "verifying" not in text.lower():
+                return text[:_EVIDENCE_TEXT_MAX]
+    except Exception:  # noqa: BLE001 -- deliberately broad; see below
+        # Broader than safe_page_url's catch, on purpose. This runs on EVERY failure path and
+        # its entire job is a nicer log line. Anything escaping here would propagate out of
+        # _fail(), destroy the CheckResult that describes the actual failure, and surface as
+        # an unhandled exception -- which guarded_cycle records as DEGRADED, i.e. a real
+        # outage written down as a monitor bug. Caught during development by exactly that:
+        # an AttributeError from a page object that did not implement get_by_role.
+        return None
+    return None
+
+
 async def _fail(
     page: Page,
     layer: str,
@@ -657,6 +702,7 @@ async def _fail(
         fail_reason=fail_reason,
         screenshot_path=screenshot_path,
         page_url=safe_page_url(page),
+        evidence_text=await _visible_alert_text(page),
         layer=layer,
     )
 
