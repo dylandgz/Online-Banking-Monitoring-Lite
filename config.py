@@ -285,6 +285,58 @@ if _headroom < MIN_SESSION_HEADROOM_S:
 AUTH_DOWN_CONFIDENCE = int(os.getenv("AUTH_DOWN_CONFIDENCE", "4"))
 AUTH_MIN_FAILED_PROBES = int(os.getenv("AUTH_MIN_FAILED_PROBES", "4"))
 
+# [D1 / 2026-09-08] Patterns that POSITIVELY identify a rejection, semicolon-separated like
+# MASK_TEXT. These are the only lists whose absence changes a fail_reason's class: a screen
+# matching one is Config-class (halts logins, needs a human), and every screen matching none
+# is platform evidence that scores. Enumerating the bounded side and defaulting the unbounded
+# one is the whole of D1's decision -- the ways a bank can announce trouble are endless, the
+# ways it rejects a credential are few and capturable.
+#
+# AUTH_REJECTED_TEXT is confirmed against captured markup (Rule 12, data/dom_dumps
+# 2026-09-08): the live banner reads "The Username and/or Password you entered does not
+# match our records. Try again." and get_by_text matches on substring, so the short form is
+# both correct and resilient to the sentence around it being reworded.
+#
+# MFA_REJECTED_TEXT ships EMPTY on purpose. No capture of an MFA rejection exists, and Rule
+# 12 forbids guessing one. Until a drill produces it, every post-code failure this cannot
+# name is platform evidence rather than a latch -- which is the safe direction, and the
+# direction that would have avoided the 13.7-hour blind window of 2026-09-06.
+AUTH_REJECTED_TEXT = [p.strip() for p in os.getenv(
+    "AUTH_REJECTED_TEXT", "does not match our records").split(";") if p.strip()]
+MFA_REJECTED_TEXT = [p.strip() for p in os.getenv("MFA_REJECTED_TEXT", "").split(";") if p.strip()]
+
+# [Rule 5 / 2026-09-08] The credential breaker. N consecutive FAILED login attempts halts
+# logins regardless of why they failed -- screen-independent, so it covers screens nobody has
+# captured. It is what protects the account now that an unrecognised screen no longer halts
+# the track by being misread as a config error.
+MAX_CONSECUTIVE_LOGIN_FAILURES = int(os.getenv("MAX_CONSECUTIVE_LOGIN_FAILURES", "5"))
+
+# While tripped, one attempt is permitted per cooldown, resetting on the first success --
+# without it the track freezes at DOWN long after the platform recovers, because no logins
+# means no session, which means no cheap checks either.
+#
+# Deliberately NOT guarded against being shorter than LOGIN_INTERVAL_S. Both gates are
+# checked in sequence, so the longer one simply wins and a short cooldown is merely
+# ineffective, never dangerous. An earlier version exited on it and refused to start on
+# LOGIN_INTERVAL_S=3000 -- a configuration the guard tests use and the headroom rule allows.
+# Turning a benign setting into a refusal to boot is worse than the thing it guarded.
+LOGIN_BREAKER_COOLDOWN_S = int(os.getenv("LOGIN_BREAKER_COOLDOWN_S", "600"))
+
+# The ordering is load-bearing, not a sanity check. DOWN must fire BEFORE the monitor stops
+# trying, or the breaker silences the track at the exact moment it has the most evidence and
+# nobody is told an outage is underway. With the floor at 4 and the breaker at 5, failure 4
+# pages and failure 5 stops the spending.
+if MAX_CONSECUTIVE_LOGIN_FAILURES <= AUTH_MIN_FAILED_PROBES:
+    sys.exit(
+        f"MAX_CONSECUTIVE_LOGIN_FAILURES={MAX_CONSECUTIVE_LOGIN_FAILURES} must be greater "
+        f"than AUTH_MIN_FAILED_PROBES={AUTH_MIN_FAILED_PROBES}.\n"
+        "The breaker halts logins; the probe floor raises the alarm. If the breaker trips "
+        "first the auth track goes quiet with nobody paged -- which is the failure mode the "
+        "breaker exists to replace, reintroduced from the other direction. Shipped values "
+        "are AUTH_MIN_FAILED_PROBES=4 / MAX_CONSECUTIVE_LOGIN_FAILURES=5."
+    )
+
+
 
 def _collect_missing(*checks: tuple[bool, str]) -> list[str]:
     """Shared shape behind every "required .env values" check below: each check is

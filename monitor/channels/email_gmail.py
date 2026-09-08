@@ -8,7 +8,7 @@ from pathlib import Path
 
 import config
 from monitor.channels.base import AlertChannel, AlertEvent
-from monitor.state import ConfigErrorEvent, DownEvent, RecoveryEvent
+from monitor.state import ConfigErrorEvent, DownEvent, LoginBreakerEvent, RecoveryEvent
 from monitor.timeutil import to_eastern, to_eastern_without_offset
 from monitor.verdict import email_description, email_service_name
 
@@ -119,6 +119,32 @@ def _build_recovery_body(event: RecoveryEvent) -> str:
     )
 
 
+def _build_breaker_subject(event: LoginBreakerEvent) -> str:
+    """Prose and admin-only, deliberately outside the machine-parsed format: this is not an
+    outage report and must not render a Teams card."""
+    return (f"[MONITOR-CONFIG] {event.target_name or config.TARGET_NAME} sign-in attempts "
+            f"halted {to_eastern_without_offset(event.ts)}")
+
+
+def _build_breaker_body(event: LoginBreakerEvent) -> str:
+    status = event.track_status or "unchanged"
+    return (
+        f"The monitor has stopped attempting sign-ins after "
+        f"{event.consecutive_failures} consecutive failed attempts, to protect the account "
+        f"from repeated credential submission.\n"
+        f"\n"
+        f"Last failure:      {event.last_reason or 'unknown'}\n"
+        f"Sign-in status:    {status}\n"
+        f"Retrying:          one attempt every {event.cooldown_s // 60} minutes until one "
+        f"succeeds\n"
+        f"\n"
+        f"This is NOT a new outage report. If online banking is down you have already been "
+        f"alerted separately; this only explains why the sign-in checks go quiet from here. "
+        f"The sign-in status above is left exactly as the evidence found it -- it is not "
+        f"downgraded just because the monitor stopped trying."
+    )
+
+
 def _build_config_cleared_subject(event: RecoveryEvent) -> str:
     """[B59] Deliberately prose and admin-only, matching the CONFIG_ERROR alert it closes --
     NOT the machine-parsed RECOVERED format, which the Power Automate flow reads."""
@@ -193,6 +219,13 @@ class EmailGmailChannel(AlertChannel):
                 body = _build_recovery_body(event)
                 screenshot = None  # no screenshot for recovery
                 recipients = _parse_email_list(config.RECIPIENTS_EMAIL)
+        elif isinstance(event, LoginBreakerEvent):
+            if not config.ADMIN_EMAIL:
+                return  # admin-only, same routing as CONFIG_ERROR
+            subject = _build_breaker_subject(event)
+            body = _build_breaker_body(event)
+            screenshot = None
+            recipients = [config.ADMIN_EMAIL.strip()]
         elif isinstance(event, ConfigErrorEvent):
             if not config.ADMIN_EMAIL:
                 return  # ADMIN_EMAIL not configured; CONFIG_ERROR notifications disabled

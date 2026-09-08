@@ -3,9 +3,9 @@
 from abc import ABC, abstractmethod
 from typing import Union
 
-from monitor.state import ConfigErrorEvent, DownEvent, RecoveryEvent
+from monitor.state import ConfigErrorEvent, DownEvent, LoginBreakerEvent, RecoveryEvent
 
-AlertEvent = Union[DownEvent, RecoveryEvent, ConfigErrorEvent]
+AlertEvent = Union[DownEvent, RecoveryEvent, ConfigErrorEvent, LoginBreakerEvent]
 
 
 class AlertChannel(ABC):
