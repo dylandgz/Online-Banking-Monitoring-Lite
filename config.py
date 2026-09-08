@@ -322,6 +322,19 @@ MAX_CONSECUTIVE_LOGIN_FAILURES = int(os.getenv("MAX_CONSECUTIVE_LOGIN_FAILURES",
 # Turning a benign setting into a refusal to boot is worse than the thing it guarded.
 LOGIN_BREAKER_COOLDOWN_S = int(os.getenv("LOGIN_BREAKER_COOLDOWN_S", "600"))
 
+# [BLIND / 2026-09-08] How long the auth track may go without a PASSING check before the
+# monitor says so. Not a verdict and never written to cycles.verdict -- a statement about the
+# monitor, not the platform. Before this the monitor could only say "everything is fine" or
+# "the bank is down", with no way to say "I cannot currently tell you", and in the week of
+# 2026-08-31 that third state happened repeatedly and silently: three CONFIG_ERROR latches
+# and a 9.5-hour host suspend, none of which notified anyone.
+#
+# 900s is comfortably above anything legitimate -- the auth track normally reports every
+# minute and the longest honest quiet stretch is a burst at ~4 minutes.
+BLIND_AFTER_S = int(os.getenv("BLIND_AFTER_S", "900"))
+# 15 minutes and 13 hours deserve different reactions, so one escalation. More is noise.
+BLIND_ESCALATE_AFTER_S = int(os.getenv("BLIND_ESCALATE_AFTER_S", "7200"))
+
 # The ordering is load-bearing, not a sanity check. DOWN must fire BEFORE the monitor stops
 # trying, or the breaker silences the track at the exact moment it has the most evidence and
 # nobody is told an outage is underway. With the floor at 4 and the breaker at 5, failure 4

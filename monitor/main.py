@@ -15,8 +15,8 @@ import uvicorn
 import config
 from monitor import check, db, journey, session
 from monitor.channels import build_channels, dispatch
-from monitor.state import (ConfigErrorEvent, DownEvent, LoginBreakerEvent, MonitorState,
-                           RecoveryEvent, apply_check)
+from monitor.state import (BlindEvent, ConfigErrorEvent, DownEvent, LoginBreakerEvent,
+                           MonitorState, RecoveryEvent, apply_check)
 from monitor.timeutil import now_iso
 from monitor.verdict import severity, unified_verdict
 
@@ -604,6 +604,78 @@ def _cycle_fail_info(
     return "authed", fail_reason
 
 
+# [BLIND] One notification per episode plus one escalation, not one per cycle.
+_BLIND: dict = {"notified": False, "escalated": False}
+
+
+def _blind_reason(conn, auth_state: MonitorState | None) -> str:
+    """WHY the auth track has gone quiet, in the operator's terms. This line is what makes a
+    benign instance readable at a glance instead of alarming."""
+    if auth_state is None:
+        return "the sign-in track is not configured"
+    if auth_state.status == "CONFIG_ERROR":
+        return f"sign-in checks are halted ({', '.join(auth_state.fail_reasons) or 'config error'})"
+    streak, _ts, last_reason = _consecutive_login_failures(conn)
+    if streak >= config.MAX_CONSECUTIVE_LOGIN_FAILURES:
+        return (f"login attempts halted after {streak} consecutive failures "
+                f"(last: {last_reason})")
+    if not _GRACE["until"] and not _session_is_usable():
+        return "no usable session, and no login has succeeded to replace it"
+    if _GRACE["until"]:
+        return "the monitor was not running"
+    return "the sign-in check has not passed"
+
+
+async def _check_blind(conn, channels, auth_enabled: bool, auth_state, main_status: str) -> None:
+    """[BLIND / 2026-09-08] Alarm on the ABSENCE of positive evidence.
+
+    The monitor could previously say only "everything is fine" or "the bank is down". There
+    was no way to say "I cannot currently tell you" -- and in the week of 2026-08-31 that
+    third state occurred repeatedly and silently: three CONFIG_ERROR latches (~21 hours) and a
+    9.5-hour host suspend, none of which notified anyone.
+
+    Deliberately reads the newest PASSING authed probe, not the newest probe: a failing one,
+    and especially an inert synthetic session_expired, is the monitor recording that it wanted
+    to look and could not.
+
+    It fires even when the host was asleep. The monitor is meant to be running, so a suspend
+    is something to be told about rather than filtered out -- the reason line is what
+    distinguishes that from something alarming."""
+    if not auth_enabled:
+        return
+
+    last_pass = db.get_last_passing_authed_ts(conn)
+    if last_pass is None:
+        return  # nothing has ever passed; no baseline to be blind relative to
+
+    blind_for = (datetime.now(timezone.utc) - datetime.fromisoformat(last_pass)).total_seconds()
+
+    if blind_for < config.BLIND_AFTER_S:
+        if _BLIND["notified"]:
+            _BLIND.update(notified=False, escalated=False)
+            await dispatch(BlindEvent(
+                ts=now_iso(), since_ts=last_pass, blind_for_s=round(blind_for),
+                reason="a sign-in check passed again", recovered=True,
+                main_status=main_status, target_name=config.TARGET_NAME), channels)
+        return
+
+    escalating = (not _BLIND["escalated"]
+                  and blind_for >= config.BLIND_ESCALATE_AFTER_S
+                  and _BLIND["notified"])
+    if _BLIND["notified"] and not escalating:
+        return
+
+    _BLIND["notified"] = True
+    if escalating:
+        _BLIND["escalated"] = True
+    event = BlindEvent(
+        ts=now_iso(), since_ts=last_pass, blind_for_s=round(blind_for),
+        reason=_blind_reason(conn, auth_state), escalation=escalating,
+        main_status=main_status, target_name=config.TARGET_NAME)
+    print(f"[alert] [auth] {event!r}")
+    await dispatch(event, channels)
+
+
 async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = None) -> None:
     """[v3.8 / Stage R] One unified cycle: the main track (pulse/render, with its
     confirmation burst) always runs; the auth track (cheap authed check, with its own
@@ -756,6 +828,10 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
     print(f"[{ts}] [cycle {cycle_id[:8]}] verdict={verdict}"
           + (f" ({fail_layer}: {fail_reason})" if fail_reason else "")
           + (f" burst={burst_id[:8]}" if burst_id else ""))
+
+    # [BLIND] Evaluated after the cycles row is written, so a notification can never cost the
+    # audit row -- same ordering discipline as Rule 9's self-health net.
+    await _check_blind(conn, channels, auth_enabled, new_auth_state, new_main_state.status)
 
 
 async def guarded_cycle(conn, channels, lock: asyncio.Lock, auth_enabled: bool) -> None:

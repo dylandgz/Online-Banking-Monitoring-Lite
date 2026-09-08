@@ -8,7 +8,8 @@ from pathlib import Path
 
 import config
 from monitor.channels.base import AlertChannel, AlertEvent
-from monitor.state import ConfigErrorEvent, DownEvent, LoginBreakerEvent, RecoveryEvent
+from monitor.state import (BlindEvent, ConfigErrorEvent, DownEvent, LoginBreakerEvent,
+                           RecoveryEvent)
 from monitor.timeutil import to_eastern, to_eastern_without_offset
 from monitor.verdict import email_description, email_service_name
 
@@ -119,6 +120,44 @@ def _build_recovery_body(event: RecoveryEvent) -> str:
     )
 
 
+def _build_blind_subject(event: BlindEvent) -> str:
+    """A distinct prefix so this can never be mistaken for -- or filtered with -- an outage.
+    Prose and admin-only, deliberately outside the machine-parsed format the Teams flow
+    reads: this is a statement about the monitor, not a report about the platform."""
+    name = event.target_name or config.TARGET_NAME
+    if event.recovered:
+        return f"[MONITOR-BLIND] {name} — sign-in monitoring resumed"
+    minutes = event.blind_for_s // 60
+    prefix = "STILL not monitored" if event.escalation else "sign-in not monitored"
+    return f"[MONITOR-BLIND] {name} — {prefix} for {_format_duration(event.blind_for_s)}"
+
+
+def _build_blind_body(event: BlindEvent) -> str:
+    name = event.target_name or config.TARGET_NAME
+    if event.recovered:
+        return (
+            f"Sign-in monitoring for {name} has resumed. A check passed again after "
+            f"{_format_duration(event.blind_for_s)} without one.\n"
+            f"\n"
+            f"Nothing about this says the platform was down during that window -- only that "
+            f"the monitor could not tell you either way."
+        )
+    return (
+        f"Sign-in monitoring has not completed a successful check in "
+        f"{_format_duration(event.blind_for_s)}.\n"
+        f"\n"
+        f"This is NOT a report that online banking is down. It means the monitor cannot "
+        f"currently tell you either way.\n"
+        f"\n"
+        f"  Last successful sign-in check:  {to_eastern(event.since_ts) if event.since_ts else 'never'}\n"
+        f"  Why checking stopped:           {event.reason}\n"
+        f"  Public website + login page:    {event.main_status or 'unknown'}\n"
+        f"\n"
+        f"Still being watched:  the public website and the login page.\n"
+        f"Not being watched:    everything behind sign-in."
+    )
+
+
 def _build_breaker_subject(event: LoginBreakerEvent) -> str:
     """Prose and admin-only, deliberately outside the machine-parsed format: this is not an
     outage report and must not render a Teams card."""
@@ -219,6 +258,13 @@ class EmailGmailChannel(AlertChannel):
                 body = _build_recovery_body(event)
                 screenshot = None  # no screenshot for recovery
                 recipients = _parse_email_list(config.RECIPIENTS_EMAIL)
+        elif isinstance(event, BlindEvent):
+            if not config.ADMIN_EMAIL:
+                return  # admin-only, same routing as CONFIG_ERROR
+            subject = _build_blind_subject(event)
+            body = _build_blind_body(event)
+            screenshot = None
+            recipients = [config.ADMIN_EMAIL.strip()]
         elif isinstance(event, LoginBreakerEvent):
             if not config.ADMIN_EMAIL:
                 return  # admin-only, same routing as CONFIG_ERROR
