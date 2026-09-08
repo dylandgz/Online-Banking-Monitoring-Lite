@@ -448,6 +448,19 @@ def get_last_check_ts(conn: sqlite3.Connection) -> str | None:
     return row["ts"] if row else None
 
 
+def get_last_passing_authed_ts(conn: sqlite3.Connection) -> str | None:
+    """[BLIND] When the auth track last actually PROVED anything -- the newest passing
+    `authed` probe.
+
+    Passing, not merely present: a failing probe, and especially an inert synthetic
+    `session_expired`, is the monitor recording that it wanted to look and could not. Counting
+    those as evidence is exactly how a track goes quiet without anyone noticing."""
+    row = conn.execute(
+        "SELECT ts FROM checks WHERE layer = 'authed' AND ok = 1 ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return row["ts"] if row else None
+
+
 def uptime_pct(conn: sqlite3.Connection, since_ts: str) -> float | None:
     """Share of cycles in the window whose unified platform verdict was UP.
 

@@ -184,7 +184,29 @@ class LoginBreakerEvent:
     target_name: Optional[str] = None
 
 
-Event = Union[DownEvent, RecoveryEvent, ConfigErrorEvent, LoginBreakerEvent]
+@dataclass(frozen=True)
+class BlindEvent:
+    """[BLIND / 2026-09-08] The auth track has not produced a passing check for a while, or
+    has started producing them again.
+
+    Deliberately NOT a status and never written to `cycles.verdict`. It is a statement about
+    the MONITOR, not the platform -- filing "we could not measure" in the same column as "the
+    bank is down" is the conflation `uptime_pct` was rewritten to remove. So it stays out of
+    the severity ladder, `unified_verdict`, the CSV value set and the dashboard palette.
+
+    `reason` is what makes a benign instance readable at a glance ("the monitor was not
+    running") versus an alarming one ("login attempts halted after 5 consecutive failures")."""
+    ts: str
+    since_ts: Optional[str]
+    blind_for_s: int
+    reason: str
+    escalation: bool = False
+    recovered: bool = False
+    main_status: Optional[str] = None
+    target_name: Optional[str] = None
+
+
+Event = Union[DownEvent, RecoveryEvent, ConfigErrorEvent, LoginBreakerEvent, BlindEvent]
 
 
 def _seconds_between(a: str, b: str) -> float:
