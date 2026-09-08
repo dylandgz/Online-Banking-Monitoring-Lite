@@ -586,10 +586,13 @@ classification work; drafted but not yet applied.**
 
 **Landed this session (three commits):**
 
-- `673aa5f` -- the 2026-09-04 machine-parsed email rework, which was sitting uncommitted in the
-  working tree, committed **separately and unmodified** so it is not mixed into the work below.
-  It has no tracker entry, and CLAUDE.md labels it `[B45]`, which collides with the tracker's
-  existing B45. Worth giving it a real ID.
+- `673aa5f` -- **the machine-parsed email rework, authored by Dylan on 2026-09-04.** It was
+  sitting uncommitted in the working tree when this session picked the repo up; it is committed
+  here **separately and entirely unmodified**, so that the sign-in work below could not be mixed
+  into it and so its authorship stays clear. Nothing in it was written or altered by the
+  assistant. It has no tracker entry, and CLAUDE.md labels it `[B45]`, which collides with the
+  tracker's existing B45 ("An auth burst can spend the cycle's budgeted login") -- worth giving
+  it a real ID.
 - `527fbf5` -- **[B64]** `clear_config_error.py` → `clear_config_error_and_stuck_down.py`. Clears
   a stuck `DOWN` as well as a `CONFIG_ERROR`, closes the open incident **by id**, and derives
   `ended_at` from the probe record rather than the clock. On the 09-04 incident that yields
