@@ -15,7 +15,8 @@ import uvicorn
 import config
 from monitor import check, db, journey, session
 from monitor.channels import build_channels, dispatch
-from monitor.state import ConfigErrorEvent, DownEvent, MonitorState, RecoveryEvent, apply_check
+from monitor.state import (ConfigErrorEvent, DownEvent, LoginBreakerEvent, MonitorState,
+                           RecoveryEvent, apply_check)
 from monitor.timeutil import now_iso
 from monitor.verdict import severity, unified_verdict
 
@@ -325,6 +326,10 @@ async def _run_full_login(conn, *, should_logout: bool) -> "check.CheckResult":
             frame_text=config.AUTHED_FRAME_TEXT,
             frame_role=config.AUTHED_FRAME_ROLE,
             frame_name=config.AUTHED_FRAME_NAME,
+            # [D1] The allowlists. A screen matching one of these is Config-class; every
+            # screen matching none is platform evidence that scores and does not halt.
+            reject_patterns=config.AUTH_REJECTED_TEXT,
+            mfa_reject_patterns=config.MFA_REJECTED_TEXT,
         )
         return result
     finally:
@@ -345,6 +350,74 @@ async def _run_full_login(conn, *, should_logout: bool) -> "check.CheckResult":
             )
         except Exception as exc:  # noqa: BLE001 -- last-resort audit write, never fatal
             print(f"[login] CRITICAL: could not record login attempt in login_events: {exc!r}", flush=True)
+
+
+# [Rule 5] One notification per breaker episode, not one per cycle. The predicate below is
+# consulted every time a login is considered, so without this the admin would be mailed every
+# minute for as long as the breaker is open. Reset by a success, which is also what resets the
+# streak -- so the flag and the ledger can never disagree for long.
+_BREAKER: dict = {"notified": False}
+
+
+def _consecutive_login_failures(conn) -> tuple[int, str | None, str | None]:
+    """How many failed login attempts sit at the tail of the ledger, and when the last one
+    was. Derived from `login_events` rather than stored, for the same reason the interval
+    budget is: the ledger is written on the failure path too (`try/finally` in
+    _run_full_login), so it cannot drift out of step with reality."""
+    streak, last_ts, last_reason = 0, None, None
+    for row in db.get_recent_login_events(conn, limit=config.MAX_CONSECUTIVE_LOGIN_FAILURES + 1):
+        if row["ok"]:
+            break
+        if last_ts is None:
+            last_ts, last_reason = row["ts"], row["reason"]
+        streak += 1
+    return streak, last_ts, last_reason
+
+
+async def _login_breaker_allows(conn, channels) -> bool:
+    """Rule 5's credential breaker: `MAX_CONSECUTIVE_LOGIN_FAILURES` consecutive failed
+    attempts halt logins regardless of WHY they failed.
+
+    Why it is screen-independent. [D1] removed the old brake -- an unrecognised screen used to
+    halt the track by being misread as a config error -- so something has to stop repeated
+    credential submission without depending on correctly classifying a screen nobody has
+    captured. Four new screens turned up in the week of 2026-08-31 alone.
+
+    The threshold sits ABOVE AUTH_MIN_FAILED_PROBES (config.py enforces it), so DOWN fires at
+    failure 4 and this trips at 5: the operator is paged before the monitor stops trying. The
+    track's status is deliberately left alone -- see Rule 5 on why forcing CONFIG_ERROR here
+    would downgrade an outage you were paged for one minute earlier.
+
+    While tripped it permits ONE attempt per LOGIN_BREAKER_COOLDOWN_S. Without that the track
+    freezes: no logins means no session, which means no cheap checks either, so it would sit
+    at DOWN long after the platform recovered. A success resets the streak on its own, since
+    the streak is read off the ledger's tail."""
+    streak, last_ts, last_reason = _consecutive_login_failures(conn)
+    if streak < config.MAX_CONSECUTIVE_LOGIN_FAILURES:
+        _BREAKER["notified"] = False   # a success cleared the streak; arm the next episode
+        return True
+
+    since = (datetime.now(timezone.utc) - datetime.fromisoformat(last_ts)).total_seconds()
+    if since < config.LOGIN_BREAKER_COOLDOWN_S:
+        print(f"[{now_iso()}] [auth] login breaker OPEN -- {streak} consecutive failures "
+              f"(last: {last_reason}), next attempt in "
+              f"{config.LOGIN_BREAKER_COOLDOWN_S - since:.0f}s. The track keeps its current "
+              f"status; it is not downgraded to CONFIG_ERROR.", flush=True)
+        if not _BREAKER["notified"]:
+            _BREAKER["notified"] = True
+            event = LoginBreakerEvent(
+                ts=now_iso(), consecutive_failures=streak,
+                cooldown_s=config.LOGIN_BREAKER_COOLDOWN_S, last_reason=last_reason,
+                track_status=db.get_state(conn, track="auth").status,
+                target_name=config.TARGET_NAME,
+            )
+            print(f"[alert] [auth] {event!r}")
+            await dispatch(event, channels)
+        return False
+
+    print(f"[{now_iso()}] [auth] login breaker cooldown elapsed after {streak} consecutive "
+          f"failures -- allowing one attempt.", flush=True)
+    return True
 
 
 def _login_budget_allows(conn) -> bool:
@@ -402,7 +475,7 @@ def _session_expired_result() -> "check.CheckResult":
 
 
 async def _run_auth_probe(
-    conn, main_down: bool, login_budget_state: dict
+    conn, channels, main_down: bool, login_budget_state: dict
 ) -> tuple["check.CheckResult", bool, bool]:
     """One auth-track probe attempt for this cycle. Cheap session-reuse check first
     (zero logins). session_expired (or no session at all) triggers exactly one budgeted
@@ -439,7 +512,10 @@ async def _run_auth_probe(
                 else (_session_expired_result(), False, False))
 
     if needs_recovery and not login_budget_state["used"]:
-        if _login_budget_allows(conn):
+        # Two independent gates, deliberately separate: the interval throttles a healthy
+        # monitor, the breaker stops an unhealthy one. Both are checked, so whichever is
+        # longer wins and a short cooldown is merely ineffective rather than unsafe.
+        if await _login_breaker_allows(conn, channels) and _login_budget_allows(conn):
             login_budget_state["used"] = True
             result = await _run_full_login(conn, should_logout=False)
             probed = True  # a real login attempt is very much an observation
@@ -613,7 +689,7 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
             login_budget_state = {"used": False}
 
             auth_result, auth_probed, auth_was_login = await _run_auth_probe(
-                conn, main_down, login_budget_state)
+                conn, channels, main_down, login_budget_state)
             ts_auth = now_iso()
             new_auth_state = await _process_probe(
                 conn, channels, prev_auth_state, auth_result, ts_auth, burst_id=None,

@@ -166,7 +166,25 @@ class ConfigErrorEvent:
     fail_reason: str
 
 
-Event = Union[DownEvent, RecoveryEvent, ConfigErrorEvent]
+@dataclass(frozen=True)
+class LoginBreakerEvent:
+    """[Rule 5 / 2026-09-08] The credential breaker tripped: N consecutive failed logins, so
+    the monitor has stopped attempting them.
+
+    Deliberately its own event rather than a ConfigErrorEvent. It is not a configuration
+    problem -- the track keeps whatever status the evidence justified, usually DOWN, and by
+    the time this fires the operator has already been paged for the outage itself. This says
+    only that the monitor has stopped spending credentials, which is why the authed column
+    goes quiet from here on."""
+    ts: str
+    consecutive_failures: int
+    cooldown_s: int
+    last_reason: Optional[str] = None
+    track_status: Optional[str] = None
+    target_name: Optional[str] = None
+
+
+Event = Union[DownEvent, RecoveryEvent, ConfigErrorEvent, LoginBreakerEvent]
 
 
 def _seconds_between(a: str, b: str) -> float:

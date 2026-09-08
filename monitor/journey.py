@@ -126,6 +126,24 @@ def error_banner(page: Page, text: str) -> Locator:
     return page.get_by_text(text).first
 
 
+def rejection_banner(page: Page, patterns: Sequence[str]) -> Optional[Locator]:
+    """[D1] An `or_`-chain over the CONFIGURED rejection patterns, or None when none are set.
+
+    This is the allowlist half of D1's decision, and the only thing that can make an outcome
+    Config-class. Everything it does not match is platform evidence, so a missing or wrong
+    pattern costs a *page* rather than silence -- the safe direction, and the opposite of the
+    old fallback, which turned every unrecognised screen into a latch.
+
+    `.first` on each, per Rule 11: these are free-form `.env` values with no arity validation,
+    and Playwright's strict mode raises Error -- not AssertionError -- on multiple matches,
+    which no classify_* helper catches."""
+    locator = None
+    for pattern in patterns:
+        candidate = page.get_by_text(pattern).first
+        locator = candidate if locator is None else locator.or_(candidate)
+    return locator
+
+
 def mfa_heading(page: Page) -> Locator:
     # [2026-08-25] The step-up flow has TWO screens, each with its own heading, and this
     # locator is what tells classify_after_submit "we reached MFA" and classify_after_totp
@@ -227,9 +245,12 @@ def logout_link(page: Page) -> Locator:
 # the CODE-ENTRY screen carries a real device-registration choice -- "Yes, register my
 # private device" / "No, this is a public device", both type=submit -- which submit_totp()
 # never clicks. Whether that is the same screen the prototype meant is unknown. Do not
-# resolve it from this comment: read the capture, and see B27 in personal/ISSUES.md first
-# -- registering the device plausibly suppresses future step-ups, which would make
-# classify_after_submit()'s bot_challenge fallback fire on every subsequent login.
+# resolve it from this comment: read the capture, and see B27 in personal/ISSUES.md first.
+# [2026-09-08] The consequence that made this urgent is gone: a suppressed step-up used to
+# fall through classify_after_submit's fallback to bot_challenge and latch the track on every
+# subsequent login. That function now recognises "authed" as a success, so registering the
+# device would be handled correctly rather than catastrophically. The open question is only
+# whether an unattended monitor SHOULD register.
 
 
 # --- submit / classify pairs --------------------------------------------------
@@ -262,27 +283,70 @@ async def submit_credentials(page: Page, login_user: str, login_password: str, b
     await _settle(page, browser_timeout_ms)
 
 
-async def classify_after_submit(page: Page, error_banner_text: str, challenge_timeout_ms: int) -> str:
-    """Returns "mfa", "auth_rejected", or "bot_challenge"."""
+async def _classify_unrecognised(page: Page) -> str:
+    """[D1] What a screen means when it matches nothing we recognise: NOT our configuration.
+
+    The old code guessed a Config-class reason here, which never pages and halts the track.
+    Three times in the week of 2026-08-31 that turned a platform problem into ~21 hours of
+    silence, twice while the bank was displaying its own outage banner.
+
+    Both outcomes score and neither halts. The split is only for the record: `auth_unavailable`
+    when the page is displaying *something* (Hard, and its first real producer -- see
+    limitation 3), `timeout` when it is not. Note the message read here uses role="alert",
+    which this bank's /dbank login page does not use, so on that screen this resolves to
+    `timeout`; the class is identical either way."""
+    if await _visible_alert_text(page):
+        return "auth_unavailable"
+    return "timeout"
+
+
+async def classify_after_submit(
+    page: Page,
+    *,
+    authed_text: Optional[str],
+    authed_role: Optional[str],
+    authed_name: Optional[str],
+    reject_patterns: Sequence[str],
+    challenge_timeout_ms: int,
+) -> str:
+    """Returns "authed", "mfa", "auth_rejected", "auth_unavailable" or "timeout".
+
+    [D1 / 2026-09-08] Asks "did sign-in progress?" and answers it from the markers that mean
+    progress, rather than guessing from what failed to appear. Three outcomes are recognised
+    positively; everything else is platform evidence.
+
+    "authed" is new, and closes B27: a login that succeeds with no step-up used to match
+    neither marker and fall through to `bot_challenge`, i.e. a completely successful sign-in
+    recorded as a bot challenge and latched. run_journey now has an explicit branch for it.
+
+    `bot_challenge` is gone from this function. It was the fallback for "neither expected
+    thing appeared", which conflated a real challenge, an auth outage, rate limiting, plain
+    slowness and outright success. Under Rule 6 it is now returned only on positive detection,
+    and no such detector exists -- nothing emits it."""
+    authed_marker_locator = authed_marker(page, text=authed_text, role=authed_role, name=authed_name)
     mfa_marker = mfa_heading(page)
-    error_marker = error_banner(page, error_banner_text)
+    rejected = rejection_banner(page, reject_patterns)
+
+    expected = authed_marker_locator.or_(mfa_marker)
+    if rejected is not None:
+        expected = expected.or_(rejected)
 
     try:
-        await expect(mfa_marker.or_(error_marker)).to_be_visible(timeout=challenge_timeout_ms)
+        await expect(expected).to_be_visible(timeout=challenge_timeout_ms)
     except AssertionError:
-        # Neither marker showed up. This is exactly what bot_challenge, auth_unavailable
-        # and rate_limited look like undifferentiated -- and, per B27, what a login that
-        # simply succeeded without a step-up looks like too.
-        # bot_challenge is the closest single reason given this is the one check
-        # layer deliberately built to contend with a Cloudflare challenge -- not
-        # confirmed correct until drilled against the real target.
-        return "bot_challenge"
+        return await _classify_unrecognised(page)
 
+    # Re-queried individually, most confident first. A marker can be visible during the wait
+    # and gone by the time it is re-read -- a transient screen, or a host suspend mid-probe
+    # (B57). That case now lands on platform evidence rather than on a Config-class default,
+    # which is what made 2026-09-03 a 7.3-hour blind window.
+    if await authed_marker_locator.is_visible():
+        return "authed"
     if await mfa_marker.is_visible():
         return "mfa"
-    if await error_marker.is_visible():
+    if rejected is not None and await rejected.is_visible():
         return "auth_rejected"
-    return "bot_challenge"
+    return await _classify_unrecognised(page)
 
 
 async def submit_totp(
@@ -336,8 +400,31 @@ async def submit_totp(
     return None
 
 
-async def classify_after_totp(page: Page, challenge_timeout_ms: int, browser_timeout_ms: int) -> str:
-    """Returns "success" or "mfa_failed"."""
+async def classify_after_totp(
+    page: Page,
+    *,
+    reject_patterns: Sequence[str],
+    challenge_timeout_ms: int,
+    browser_timeout_ms: int,
+) -> str:
+    """Returns "success", "mfa_failed", "auth_unavailable" or "timeout".
+
+    [D1 / 2026-09-08] The MFA heading disappearing is the only positive signal that the step
+    completed; a CONFIGURED rejection pattern is the only positive signal that the code was
+    refused. Everything else is platform evidence.
+
+    What this replaces, and why it mattered. Both branches of the old version returned
+    `mfa_failed` -- it scanned the page's alerts, read the text, and then discarded it. On
+    2026-09-06 that text was "Login is currently unavailable. Please try again later.", the
+    bank announcing its own outage, and the monitor recorded a configuration problem and
+    stopped checking online banking for 13.7 hours. Eleven successful logins had preceded it
+    that evening, so the secret and the clock were both fine.
+
+    Note `MFA_REJECTED_TEXT` ships EMPTY: no capture of a refused code exists, and Rule 12
+    forbids guessing one. Until a drill produces it, `mfa_failed` from this function is
+    unreachable and every post-code failure is platform evidence -- deliberately the safe
+    direction. `submit_totp` still returns `mfa_failed` for the case we DO positively know
+    (no TOTP_SECRET, or one that is not valid base32), which is a genuine config problem."""
     heading = mfa_heading(page)
     try:
         await expect(heading).to_be_hidden(timeout=challenge_timeout_ms)
@@ -348,18 +435,10 @@ async def classify_after_totp(page: Page, challenge_timeout_ms: int, browser_tim
     except AssertionError:
         pass
 
-    # Full timeout elapsed with the heading still visible -- MFA did not succeed,
-    # regardless of whether a specific rejection message is findable. Ignore
-    # "Verifying..." (may just be mid-retry) and hidden alerts (not what the user sees).
-    alerts = page.get_by_role("alert")
-    count = await alerts.count()
-    for i in range(count):
-        el = alerts.nth(i)
-        if await el.is_visible():
-            text = (await el.text_content()) or ""
-            if text.strip() and "verifying" not in text.lower():
-                return "mfa_failed"
-    return "mfa_failed"
+    rejected = rejection_banner(page, reject_patterns)
+    if rejected is not None and await rejected.is_visible():
+        return "mfa_failed"
+    return await _classify_unrecognised(page)
 
 
 async def classify_authed(page: Page, authed_text: Optional[str], authed_role: Optional[str],
@@ -523,9 +602,11 @@ async def capture_masked_screenshot(
 # The shape this follows:
 #   navigate -> (nav_error)
 #   wait for login form -> (element_missing)
-#   submit credentials -> classify_after_submit -> mfa | auth_rejected | bot_challenge
+#   submit credentials -> classify_after_submit -> authed | mfa | auth_rejected
+#                                                 | auth_unavailable | timeout
+#     if authed: no step-up was required -- straight to the authed assertion (B27)
 #     if mfa:
-#       submit_totp -> classify_after_totp -> success | mfa_failed
+#       submit_totp -> classify_after_totp -> success | mfa_failed | auth_unavailable | timeout
 #       if success:
 #         classify_authed -> authed | element_missing
 #         if authed:
@@ -731,6 +812,8 @@ async def run_journey(
     frame_text: Optional[str] = None,
     frame_role: Optional[str] = None,
     frame_name: Optional[str] = None,
+    reject_patterns: Sequence[str] = (),
+    mfa_reject_patterns: Sequence[str] = (),
 ) -> CheckResult:
     """Runs the full login -> TOTP -> authed-assertion -> (optional) logout journey
     once and reports the outcome as a CheckResult, exactly like check.py's probes.
@@ -797,32 +880,50 @@ async def run_journey(
                                         artifacts_dir, mask_patterns, masking_enabled)
 
                 await submit_credentials(page, login_user, login_password, browser_timeout_ms)
-                after_submit = await classify_after_submit(page, error_banner_text, challenge_timeout_ms)
+                after_submit = await classify_after_submit(
+                    page, authed_text=authed_text, authed_role=authed_role,
+                    authed_name=authed_name, reject_patterns=reject_patterns,
+                    challenge_timeout_ms=challenge_timeout_ms,
+                )
 
-                if after_submit in ("auth_rejected", "bot_challenge"):
+                # Anything that is not a recognised way FORWARD is a failure, and the outcome
+                # is already the fail_reason: auth_rejected (Config, a human must look),
+                # auth_unavailable or timeout (platform evidence, scores, does not halt).
+                if after_submit not in ("authed", "mfa"):
                     latency_ms = (time.monotonic() - start) * 1000
                     return await _fail(page, "authed", after_submit, "after_submit", latency_ms,
                                         artifacts_dir, mask_patterns, masking_enabled)
 
-                # after_submit == "mfa"
-                if manual_mfa_pause:
-                    # Human handles the entire MFA step (any factor) directly in the
-                    # browser -- nothing here clicks "Enter code" or touches a code field.
-                    await manual_mfa_pause()
-                else:
-                    totp_fail_reason = await submit_totp(
-                        page, totp_secret, challenge_timeout_ms, browser_timeout_ms, code_provider=totp_code_provider
-                    )
-                    if totp_fail_reason:
-                        latency_ms = (time.monotonic() - start) * 1000
-                        return await _fail(page, "authed", totp_fail_reason, "submit_totp", latency_ms,
-                                            artifacts_dir, mask_patterns, masking_enabled)
+                # [B27] "authed" means we are already in -- no step-up was required. This
+                # branch did not exist: such a login matched neither marker and fell through
+                # to the bot_challenge fallback, so a completely successful sign-in was
+                # recorded as a bot challenge and latched the track. Skip MFA entirely and go
+                # straight to the authed assertion below. Without an explicit branch here the
+                # old code would treat it as "mfa" and click a button that is not on the
+                # page -- failing wrongly rather than safely.
+                if after_submit == "mfa":
+                    if manual_mfa_pause:
+                        # Human handles the entire MFA step (any factor) directly in the
+                        # browser -- nothing here clicks "Enter code" or touches a code field.
+                        await manual_mfa_pause()
+                    else:
+                        totp_fail_reason = await submit_totp(
+                            page, totp_secret, challenge_timeout_ms, browser_timeout_ms, code_provider=totp_code_provider
+                        )
+                        if totp_fail_reason:
+                            latency_ms = (time.monotonic() - start) * 1000
+                            return await _fail(page, "authed", totp_fail_reason, "submit_totp", latency_ms,
+                                                artifacts_dir, mask_patterns, masking_enabled)
 
-                    after_totp = await classify_after_totp(page, challenge_timeout_ms, browser_timeout_ms)
-                    if after_totp == "mfa_failed":
-                        latency_ms = (time.monotonic() - start) * 1000
-                        return await _fail(page, "authed", "mfa_failed", "after_totp", latency_ms,
-                                            artifacts_dir, mask_patterns, masking_enabled)
+                        after_totp = await classify_after_totp(
+                            page, reject_patterns=mfa_reject_patterns,
+                            challenge_timeout_ms=challenge_timeout_ms,
+                            browser_timeout_ms=browser_timeout_ms,
+                        )
+                        if after_totp != "success":
+                            latency_ms = (time.monotonic() - start) * 1000
+                            return await _fail(page, "authed", after_totp, "after_totp", latency_ms,
+                                                artifacts_dir, mask_patterns, masking_enabled)
 
                 authed_result = await classify_authed(
                     page, authed_text, authed_role, authed_name, error_banner_text,

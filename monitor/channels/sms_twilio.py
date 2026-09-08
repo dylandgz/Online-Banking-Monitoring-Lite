@@ -22,7 +22,7 @@ except ImportError:
 
 import config
 from monitor.channels.base import AlertChannel, AlertEvent
-from monitor.state import ConfigErrorEvent, DownEvent, RecoveryEvent
+from monitor.state import ConfigErrorEvent, DownEvent, LoginBreakerEvent, RecoveryEvent
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
@@ -65,8 +65,9 @@ class SmsTwilioChannel(AlertChannel):
             body = down_message(event, config.TARGET_NAME)
         elif isinstance(event, RecoveryEvent):
             body = recovery_message(event, config.TARGET_NAME)
-        elif isinstance(event, ConfigErrorEvent):
-            return  # ConfigErrorEvent does not trigger SMS alerts
+        elif isinstance(event, (ConfigErrorEvent, LoginBreakerEvent)):
+            # Neither is an outage. Both go to ADMIN_EMAIL only; SMS is for paging.
+            return
         else:
             raise TypeError(f"unknown event type: {event!r}")
 
