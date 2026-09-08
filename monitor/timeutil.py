@@ -12,8 +12,9 @@ Two directions, deliberately not symmetric:
   the same -- across the fall-back boundary a real 30-minute outage computes as -30.
 
 - **Presentation is America/New_York.** `to_eastern()` is called only at the outer edges
-  (dashboard JSON, CSV export, alert email bodies). Nothing between the probe and the
-  database ever sees Eastern.
+  (dashboard JSON, CSV export, the CONFIG_ERROR email). Nothing between the probe and the
+  database ever sees Eastern. `to_eastern_without_offset()` is the same conversion for the
+  DOWN/RECOVERED alert emails, whose format is machine-parsed downstream.
 
 `artifact_stamp()` sits on the presentation side despite producing a filename: a screenshot
 name is read by a human next to Eastern timestamps, and for most artifacts it is the *only*
@@ -89,3 +90,19 @@ def to_eastern(ts_utc_iso: str) -> str:
     offset = eastern.strftime("%z")  # e.g. '-0400'
     offset_fmt = f"{offset[:3]}:{offset[3:]}"
     return f"{eastern.strftime('%Y-%m-%d %H:%M:%S')} {eastern.tzname()} (UTC{offset_fmt})"
+
+
+def to_eastern_without_offset(ts_utc_iso: str) -> str:
+    """Eastern timestamp without the parenthetical offset, e.g. '2026-09-01 14:32:15 EDT'.
+
+    [B45] The alert-email format for Power Automate. to_eastern()'s trailing '(UTC-04:00)'
+    is right for a dashboard cell a human reads, but this string is also the last field of
+    a pipe-delimited subject line -- the parenthetical made that field read as prose. The
+    zone abbreviation is kept so a recipient still sees which offset applies, and it comes
+    from the zone (not a fixed 'EST') so DST is handled: '... EDT' in summer, '... EST' in
+    winter, from the same call."""
+    dt = datetime.fromisoformat(ts_utc_iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    eastern = dt.astimezone(EASTERN)
+    return f"{eastern.strftime('%Y-%m-%d %H:%M:%S')} {eastern.tzname()}"

@@ -77,6 +77,8 @@ class LayerEvidence:
     fail_reasons: tuple[str, ...] = ()
     last_probe_ts: Optional[str] = None     # any probe, pass or fail -- drives the stale reset
     run_started_ts: Optional[str] = None    # first failure of the CURRENT run; None when clear
+    # [B50] Did this run collect at least one FAILED LOGIN? Gates recovery -- see apply_check.
+    from_login: bool = False
 
 
 @dataclass(frozen=True)
@@ -144,6 +146,12 @@ class RecoveryEvent:
     duration_s: int
     confidence: int
     fail_reasons: tuple[str, ...]
+    # [B59] What this incident is recovering FROM. Both DOWN and CONFIG_ERROR leave through
+    # the same path, so without this a channel cannot tell "the outage ended" from "a human
+    # cleared a config latch" -- and the email channel told every recipient that an outage
+    # they were never notified of had recovered, with a duration measuring how long a human
+    # took to notice. CONFIG_ERROR is explicitly not an outage (Rule 7).
+    from_status: Optional[str] = None
     # Optional fields added by main.py after DB operations
     trigger_layer: Optional[str] = None
     page_url: Optional[str] = None
@@ -158,7 +166,47 @@ class ConfigErrorEvent:
     fail_reason: str
 
 
-Event = Union[DownEvent, RecoveryEvent, ConfigErrorEvent]
+@dataclass(frozen=True)
+class LoginBreakerEvent:
+    """[Rule 5 / 2026-09-08] The credential breaker tripped: N consecutive failed logins, so
+    the monitor has stopped attempting them.
+
+    Deliberately its own event rather than a ConfigErrorEvent. It is not a configuration
+    problem -- the track keeps whatever status the evidence justified, usually DOWN, and by
+    the time this fires the operator has already been paged for the outage itself. This says
+    only that the monitor has stopped spending credentials, which is why the authed column
+    goes quiet from here on."""
+    ts: str
+    consecutive_failures: int
+    cooldown_s: int
+    last_reason: Optional[str] = None
+    track_status: Optional[str] = None
+    target_name: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class BlindEvent:
+    """[BLIND / 2026-09-08] The auth track has not produced a passing check for a while, or
+    has started producing them again.
+
+    Deliberately NOT a status and never written to `cycles.verdict`. It is a statement about
+    the MONITOR, not the platform -- filing "we could not measure" in the same column as "the
+    bank is down" is the conflation `uptime_pct` was rewritten to remove. So it stays out of
+    the severity ladder, `unified_verdict`, the CSV value set and the dashboard palette.
+
+    `reason` is what makes a benign instance readable at a glance ("the monitor was not
+    running") versus an alarming one ("login attempts halted after 5 consecutive failures")."""
+    ts: str
+    since_ts: Optional[str]
+    blind_for_s: int
+    reason: str
+    escalation: bool = False
+    recovered: bool = False
+    main_status: Optional[str] = None
+    target_name: Optional[str] = None
+
+
+Event = Union[DownEvent, RecoveryEvent, ConfigErrorEvent, LoginBreakerEvent, BlindEvent]
 
 
 def _seconds_between(a: str, b: str) -> float:
@@ -183,6 +231,7 @@ def apply_check(
     recovery_passes: int = 1,
     precursor_down: bool = False,
     scoring: bool = True,
+    is_login: bool = False,
 ) -> tuple[MonitorState, list[Event]]:
     """Advances the state machine by one probe result. Emits an event only on a status
     transition -- never re-emits while an incident is ongoing.
@@ -216,7 +265,22 @@ def apply_check(
     we were looking by then -- otherwise the stale reset would fire spuriously.
 
     `precursor_down` [the "Cross-track suppression" section]: only meaningful for the auth
-    track, when the main track's incident is already open and explains the symptom."""
+    track, when the main track's incident is already open and explains the symptom.
+
+    `is_login` [B50, 2026-09-07] says this probe was a full credentialed login rather than a
+    cheap session-reuse check. It exists for one rule: **a DOWN whose evidence includes a failed
+    login can only BEGIN recovering on a successful login.** Passes two and three may be cheap
+    checks.
+
+    Why the rule is needed at all: before B50 the auth track filed pre-credential login failures
+    on a separate `render` layer, so the two could never interact. Now they share one layer, and
+    without this a cheap check could close an outage that was raised by failed logins -- declaring
+    "sign-in works again" on the strength of a cached cookie, while customers who are not already
+    signed in still cannot get in.
+
+    In the common case the rule is close to automatic: after a login-caused DOWN there is no
+    usable session, so the cheap check cannot run at all until a login succeeds. It closes the
+    narrow case where the session file is still fresh but the bank had been rejecting it."""
     prev = state.evidence(layer)
 
     # A probe we are told not to score still proves the monitor was awake and looking.
@@ -231,6 +295,13 @@ def apply_check(
             # opposite direction. CONFIG_ERROR has no cause layer, so any pass clears it.
             if state.cause_layer and layer != state.cause_layer:
                 touched = replace(state.evidence(layer), last_probe_ts=ts)
+                return replace(state, layers=_with_layer(state, layer, touched)), []
+
+            # [B50] A DOWN built from failed logins does not start recovering on a cheap
+            # check. Only the FIRST pass is gated: once a login has proved sign-in works,
+            # passes two and three may be cheap checks.
+            if prev.from_login and not is_login and state.consecutive_passes == 0:
+                touched = replace(prev, last_probe_ts=ts)
                 return replace(state, layers=_with_layer(state, layer, touched)), []
 
             # The causing layer's evidence is NOT cleared yet, only timestamped. It is the
@@ -252,6 +323,7 @@ def apply_check(
                 confidence=state.confidence,
                 fail_reasons=state.fail_reasons,
                 trigger_layer=state.cause_layer,
+                from_status=state.status,
             )
             # Now it is safe to discard: the event carries the record forward.
             return MonitorState(status="UP", since_ts=ts,
@@ -302,6 +374,7 @@ def apply_check(
             fail_reasons=prev.fail_reasons + (fail_reason,),
             last_probe_ts=ts,
             run_started_ts=prev.run_started_ts or ts,
+            from_login=prev.from_login or is_login,
         )
         return replace(state, layers=_with_layer(state, layer, tallied), consecutive_passes=0), []
 
@@ -319,6 +392,7 @@ def apply_check(
         fail_reasons=base.fail_reasons + (fail_reason,),
         last_probe_ts=ts,
         run_started_ts=base.run_started_ts or ts,
+        from_login=base.from_login or is_login,
     )
     layers = _with_layer(state, layer, ev)
 

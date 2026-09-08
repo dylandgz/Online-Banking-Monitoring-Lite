@@ -8,9 +8,25 @@ from pathlib import Path
 
 import config
 from monitor.channels.base import AlertChannel, AlertEvent
-from monitor.state import ConfigErrorEvent, DownEvent, RecoveryEvent
-from monitor.timeutil import to_eastern
-from monitor.verdict import email_layer_body, email_layer_subject, email_reason_text
+from monitor.state import (BlindEvent, ConfigErrorEvent, DownEvent, LoginBreakerEvent,
+                           RecoveryEvent)
+from monitor.timeutil import to_eastern, to_eastern_without_offset
+from monitor.verdict import email_description, email_service_name
+
+
+# [B61] Socket timeout for the whole SMTP conversation. Without it the socket inherits the
+# global default -- None -- and a stalled send hangs forever.
+#
+# That is not a theoretical leak. send() is called via asyncio.to_thread from dispatch(),
+# which is awaited inside run_cycle, which runs inside guarded_cycle's `async with lock`. A
+# hung send therefore holds the cycle lock for as long as the socket hangs, and the scheduler
+# prints "skip cycle" every 60s while the monitor stops probing and keeps serving the last
+# verdict. That is B42 exactly: 13h 34m on 2026-08-29, reporting UP throughout.
+#
+# 30s is generous for this payload -- a DOWN email carries a screenshot and measures ~220KB --
+# while capping the damage at half a cycle. NOTE this bounds the hang; it does not fix B42.
+# The structural fix is dispatching off the cycle lock, which is still open.
+_SMTP_TIMEOUT_S = 30
 
 
 def _parse_email_list(emails_str: str) -> list:
@@ -28,87 +44,167 @@ def _format_duration(duration_s: int) -> str:
     return f"{seconds}s"
 
 
-def _format_time_ago(ts: str) -> str:
-    """Convert ISO timestamp to human-readable 'X minutes ago' format."""
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc)
-    started = datetime.fromisoformat(ts)
-    diff = (now - started).total_seconds()
+# The fixed body keys, in emission order. Every DOWN and RECOVERED email carries all of
+# them so one Power Automate parser reads both without branching on STATUS; a key that does
+# not apply to the event carries NOT_APPLICABLE rather than being omitted.
+MONITOR_NAME = "Online Banking Monitor Lite"
+ALERT_SOURCE = "Teachers RPA Team"
+NOT_APPLICABLE = "N/A"
 
-    if diff < 60:
-        return f"{int(diff)} seconds ago"
-    minutes, _ = divmod(int(diff), 60)
-    if minutes < 60:
-        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours} hour{'s' if hours != 1 else ''}, {minutes} minute{'s' if minutes != 1 else ''} ago"
+
+def _default_url(fail_layer) -> str:
+    """The URL the failed layer was actually looking at. The authed check navigates
+    AUTHED_URL directly (never derived from LOGIN_URL), so an authed alert that printed
+    TARGET_URL would name a page that was never probed."""
+    if fail_layer == "authed" and config.AUTHED_URL:
+        return config.AUTHED_URL
+    return config.TARGET_URL
+
+
+def _build_subject(status: str, target_name: str, stamp_eastern: str) -> str:
+    """Pipe-delimited so a Power Automate trigger can split the subject into fields
+    without parsing prose. Field 2 is the machine-readable status."""
+    return f"[OLB MONITOR LITE]|{status}|{target_name} Online Banking|{stamp_eastern}"
+
+
+def _build_body(*, status: str, service: str, description: str,
+                start_time: str, end_time: str, duration: str, url: str) -> str:
+    """The fixed nine-key body. Order and key names are the contract the Teams flow parses
+    -- changing either breaks the card, so treat this like a schema, not like copy."""
+    return "\n".join([
+        f"MONITOR: {MONITOR_NAME}", "",
+        f"STATUS: {status}", "",
+        f"SERVICE: {service}", "",
+        "DESCRIPTION:", description, "",
+        f"START_TIME: {start_time}", "",
+        f"END_TIME: {end_time}", "",
+        f"DURATION: {duration}", "",
+        f"URL: {url}", "",
+        f"SOURCE: {ALERT_SOURCE}",
+    ])
 
 
 def _build_down_subject(event: DownEvent) -> str:
-    """Build the DOWN email subject line."""
     target = event.target_name or config.TARGET_NAME
-    layer_desc = email_layer_subject(event.trigger_layer)
-    # Extract time from ISO timestamp (e.g., "2026-08-11T14:00:00+00:00" -> "14:00")
-    time_part = event.since_ts[11:16] if len(event.since_ts) > 10 else ""
-    return f"[MONITOR] {target} Online Banking DOWN — {layer_desc} {time_part}".strip()
+    return _build_subject("DOWN", target, to_eastern_without_offset(event.since_ts))
 
 
 def _build_down_body(event: DownEvent) -> str:
-    """Build the DOWN email body text (plain text part of multipart)."""
     target = event.target_name or config.TARGET_NAME
-    layer_desc = email_layer_body(event.trigger_layer)
-    time_ago = _format_time_ago(event.since_ts)
-    started_eastern = to_eastern(event.since_ts)
-
-    # Reason: if there's only one fail_reason repeated, say "checked X times";
-    # otherwise list the distinct reasons
-    if event.fail_reasons:
-        first_reason = event.fail_reasons[0]
-        reason_text = email_reason_text(first_reason)
-        check_count = len(event.fail_reasons)
-    else:
-        reason_text = "unknown"
-        check_count = 0
-
-    lines = [
-        "This is Online Banking Monitor Lite — a monitor built by Francisco and Dylan from Teachers RPA team.",
-        "",
-        f"{target}'s {layer_desc}",
-        "",
-        f"Started {started_eastern}, {time_ago}.",
-        "",
-        f"Checked {check_count} times in a row — {reason_text}.",
-        "",
-        f"URL: {event.page_url or config.TARGET_URL}",
-    ]
-
-    return "\n".join(lines)
+    return _build_body(
+        status="DOWN",
+        service=email_service_name(event.trigger_layer, target),
+        description=email_description(event.trigger_layer, target),
+        start_time=to_eastern_without_offset(event.since_ts),
+        end_time=NOT_APPLICABLE,   # the incident is open; it has no end yet
+        duration=NOT_APPLICABLE,
+        url=event.page_url or _default_url(event.trigger_layer),
+    )
 
 
 def _build_recovery_subject(event: RecoveryEvent) -> str:
-    """Build the RECOVERY email subject line."""
     target = event.target_name or config.TARGET_NAME
-    # Extract time from ISO timestamp (e.g., "2026-08-11T14:07:30+00:00" -> "14:07")
-    time_part = event.ended_at[11:16] if len(event.ended_at) > 10 else ""
-    return f"[MONITOR] {target} Online Banking Recovered {time_part}".strip()
+    return _build_subject("RECOVERED", target, to_eastern_without_offset(event.ended_at))
 
 
 def _build_recovery_body(event: RecoveryEvent) -> str:
-    """Build the RECOVERY email body text."""
     target = event.target_name or config.TARGET_NAME
-    duration_text = _format_duration(event.duration_s)
+    return _build_body(
+        status="RECOVERED",
+        service=email_service_name(event.trigger_layer, target),
+        description=email_description(event.trigger_layer, target, recovered=True),
+        start_time=to_eastern_without_offset(event.since_ts),
+        end_time=to_eastern_without_offset(event.ended_at),
+        duration=_format_duration(event.duration_s),
+        url=event.page_url or _default_url(event.trigger_layer),
+    )
 
-    lines = [
-        "This is Online Banking Monitor Lite — a monitor built by Francisco and Dylan from Teachers RPA team.",
-        "",
-        f"{target}'s online banking has recovered and is now loading normally.",
-        "",
-        f"The outage lasted {duration_text}.",
-        "",
-        f"URL: {event.page_url or config.TARGET_URL}",
-    ]
 
-    return "\n".join(lines)
+def _build_blind_subject(event: BlindEvent) -> str:
+    """A distinct prefix so this can never be mistaken for -- or filtered with -- an outage.
+    Prose and admin-only, deliberately outside the machine-parsed format the Teams flow
+    reads: this is a statement about the monitor, not a report about the platform."""
+    name = event.target_name or config.TARGET_NAME
+    if event.recovered:
+        return f"[MONITOR-BLIND] {name} — sign-in monitoring resumed"
+    minutes = event.blind_for_s // 60
+    prefix = "STILL not monitored" if event.escalation else "sign-in not monitored"
+    return f"[MONITOR-BLIND] {name} — {prefix} for {_format_duration(event.blind_for_s)}"
+
+
+def _build_blind_body(event: BlindEvent) -> str:
+    name = event.target_name or config.TARGET_NAME
+    if event.recovered:
+        return (
+            f"Sign-in monitoring for {name} has resumed. A check passed again after "
+            f"{_format_duration(event.blind_for_s)} without one.\n"
+            f"\n"
+            f"Nothing about this says the platform was down during that window -- only that "
+            f"the monitor could not tell you either way."
+        )
+    return (
+        f"Sign-in monitoring has not completed a successful check in "
+        f"{_format_duration(event.blind_for_s)}.\n"
+        f"\n"
+        f"This is NOT a report that online banking is down. It means the monitor cannot "
+        f"currently tell you either way.\n"
+        f"\n"
+        f"  Last successful sign-in check:  {to_eastern(event.since_ts) if event.since_ts else 'never'}\n"
+        f"  Why checking stopped:           {event.reason}\n"
+        f"  Public website + login page:    {event.main_status or 'unknown'}\n"
+        f"\n"
+        f"Still being watched:  the public website and the login page.\n"
+        f"Not being watched:    everything behind sign-in."
+    )
+
+
+def _build_breaker_subject(event: LoginBreakerEvent) -> str:
+    """Prose and admin-only, deliberately outside the machine-parsed format: this is not an
+    outage report and must not render a Teams card."""
+    return (f"[MONITOR-CONFIG] {event.target_name or config.TARGET_NAME} sign-in attempts "
+            f"halted {to_eastern_without_offset(event.ts)}")
+
+
+def _build_breaker_body(event: LoginBreakerEvent) -> str:
+    status = event.track_status or "unchanged"
+    return (
+        f"The monitor has stopped attempting sign-ins after "
+        f"{event.consecutive_failures} consecutive failed attempts, to protect the account "
+        f"from repeated credential submission.\n"
+        f"\n"
+        f"Last failure:      {event.last_reason or 'unknown'}\n"
+        f"Sign-in status:    {status}\n"
+        f"Retrying:          one attempt every {event.cooldown_s // 60} minutes until one "
+        f"succeeds\n"
+        f"\n"
+        f"This is NOT a new outage report. If online banking is down you have already been "
+        f"alerted separately; this only explains why the sign-in checks go quiet from here. "
+        f"The sign-in status above is left exactly as the evidence found it -- it is not "
+        f"downgraded just because the monitor stopped trying."
+    )
+
+
+def _build_config_cleared_subject(event: RecoveryEvent) -> str:
+    """[B59] Deliberately prose and admin-only, matching the CONFIG_ERROR alert it closes --
+    NOT the machine-parsed RECOVERED format, which the Power Automate flow reads."""
+    return (f"[MONITOR-CONFIG] {config.TARGET_NAME} configuration error cleared "
+            f"{to_eastern_without_offset(event.ended_at)}")
+
+
+def _build_config_cleared_body(event: RecoveryEvent) -> str:
+    reasons = ", ".join(event.fail_reasons) or "unknown"
+    return (
+        f"The configuration error reported earlier has cleared and sign-in checks have "
+        f"resumed.\n"
+        f"\n"
+        f"Raised:   {to_eastern(event.since_ts)} ({reasons})\n"
+        f"Cleared:  {to_eastern(event.ended_at)}\n"
+        f"Latched:  {_format_duration(event.duration_s)}\n"
+        f"\n"
+        f"This was NOT a platform outage -- online banking was not reported down, and this "
+        f"period is excluded from uptime. The duration above is how long the check was "
+        f"paused, not how long anything was broken."
+    )
 
 
 def _build_config_subject(event: ConfigErrorEvent) -> str:
@@ -140,10 +236,42 @@ class EmailGmailChannel(AlertChannel):
             screenshot = event.screenshot_path
             recipients = _parse_email_list(config.RECIPIENTS_EMAIL)
         elif isinstance(event, RecoveryEvent):
-            subject = _build_recovery_subject(event)
-            body = _build_recovery_body(event)
-            screenshot = None  # no screenshot for recovery
-            recipients = _parse_email_list(config.RECIPIENTS_EMAIL)
+            # [B59] A cleared CONFIG_ERROR is NOT an outage recovery and must not be
+            # announced as one. Both leave through the same state-machine path, so without
+            # this discriminator the channel mailed every recipient "...has recovered and is
+            # now loading normally. The outage lasted 5m 0s." Two falsehoods at once: they
+            # were never told of an outage (CONFIG_ERROR goes to ADMIN_EMAIL only), and there
+            # was no outage -- Rule 7 says so, and uptime_pct excludes it from both sides for
+            # exactly this reason. The duration measured how long a human took to notice.
+            #
+            # It also protects the Teams card: RECOVERED is a machine-parsed format, so a
+            # bogus one renders a card for an incident the flow never saw open.
+            if event.from_status == "CONFIG_ERROR":
+                if not config.ADMIN_EMAIL:
+                    return  # same routing as the CONFIG_ERROR alert this pairs with
+                subject = _build_config_cleared_subject(event)
+                body = _build_config_cleared_body(event)
+                screenshot = None
+                recipients = [config.ADMIN_EMAIL.strip()]
+            else:
+                subject = _build_recovery_subject(event)
+                body = _build_recovery_body(event)
+                screenshot = None  # no screenshot for recovery
+                recipients = _parse_email_list(config.RECIPIENTS_EMAIL)
+        elif isinstance(event, BlindEvent):
+            if not config.ADMIN_EMAIL:
+                return  # admin-only, same routing as CONFIG_ERROR
+            subject = _build_blind_subject(event)
+            body = _build_blind_body(event)
+            screenshot = None
+            recipients = [config.ADMIN_EMAIL.strip()]
+        elif isinstance(event, LoginBreakerEvent):
+            if not config.ADMIN_EMAIL:
+                return  # admin-only, same routing as CONFIG_ERROR
+            subject = _build_breaker_subject(event)
+            body = _build_breaker_body(event)
+            screenshot = None
+            recipients = [config.ADMIN_EMAIL.strip()]
         elif isinstance(event, ConfigErrorEvent):
             if not config.ADMIN_EMAIL:
                 return  # ADMIN_EMAIL not configured; CONFIG_ERROR notifications disabled
@@ -201,7 +329,7 @@ class EmailGmailChannel(AlertChannel):
         # Send via SMTP to all recipients (To + Cc + Bcc)
         all_recipients = to_list + cc_list + bcc_list
         try:
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=_SMTP_TIMEOUT_S) as server:
                 server.login(config.GMAIL_USER, config.GMAIL_APP_PASSWORD)
                 server.sendmail(config.GMAIL_USER, all_recipients, msg.as_string())
         except Exception as exc:

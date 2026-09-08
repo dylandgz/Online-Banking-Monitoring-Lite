@@ -25,6 +25,12 @@ class CheckResult:
     # away to it. Both report element_missing, and telling them apart cost a multi-hour
     # diagnosis on 2026-08-27 because nothing wrote down the URL.
     page_url: Optional[str] = None
+    # [B63] Whatever the page said when it failed, verbatim and truncated -- the sentence a
+    # human would have read off the screen. Diagnostics ONLY: no classifier consults it, so a
+    # page whose message we cannot locate costs a poorer log line and never a wrong verdict.
+    # Both 2026-09-03 and 2026-09-06 took opening a PNG to diagnose, and on 2026-09-04 eleven
+    # failures captured no PNG at all (B65).
+    evidence_text: Optional[str] = None
     layer: str = "render"  # "pulse" | "render" -- the strongest layer this probe actually evaluated
     # [v3.8 / Stage R] populated only by perform_check() (the combined pulse+render probe
     # that opens a cycle) -- None on burst re-probes and the auth journey, which each only

@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from monitor.timeutil import artifact_stamp, now_iso, to_eastern
+from monitor.timeutil import artifact_stamp, now_iso, to_eastern, to_eastern_without_offset
 
 
 def test_winter_utc_converts_to_est():
@@ -23,6 +23,30 @@ def test_offset_always_present_and_unambiguous():
     result = to_eastern("2026-03-08T12:00:00+00:00")
     assert "UTC" in result
     assert result.count(":") >= 3  # H:M:S plus the UTC offset's own colon
+
+
+# --- to_eastern_without_offset: the alert-email stamp (B45) ---------------------------
+# Same conversion as to_eastern(), minus the parenthetical. It is a field in a
+# pipe-delimited subject line, so the exact shape is a parsing contract, not copy.
+
+def test_without_offset_drops_the_parenthetical_but_keeps_the_zone():
+    assert to_eastern_without_offset("2026-09-01T18:32:15+00:00") == "2026-09-01 14:32:15 EDT"
+
+
+def test_without_offset_still_follows_dst():
+    # The zone abbreviation is read from the zone, so the same call yields EST in winter.
+    assert to_eastern_without_offset("2026-01-15T12:00:00+00:00") == "2026-01-15 07:00:00 EST"
+
+
+def test_without_offset_treats_naive_iso_as_utc():
+    # Matches to_eastern(): SQLite round-trips some stamps without an explicit offset.
+    assert to_eastern_without_offset("2026-01-15T12:00:00") == "2026-01-15 07:00:00 EST"
+
+
+def test_without_offset_never_emits_a_pipe():
+    # It is the last field of "[OLB MONITOR LITE]|DOWN|<name>|<stamp>" -- a pipe in the
+    # stamp would add a fifth field and break the Power Automate split.
+    assert "|" not in to_eastern_without_offset("2026-09-01T18:32:15+00:00")
 
 
 # --- now_iso: the storage stamp -------------------------------------------------------

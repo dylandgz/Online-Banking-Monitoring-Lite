@@ -15,7 +15,8 @@ import uvicorn
 import config
 from monitor import check, db, journey, session
 from monitor.channels import build_channels, dispatch
-from monitor.state import ConfigErrorEvent, DownEvent, MonitorState, RecoveryEvent, apply_check
+from monitor.state import (BlindEvent, ConfigErrorEvent, DownEvent, LoginBreakerEvent,
+                           MonitorState, RecoveryEvent, apply_check)
 from monitor.timeutil import now_iso
 from monitor.verdict import severity, unified_verdict
 
@@ -29,6 +30,7 @@ async def _process_probe(
     precursor_down: bool = False,
     cycle_id: str | None = None,
     scoring: bool = True,
+    is_login: bool = False,
 ) -> MonitorState:
     """Writes the check row (Rule 15 "every probe writes a checks row" -- pass or fail), advances
     the pure state machine, persists it, and dispatches any resulting alert.
@@ -69,6 +71,8 @@ async def _process_probe(
         # to disk and its location discarded here.
         page_url=result.page_url,
         screenshot_path=result.screenshot_path,
+        # [B63] What the page said, for the operator. Never read by any classifier.
+        evidence_text=result.evidence_text,
     )
     status = "OK" if result.ok else f"FAIL ({result.fail_reason}, layer={result.layer})"
     shot = f" screenshot={result.screenshot_path}" if result.screenshot_path else ""
@@ -78,7 +82,7 @@ async def _process_probe(
         conn, channels, prev_state, result.ok, result.fail_reason, ts, result.layer,
         track=track, down_confidence=down_confidence, min_failed_probes=min_failed_probes,
         precursor_down=precursor_down, scoring=scoring, screenshot_path=result.screenshot_path,
-        page_url=result.page_url,
+        page_url=result.page_url, is_login=is_login,
     )
 
 
@@ -91,6 +95,7 @@ async def _advance_state(
     scoring: bool = True,
     screenshot_path: str | None = None,
     page_url: str | None = None,
+    is_login: bool = False,
 ) -> MonitorState:
     """Advances the pure state machine, persists it, and dispatches any resulting alert.
 
@@ -109,6 +114,7 @@ async def _advance_state(
         recovery_passes=config.RECOVERY_PASSES,
         precursor_down=precursor_down,
         scoring=scoring,
+        is_login=is_login,
     )
     db.set_state(conn, new_state, track=track)
 
@@ -320,6 +326,10 @@ async def _run_full_login(conn, *, should_logout: bool) -> "check.CheckResult":
             frame_text=config.AUTHED_FRAME_TEXT,
             frame_role=config.AUTHED_FRAME_ROLE,
             frame_name=config.AUTHED_FRAME_NAME,
+            # [D1] The allowlists. A screen matching one of these is Config-class; every
+            # screen matching none is platform evidence that scores and does not halt.
+            reject_patterns=config.AUTH_REJECTED_TEXT,
+            mfa_reject_patterns=config.MFA_REJECTED_TEXT,
         )
         return result
     finally:
@@ -340,6 +350,74 @@ async def _run_full_login(conn, *, should_logout: bool) -> "check.CheckResult":
             )
         except Exception as exc:  # noqa: BLE001 -- last-resort audit write, never fatal
             print(f"[login] CRITICAL: could not record login attempt in login_events: {exc!r}", flush=True)
+
+
+# [Rule 5] One notification per breaker episode, not one per cycle. The predicate below is
+# consulted every time a login is considered, so without this the admin would be mailed every
+# minute for as long as the breaker is open. Reset by a success, which is also what resets the
+# streak -- so the flag and the ledger can never disagree for long.
+_BREAKER: dict = {"notified": False}
+
+
+def _consecutive_login_failures(conn) -> tuple[int, str | None, str | None]:
+    """How many failed login attempts sit at the tail of the ledger, and when the last one
+    was. Derived from `login_events` rather than stored, for the same reason the interval
+    budget is: the ledger is written on the failure path too (`try/finally` in
+    _run_full_login), so it cannot drift out of step with reality."""
+    streak, last_ts, last_reason = 0, None, None
+    for row in db.get_recent_login_events(conn, limit=config.MAX_CONSECUTIVE_LOGIN_FAILURES + 1):
+        if row["ok"]:
+            break
+        if last_ts is None:
+            last_ts, last_reason = row["ts"], row["reason"]
+        streak += 1
+    return streak, last_ts, last_reason
+
+
+async def _login_breaker_allows(conn, channels) -> bool:
+    """Rule 5's credential breaker: `MAX_CONSECUTIVE_LOGIN_FAILURES` consecutive failed
+    attempts halt logins regardless of WHY they failed.
+
+    Why it is screen-independent. [D1] removed the old brake -- an unrecognised screen used to
+    halt the track by being misread as a config error -- so something has to stop repeated
+    credential submission without depending on correctly classifying a screen nobody has
+    captured. Four new screens turned up in the week of 2026-08-31 alone.
+
+    The threshold sits ABOVE AUTH_MIN_FAILED_PROBES (config.py enforces it), so DOWN fires at
+    failure 4 and this trips at 5: the operator is paged before the monitor stops trying. The
+    track's status is deliberately left alone -- see Rule 5 on why forcing CONFIG_ERROR here
+    would downgrade an outage you were paged for one minute earlier.
+
+    While tripped it permits ONE attempt per LOGIN_BREAKER_COOLDOWN_S. Without that the track
+    freezes: no logins means no session, which means no cheap checks either, so it would sit
+    at DOWN long after the platform recovered. A success resets the streak on its own, since
+    the streak is read off the ledger's tail."""
+    streak, last_ts, last_reason = _consecutive_login_failures(conn)
+    if streak < config.MAX_CONSECUTIVE_LOGIN_FAILURES:
+        _BREAKER["notified"] = False   # a success cleared the streak; arm the next episode
+        return True
+
+    since = (datetime.now(timezone.utc) - datetime.fromisoformat(last_ts)).total_seconds()
+    if since < config.LOGIN_BREAKER_COOLDOWN_S:
+        print(f"[{now_iso()}] [auth] login breaker OPEN -- {streak} consecutive failures "
+              f"(last: {last_reason}), next attempt in "
+              f"{config.LOGIN_BREAKER_COOLDOWN_S - since:.0f}s. The track keeps its current "
+              f"status; it is not downgraded to CONFIG_ERROR.", flush=True)
+        if not _BREAKER["notified"]:
+            _BREAKER["notified"] = True
+            event = LoginBreakerEvent(
+                ts=now_iso(), consecutive_failures=streak,
+                cooldown_s=config.LOGIN_BREAKER_COOLDOWN_S, last_reason=last_reason,
+                track_status=db.get_state(conn, track="auth").status,
+                target_name=config.TARGET_NAME,
+            )
+            print(f"[alert] [auth] {event!r}")
+            await dispatch(event, channels)
+        return False
+
+    print(f"[{now_iso()}] [auth] login breaker cooldown elapsed after {streak} consecutive "
+          f"failures -- allowing one attempt.", flush=True)
+    return True
 
 
 def _login_budget_allows(conn) -> bool:
@@ -363,13 +441,42 @@ def _login_budget_allows(conn) -> bool:
     return True
 
 
+def _session_is_usable() -> bool:
+    """Is there a saved session worth reusing? The gate on every zero-login probe."""
+    return session.is_session_fresh(config.SESSION_STATE_PATH, config.SESSION_MAX_AGE_S)
+
+
+async def _cheap_authed_check() -> "check.CheckResult":
+    """The zero-login probe: reuse the saved session, assert the authed markers. Extracted so
+    the confirmation burst can call it DIRECTLY rather than going through _run_auth_probe,
+    which contains the recovery-login path (Rule 5 "a burst consumes zero logins")."""
+    return await journey.run_authed_check(
+        authed_url=config.AUTHED_URL,
+        authed_text=config.AUTHED_REQUIRED_TEXT,
+        authed_role=config.AUTHED_REQUIRED_ROLE,
+        authed_name=config.AUTHED_REQUIRED_NAME,
+        error_banner_text=config.ERROR_BANNER_TEXT,
+        browser_channel=config.BROWSER_CHANNEL,
+        session_state_path=config.SESSION_STATE_PATH,
+        browser_timeout_ms=config.BROWSER_TIMEOUT_MS,
+        challenge_timeout_ms=config.CHALLENGE_TIMEOUT_MS,
+        artifacts_dir=config.ARTIFACTS_DIR,
+        mask_patterns=config.MASK_TEXT,
+        masking_enabled=config.MASKING_ENABLED,
+        frame_url=config.AUTHED_FRAME_URL,
+        frame_text=config.AUTHED_FRAME_TEXT,
+        frame_role=config.AUTHED_FRAME_ROLE,
+        frame_name=config.AUTHED_FRAME_NAME,
+    )
+
+
 def _session_expired_result() -> "check.CheckResult":
     return check.CheckResult(ok=False, http_status=None, latency_ms=0.0, fail_reason="session_expired", layer="authed")
 
 
 async def _run_auth_probe(
-    conn, main_down: bool, login_budget_state: dict
-) -> tuple["check.CheckResult", bool]:
+    conn, channels, main_down: bool, login_budget_state: dict
+) -> tuple["check.CheckResult", bool, bool]:
     """One auth-track probe attempt for this cycle. Cheap session-reuse check first
     (zero logins). session_expired (or no session at all) triggers exactly one budgeted
     recovery login per cycle (Rule 5 "the login budget is a hard limit") -- UNLESS the main track's precursor is already
@@ -389,25 +496,9 @@ async def _run_auth_probe(
     contradicting the "Cross-track suppression" section's own wording that NULL means the track didn't run, and painting
     the dashboard's authed badge red on a completely healthy platform."""
     result = None
-    if session.is_session_fresh(config.SESSION_STATE_PATH, config.SESSION_MAX_AGE_S):
-        result = await journey.run_authed_check(
-            authed_url=config.AUTHED_URL,
-            authed_text=config.AUTHED_REQUIRED_TEXT,
-            authed_role=config.AUTHED_REQUIRED_ROLE,
-            authed_name=config.AUTHED_REQUIRED_NAME,
-            error_banner_text=config.ERROR_BANNER_TEXT,
-            browser_channel=config.BROWSER_CHANNEL,
-            session_state_path=config.SESSION_STATE_PATH,
-            browser_timeout_ms=config.BROWSER_TIMEOUT_MS,
-            challenge_timeout_ms=config.CHALLENGE_TIMEOUT_MS,
-            artifacts_dir=config.ARTIFACTS_DIR,
-            mask_patterns=config.MASK_TEXT,
-            masking_enabled=config.MASKING_ENABLED,
-            frame_url=config.AUTHED_FRAME_URL,
-            frame_text=config.AUTHED_FRAME_TEXT,
-            frame_role=config.AUTHED_FRAME_ROLE,
-            frame_name=config.AUTHED_FRAME_NAME,
-        )
+    was_login = False   # [B50] the recovery rule needs to know; see state.apply_check's is_login
+    if _session_is_usable():
+        result = await _cheap_authed_check()
 
     # The cheap check ran and produced a real observation if we got a result at all.
     probed = result is not None
@@ -417,13 +508,18 @@ async def _run_auth_probe(
         # the "Cross-track suppression" section: recovery logins are paused while the precursor is DOWN. If the cheap
         # check itself ran and said session_expired, that IS a real observation (probed
         # stays True); if there was no session to check, nothing was observed.
-        return (result, probed) if result is not None else (_session_expired_result(), False)
+        return ((result, probed, False) if result is not None
+                else (_session_expired_result(), False, False))
 
     if needs_recovery and not login_budget_state["used"]:
-        if _login_budget_allows(conn):
+        # Two independent gates, deliberately separate: the interval throttles a healthy
+        # monitor, the breaker stops an unhealthy one. Both are checked, so whichever is
+        # longer wins and a short cooldown is merely ineffective rather than unsafe.
+        if await _login_breaker_allows(conn, channels) and _login_budget_allows(conn):
             login_budget_state["used"] = True
             result = await _run_full_login(conn, should_logout=False)
             probed = True  # a real login attempt is very much an observation
+            was_login = True
         elif result is None:
             result = _session_expired_result()
         # else: budget says wait -- keep the cheap check's own session_expired result.
@@ -432,18 +528,32 @@ async def _run_auth_probe(
         # plainly rather than silently doing nothing (Rule 15 "every probe writes a checks row").
         result = _session_expired_result()
 
-    return result, probed
+    return result, probed, was_login
 
 
 async def _run_auth_burst_reprobes(
-    conn, channels, state: MonitorState, cycle_id: str,
-    main_down: bool, login_budget_state: dict,
+    conn, channels, state: MonitorState, cycle_id: str, main_down: bool,
 ) -> tuple[MonitorState, "check.CheckResult", str]:
-    """[v3.8 / Stage R] Auth-track confirmation burst: re-probes with the cheap
-    session-reuse check, spaced by BURST_GAP_S like the main track -- zero logins per probe
-    (Rule 5 "the login budget is a hard limit"). A session_expired probe mid-burst is inert (Rule 3 "session_expired never scores": doesn't count, burst
-    stays open) and, per the "Cross-track suppression" section, doesn't get its own recovery login if main is down or
-    if this cycle's one budgeted login was already spent."""
+    """[v3.8 / Stage R] Auth-track confirmation burst: re-probes with the cheap session-reuse
+    check, spaced by BURST_GAP_S like the main track -- zero logins, ever.
+
+    [B45 / 2026-09-07] It now calls _cheap_authed_check() DIRECTLY. It used to call
+    _run_auth_probe(), which contains the recovery-login path, so a burst probe silently became
+    a full credentialed login whenever the session went stale mid-burst and the cycle's budget
+    slot was still free. Rule 5 states plainly that "a burst consumes zero logins"; the code
+    simply did not comply. Observed twice: on 2026-08-31 a login inside a burst SUCCEEDED and
+    wiped three accumulated failures, and on 2026-09-04 five of them failed and put their
+    evidence on a layer the track could never recover from (B50) -- 12h 36m stuck.
+
+    It also STOPS when there is no usable session, instead of spinning. Every probe in that
+    state returned a synthetic session_expired, which Rule 3 makes completely inert: it cannot
+    confirm the run and cannot clear it, so the burst learned nothing while holding the cycle
+    lock. On 2026-09-06 that turned single cycles into 3h 19m and 4h 25m lock-holders, because
+    each 25s gap spanned a host suspend -- B42's signature from a new direction.
+
+    Ending early is not a detection loss. Evidence persists across cycles with no time window
+    (B38), so a run sitting at 3 is continued by the next cycle's budgeted login: ~2-3 minutes
+    later, not never. Before B38 this same change would have been a regression."""
     burst_id = str(uuid.uuid4())
     last_result = None
     run_started = state.evidence("authed").run_started_ts
@@ -451,12 +561,12 @@ async def _run_auth_burst_reprobes(
     for _ in range(config.BURST_PROBES):
         if state.status != "UP" or state.evidence("authed").run_started_ts != run_started:
             break  # already resolved: DOWN fired, or a pass cleared the run
+        if not _session_is_usable():
+            break  # nothing to learn without spending a login, which Rule 5 forbids here
 
         await _wait_burst_gap()
 
-        # The burst only needs the result; whether it counted as a real observation
-        # matters to the cycles row, which the initiating probe already decided.
-        result, _probed = await _run_auth_probe(conn, main_down, login_budget_state)
+        result = await _cheap_authed_check()
         last_result = result
         state = await _process_probe(
             conn, channels, state, result, now_iso(), burst_id,
@@ -492,6 +602,78 @@ def _cycle_fail_info(
         return fail_layer, fail_reason
     fail_reason = auth_state.fail_reasons[-1] if auth_state and auth_state.fail_reasons else (last_auth_result.fail_reason if last_auth_result else None)
     return "authed", fail_reason
+
+
+# [BLIND] One notification per episode plus one escalation, not one per cycle.
+_BLIND: dict = {"notified": False, "escalated": False}
+
+
+def _blind_reason(conn, auth_state: MonitorState | None) -> str:
+    """WHY the auth track has gone quiet, in the operator's terms. This line is what makes a
+    benign instance readable at a glance instead of alarming."""
+    if auth_state is None:
+        return "the sign-in track is not configured"
+    if auth_state.status == "CONFIG_ERROR":
+        return f"sign-in checks are halted ({', '.join(auth_state.fail_reasons) or 'config error'})"
+    streak, _ts, last_reason = _consecutive_login_failures(conn)
+    if streak >= config.MAX_CONSECUTIVE_LOGIN_FAILURES:
+        return (f"login attempts halted after {streak} consecutive failures "
+                f"(last: {last_reason})")
+    if not _GRACE["until"] and not _session_is_usable():
+        return "no usable session, and no login has succeeded to replace it"
+    if _GRACE["until"]:
+        return "the monitor was not running"
+    return "the sign-in check has not passed"
+
+
+async def _check_blind(conn, channels, auth_enabled: bool, auth_state, main_status: str) -> None:
+    """[BLIND / 2026-09-08] Alarm on the ABSENCE of positive evidence.
+
+    The monitor could previously say only "everything is fine" or "the bank is down". There
+    was no way to say "I cannot currently tell you" -- and in the week of 2026-08-31 that
+    third state occurred repeatedly and silently: three CONFIG_ERROR latches (~21 hours) and a
+    9.5-hour host suspend, none of which notified anyone.
+
+    Deliberately reads the newest PASSING authed probe, not the newest probe: a failing one,
+    and especially an inert synthetic session_expired, is the monitor recording that it wanted
+    to look and could not.
+
+    It fires even when the host was asleep. The monitor is meant to be running, so a suspend
+    is something to be told about rather than filtered out -- the reason line is what
+    distinguishes that from something alarming."""
+    if not auth_enabled:
+        return
+
+    last_pass = db.get_last_passing_authed_ts(conn)
+    if last_pass is None:
+        return  # nothing has ever passed; no baseline to be blind relative to
+
+    blind_for = (datetime.now(timezone.utc) - datetime.fromisoformat(last_pass)).total_seconds()
+
+    if blind_for < config.BLIND_AFTER_S:
+        if _BLIND["notified"]:
+            _BLIND.update(notified=False, escalated=False)
+            await dispatch(BlindEvent(
+                ts=now_iso(), since_ts=last_pass, blind_for_s=round(blind_for),
+                reason="a sign-in check passed again", recovered=True,
+                main_status=main_status, target_name=config.TARGET_NAME), channels)
+        return
+
+    escalating = (not _BLIND["escalated"]
+                  and blind_for >= config.BLIND_ESCALATE_AFTER_S
+                  and _BLIND["notified"])
+    if _BLIND["notified"] and not escalating:
+        return
+
+    _BLIND["notified"] = True
+    if escalating:
+        _BLIND["escalated"] = True
+    event = BlindEvent(
+        ts=now_iso(), since_ts=last_pass, blind_for_s=round(blind_for),
+        reason=_blind_reason(conn, auth_state), escalation=escalating,
+        main_status=main_status, target_name=config.TARGET_NAME)
+    print(f"[alert] [auth] {event!r}")
+    await dispatch(event, channels)
 
 
 async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = None) -> None:
@@ -578,22 +760,22 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
         else:
             login_budget_state = {"used": False}
 
-            auth_result, auth_probed = await _run_auth_probe(conn, main_down, login_budget_state)
+            auth_result, auth_probed, auth_was_login = await _run_auth_probe(
+                conn, channels, main_down, login_budget_state)
             ts_auth = now_iso()
             new_auth_state = await _process_probe(
                 conn, channels, prev_auth_state, auth_result, ts_auth, burst_id=None,
                 browser_mode=config.JOURNEY_BROWSER_MODE, track="auth",
                 down_confidence=config.AUTH_DOWN_CONFIDENCE,
                 min_failed_probes=config.AUTH_MIN_FAILED_PROBES, precursor_down=main_down,
-                cycle_id=cycle_id, scoring=scoring,
+                cycle_id=cycle_id, scoring=scoring, is_login=auth_was_login,
             )
             last_auth_result = auth_result
 
             if (new_auth_state.status == "UP"
                     and new_auth_state.evidence("authed").run_started_ts):
                 new_auth_state, burst_last_auth_result, auth_burst_id = await _run_auth_burst_reprobes(
-                    conn, channels, new_auth_state, cycle_id=cycle_id,
-                    main_down=main_down, login_budget_state=login_budget_state,
+                    conn, channels, new_auth_state, cycle_id=cycle_id, main_down=main_down,
                 )
                 if burst_last_auth_result is not None:
                     last_auth_result = burst_last_auth_result
@@ -646,6 +828,10 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
     print(f"[{ts}] [cycle {cycle_id[:8]}] verdict={verdict}"
           + (f" ({fail_layer}: {fail_reason})" if fail_reason else "")
           + (f" burst={burst_id[:8]}" if burst_id else ""))
+
+    # [BLIND] Evaluated after the cycles row is written, so a notification can never cost the
+    # audit row -- same ordering discipline as Rule 9's self-health net.
+    await _check_blind(conn, channels, auth_enabled, new_auth_state, new_main_state.status)
 
 
 async def guarded_cycle(conn, channels, lock: asyncio.Lock, auth_enabled: bool) -> None:

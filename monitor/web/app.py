@@ -164,9 +164,26 @@ def api_status(conn=Depends(get_conn)):
         if inc.get("ended_at"):
             inc["ended_at"] = to_eastern(inc["ended_at"])
 
+    # [BLIND / 2026-09-08] Deliberately a FIELD, not a status. It is a statement about the
+    # monitor, not the platform, so it must not enter `status` -- filing "we could not
+    # measure" in the same place as "the bank is down" is the conflation uptime_pct was
+    # rewritten to remove. The banner keeps showing the real verdict; this sits beside it.
+    last_authed_pass = db.get_last_passing_authed_ts(conn)
+    blind_for_s = (
+        round((now - datetime.fromisoformat(last_authed_pass)).total_seconds())
+        if last_authed_pass else None
+    )
+    blind = {
+        "is_blind": blind_for_s is not None and blind_for_s >= config.BLIND_AFTER_S,
+        "blind_for_s": blind_for_s,
+        "last_authed_pass": to_eastern(last_authed_pass) if last_authed_pass else None,
+        "threshold_s": config.BLIND_AFTER_S,
+    }
+
     return {
         "target_name": config.TARGET_NAME,
         "target_url": config.TARGET_URL,
+        "blind": blind,
         "status": verdict,
         "since_ts": to_eastern(since_ts) if since_ts else None,
         "fail_layer": fail_layer,
@@ -235,6 +252,7 @@ def _split_main_probe(row: dict, cycle: dict) -> list[dict]:
         # The browser leg produces these; the pulse is a plain HTTP GET.
         page_url=None,
         screenshot_path=None,
+        evidence_text=None,
     )
 
     render_line = dict(row)
@@ -280,7 +298,7 @@ _EXPORT_COLUMNS = {
         ("latency_ms", "latency_ms"), ("fail_reason", "fail_reason"), ("browser_mode", "browser_mode"),
         ("layer", "layer"), ("burst_id", "burst_id"), ("cycle_id", "cycle_id"),
         ("page_url", "page_url"), ("screenshot_path", "screenshot_path"),
-        ("scored", "scored"),
+        ("evidence_text", "evidence_text"), ("scored", "scored"),
     ],
 }
 

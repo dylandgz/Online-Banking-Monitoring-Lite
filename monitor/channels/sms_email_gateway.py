@@ -16,7 +16,8 @@ from email.mime.text import MIMEText
 import config
 from monitor.channels.base import AlertChannel, AlertEvent
 from monitor.channels.sms_twilio import config_message, down_message, recovery_message
-from monitor.state import ConfigErrorEvent, DownEvent, RecoveryEvent
+from monitor.state import (BlindEvent, ConfigErrorEvent, DownEvent, LoginBreakerEvent,
+                           RecoveryEvent)
 
 SMS_GATEWAY_ADDRESSES = [a.strip() for a in (os.getenv("SMS_GATEWAY_ADDRESS") or "").split(",") if a.strip()]
 
@@ -29,8 +30,9 @@ class SmsEmailGatewayChannel(AlertChannel):
             body = down_message(event, config.TARGET_NAME)
         elif isinstance(event, RecoveryEvent):
             body = recovery_message(event, config.TARGET_NAME)
-        elif isinstance(event, ConfigErrorEvent):
-            return  # ConfigErrorEvent does not trigger SMS alerts
+        elif isinstance(event, (ConfigErrorEvent, LoginBreakerEvent, BlindEvent)):
+            # Neither is an outage. Both go to ADMIN_EMAIL only; SMS is for paging.
+            return
         else:
             raise TypeError(f"unknown event type: {event!r}")
 

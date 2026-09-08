@@ -31,33 +31,34 @@ _LAYER_WORDING = {
     "authed": AUTHED_WORDING,
 }
 
-# Plain-English descriptions for email notifications (B44)
-_EMAIL_LAYER_DESCRIPTION = {
-    "pulse": {
-        "subject": "website not responding",
-        "body": "website is not responding. Customers cannot reach the login page.",
-    },
-    "render": {
-        "subject": "sign-in page not loading",
-        "body": "sign-in page is not loading correctly. Customers can reach the website, but the login form is not appearing.",
-    },
-    "authed": {
-        "subject": "not loading after sign-in",
-        "body": "online banking is not loading after sign-in. Customers can sign in, but their accounts are not appearing.",
-    },
+# [B45] The DOWN/RECOVERED email vocabulary, for the fixed-key format Power Automate parses
+# into a Teams card. Two facts per layer: the SERVICE line (what stopped working, named the
+# way a business reader would name it) and the DESCRIPTION line (what a customer experiences).
+# Neither ever names a probe, a layer or a fail_reason -- the screenshot carries the detail.
+# The CONFIG_ERROR email predates this and deliberately does not use these tables.
+_EMAIL_SERVICE = {
+    "pulse": "{name} Online Banking Website",
+    "render": "{name} Online Banking Login Page",
+    "authed": "{name} Online Banking Account Access",
 }
 
-# Reason codes mapped to plain English for email
-_EMAIL_REASON_TEXT = {
-    "dns": "the website's address could not be looked up",
-    "conn_refused": "the server refused the connection",
-    "timeout": "the server did not respond in time",
-    "nav_error": "the page failed to load",
-    "element_missing": "the page loaded, but the expected content never appeared",
-    "bad_status:500": "the server returned an error (HTTP 500)",
-    "bad_status:502": "the server returned an error (HTTP 502)",
-    "bad_status:503": "the server returned an error (HTTP 503)",
+_EMAIL_DOWN_DESCRIPTION = {
+    "pulse": "{name}'s website is not responding. Customers may be unable to access Online Banking.",
+    "render": "{name}'s sign-in page is not loading. Customers can reach the website, but the login form is not appearing, so they cannot sign in.",
+    "authed": "{name}'s Online Banking is not loading after sign-in. Customers can sign in, but their accounts are not appearing.",
 }
+
+_EMAIL_RECOVERY_DESCRIPTION = {
+    "pulse": "{name}'s website is responding again. Customers can reach Online Banking.",
+    "render": "{name}'s sign-in page is loading again. Customers can sign in normally.",
+    "authed": "{name}'s Online Banking is loading again after sign-in. Customers can see their accounts.",
+}
+
+# Fallbacks for an unmapped layer. An alert must still send with a vaguer description rather
+# than not send at all -- and RecoveryEvent.trigger_layer is Optional, so None lands here too.
+_EMAIL_SERVICE_FALLBACK = "{name} Online Banking"
+_EMAIL_DOWN_FALLBACK = "{name}'s Online Banking is not available."
+_EMAIL_RECOVERY_FALLBACK = "{name}'s Online Banking is available again."
 
 
 def severity(status: str) -> int:
@@ -83,30 +84,15 @@ def layer_wording(fail_layer: Optional[str]) -> Optional[str]:
     return _LAYER_WORDING.get(fail_layer) if fail_layer else None
 
 
-def email_layer_subject(fail_layer: Optional[str]) -> str:
-    """Plain-English subject line fragment for email alerts (B44)."""
-    if not fail_layer:
-        return "online banking not available"
-    desc = _EMAIL_LAYER_DESCRIPTION.get(fail_layer)
-    return desc["subject"] if desc else "online banking not available"
+def email_service_name(fail_layer: Optional[str], target_name: str) -> str:
+    """The SERVICE line of a DOWN/RECOVERED email (B45)."""
+    return _EMAIL_SERVICE.get(fail_layer or "", _EMAIL_SERVICE_FALLBACK).format(name=target_name)
 
 
-def email_layer_body(fail_layer: Optional[str]) -> str:
-    """Plain-English body text for email alerts (B44)."""
-    if not fail_layer:
-        return "online banking is not available."
-    desc = _EMAIL_LAYER_DESCRIPTION.get(fail_layer)
-    return desc["body"] if desc else "online banking is not available."
-
-
-def email_reason_text(fail_reason: str) -> str:
-    """Convert a fail_reason code to plain English for email (B44)."""
-    # Try exact match first
-    if fail_reason in _EMAIL_REASON_TEXT:
-        return _EMAIL_REASON_TEXT[fail_reason]
-    # Try prefix match for bad_status codes
-    if fail_reason.startswith("bad_status:"):
-        code = fail_reason.rsplit(":", 1)[-1]
-        return f"the server returned an error (HTTP {code})"
-    # Fallback
-    return fail_reason
+def email_description(fail_layer: Optional[str], target_name: str, *, recovered: bool = False) -> str:
+    """The DESCRIPTION line of a DOWN/RECOVERED email (B45), in customer terms."""
+    if recovered:
+        table, fallback = _EMAIL_RECOVERY_DESCRIPTION, _EMAIL_RECOVERY_FALLBACK
+    else:
+        table, fallback = _EMAIL_DOWN_DESCRIPTION, _EMAIL_DOWN_FALLBACK
+    return table.get(fail_layer or "", fallback).format(name=target_name)

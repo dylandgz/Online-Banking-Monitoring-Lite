@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS checks (
     burst_id TEXT,
     page_url TEXT,
     screenshot_path TEXT,
+    evidence_text TEXT,
     scored INTEGER NOT NULL DEFAULT 1
 );
 
@@ -212,6 +213,19 @@ def _migrate_evidence_columns(conn: sqlite3.Connection) -> None:
     _add_missing_columns(conn, "checks", {"page_url": "TEXT", "screenshot_path": "TEXT"})
 
 
+def _migrate_evidence_text(conn: sqlite3.Connection) -> None:
+    """[B63] checks gains evidence_text: what the page actually SAID when it failed.
+
+    Additive, no backfill -- historic rows carry NULL because nothing captured it. Diagnosing
+    the 2026-09-03 and 2026-09-06 latches both required finding and opening a screenshot to
+    read one sentence off it, and on 2026-09-04 eleven failures captured no screenshot at all
+    (B65), leaving nothing to read. The reason code alone (`mfa_failed`) does not say that the
+    bank was displaying "Login is currently unavailable. Please try again later."
+
+    Diagnostics only: no classifier reads this column."""
+    _add_missing_columns(conn, "checks", {"evidence_text": "TEXT"})
+
+
 def _migrate_scored(conn: sqlite3.Connection) -> None:
     """[B7] checks gains `scored`. A probe taken while the monitor demonstrably was not
     running is recorded but does not count toward DOWN -- and without this column the row
@@ -243,6 +257,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _migrate_evidence_columns(conn)
     _migrate_layer_state(conn)
     _migrate_scored(conn)
+    _migrate_evidence_text(conn)
     _migrate_b44_incidents_page_url(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_burst_id ON checks(burst_id)")
@@ -269,14 +284,15 @@ def append_check(
     cycle_id: str | None = None,
     page_url: str | None = None,
     screenshot_path: str | None = None,
+    evidence_text: str | None = None,
     scored: bool = True,
 ) -> None:
     conn.execute(
         "INSERT INTO checks (ts, ok, http_status, latency_ms, fail_reason, browser_mode, layer, "
-        "burst_id, cycle_id, page_url, screenshot_path, scored) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "burst_id, cycle_id, page_url, screenshot_path, evidence_text, scored) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (ts, int(ok), http_status, latency_ms, fail_reason, browser_mode, layer, burst_id, cycle_id,
-         page_url, screenshot_path, int(scored)),
+         page_url, screenshot_path, evidence_text, int(scored)),
     )
     conn.commit()
 
@@ -324,7 +340,7 @@ def get_state(conn: sqlite3.Connection, track: str = "main") -> MonitorState:
             name: LayerEvidence(
                 consecutive=d.get("n", 0), confidence=d.get("c", 0),
                 fail_reasons=tuple(d.get("r", ())), last_probe_ts=d.get("t"),
-                run_started_ts=d.get("s"),
+                run_started_ts=d.get("s"), from_login=d.get("l", False),
             )
             for name, d in json.loads(raw).items()
         }
@@ -352,7 +368,7 @@ def get_state(conn: sqlite3.Connection, track: str = "main") -> MonitorState:
 def set_state(conn: sqlite3.Connection, state: MonitorState, track: str = "main") -> None:
     layers_json = json.dumps({
         name: {"n": e.consecutive, "c": e.confidence, "r": list(e.fail_reasons),
-         "t": e.last_probe_ts, "s": e.run_started_ts}
+         "t": e.last_probe_ts, "s": e.run_started_ts, "l": e.from_login}
         for name, e in state.layers.items()
     })
     conn.execute(
@@ -429,6 +445,19 @@ def get_last_check_ts(conn: sqlite3.Connection) -> str | None:
     unhealthy if nothing has been written in 3x CHECK_INTERVAL_S regardless of which
     track wrote it, since either track going silent means the loop itself has stalled."""
     row = conn.execute("SELECT ts FROM checks ORDER BY id DESC LIMIT 1").fetchone()
+    return row["ts"] if row else None
+
+
+def get_last_passing_authed_ts(conn: sqlite3.Connection) -> str | None:
+    """[BLIND] When the auth track last actually PROVED anything -- the newest passing
+    `authed` probe.
+
+    Passing, not merely present: a failing probe, and especially an inert synthetic
+    `session_expired`, is the monitor recording that it wanted to look and could not. Counting
+    those as evidence is exactly how a track goes quiet without anyone noticing."""
+    row = conn.execute(
+        "SELECT ts FROM checks WHERE layer = 'authed' AND ok = 1 ORDER BY id DESC LIMIT 1"
+    ).fetchone()
     return row["ts"] if row else None
 
 

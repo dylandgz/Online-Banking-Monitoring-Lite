@@ -154,7 +154,7 @@ scripts/                # manual drill runners + operator tools -- see each file
                         #   run_signin_drill.py    -- live sign-in, optionally saving the session
                         #   dump_dom.py            -- capture real markup to write locators from
                         #   check_totp.py          -- offline TOTP cross-check vs the phone app
-                        #   clear_config_error.py  -- Rule 10's human "I looked, resume"
+                        #   clear_config_error_and_stuck_down.py -- the human "I looked, resume"
 tests/                  # pytest suite
 ```
 

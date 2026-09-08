@@ -2,8 +2,9 @@
 """Send sample DOWN and RECOVERY emails to RECIPIENTS_EMAIL.
 
 This script demonstrates what monitor alerts look like by sending realistic
-sample emails. It creates temporary 1x1 PNG attachments so you can see how
-screenshots appear in the email, but cleans up after itself.
+sample emails. The DOWN email carries a generated placeholder screenshot clearly
+marked TEST SCREENSHOT, so a recipient can never mistake a sample for a real
+outage artifact. Temporary files are cleaned up afterwards.
 
 Usage:
     python -m scripts.send_sample_recipient_emails
@@ -21,19 +22,48 @@ from monitor.channels.email_gmail import EmailGmailChannel
 from monitor.state import DownEvent, RecoveryEvent
 
 
-# Minimal 1x1 red PNG (68 bytes)
+# Fallback if Chromium is unavailable: a 1x1 red PNG, so the script can still demonstrate
+# the email even on a host where `playwright install` has not been run.
 MINIMAL_PNG = (
     b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01'
     b'\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00'
     b'\x00\x01\x01\x00\x05\x1b\xf1\xde\x00\x00\x00\x00IEND\xaeB`\x82'
 )
 
+# The placeholder is rendered by Playwright rather than drawn by hand: Playwright already
+# takes every real screenshot this monitor attaches, so the sample lands in the inbox as
+# the same kind of artifact -- same encoder, same dimensions, same viewport -- instead of a
+# 1x1 pixel that tells a reviewer nothing about how a real attachment will look.
+PLACEHOLDER_HTML = """<!doctype html>
+<html><body style="margin:0;height:100vh;display:flex;align-items:center;
+justify-content:center;background:#f4f4f5;font-family:Helvetica,Arial,sans-serif;">
+  <div style="text-align:center;border:6px dashed #9ca3af;border-radius:16px;padding:64px 96px;">
+    <div style="font-size:76px;font-weight:700;letter-spacing:2px;color:#111827;">TEST SCREENSHOT</div>
+    <div style="font-size:28px;margin-top:24px;color:#4b5563;">Online Banking Monitor Lite &mdash; sample alert</div>
+    <div style="font-size:24px;margin-top:8px;color:#6b7280;">Not a real outage. No action required.</div>
+  </div>
+</body></html>"""
+
 
 def _create_temp_screenshot() -> str:
-    """Create a temporary PNG file and return its path."""
-    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-        f.write(MINIMAL_PNG)
-        return f.name
+    """Render the TEST SCREENSHOT placeholder to a temporary PNG and return its path."""
+    path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            try:
+                page = browser.new_page(viewport={"width": 1280, "height": 800})
+                page.set_content(PLACEHOLDER_HTML)
+                page.screenshot(path=path)
+            finally:
+                browser.close()
+    except Exception as exc:
+        # Never let the placeholder block the thing being demonstrated -- the emails.
+        print(f"     ! could not render placeholder ({exc}); falling back to a 1x1 PNG")
+        Path(path).write_bytes(MINIMAL_PNG)
+    return path
 
 
 def main() -> None:
@@ -74,7 +104,7 @@ def main() -> None:
             print(f"     → BCC: {config.RECIPIENTS_BCC}")
         from monitor.channels.email_gmail import _build_down_subject
         print(f"     ✓ Subject: {_build_down_subject(down_event)}")
-        print(f"     ✓ Attachment: sample screenshot (1x1 PNG)\n")
+        print(f"     ✓ Attachment: placeholder marked TEST SCREENSHOT\n")
 
         # 2. Sample RECOVERY event
         print("  2. RECOVERY event")

@@ -78,7 +78,7 @@ Cheapest → strongest. Each proves strictly more than the one above it.
 
 `AUTHED_URL` is navigated **directly** — configured, never derived from `LOGIN_URL`. The login route and the authed-home route have different dependencies (auth service / MFA / login UI / Cloudflare vs. plain session-cookie validation), so they are independent evidence.
 
-A **full login** (`run_journey`: credentials → MFA → authed assertion → optional logout) is only ever the budgeted recovery path. It emits `nav_error`/`element_missing` at `layer="render"` before credentials are submitted, and `auth_rejected` · `bot_challenge` · `mfa_failed` · `element_missing` · `logout_failed` at `layer="authed"` after.
+A **full login** (`run_journey`: credentials → MFA → authed assertion → optional logout) is only ever the budgeted recovery path. Every outcome it reports is `layer="authed"`, at every stage: `nav_error`/`element_missing` before credentials are submitted, and `auth_rejected` · `bot_challenge` · `mfa_failed` · `element_missing` · `logout_failed` after. **[B50 / 2026-09-07]** It used to report `layer="render"` for the pre-credential failures. That put auth-track evidence on a layer this track can never record a *pass* on — `render` is the main track's question and is answered by its own probe every minute — so a DOWN landing on it could never be closed (12 h 36 m on 2026-09-04). The stage it failed at is still recorded, in `fail_reason` + `page_url`.
 
 ## The two tracks
 
@@ -103,7 +103,7 @@ The dashboard banner and `/api/status` speak platform-level, and always name the
 
 The operator must never need a browser to know which wall failed. The wording lives in `monitor/verdict.py` and nowhere else. `fail_layer='monitor'` deliberately returns `None` — our own bug never gets operator phrasing.
 
-**[B44]** Email alerts use plain-English layer descriptions instead (e.g., "website not responding", "not loading after sign-in"), satisfying Rule 10's intent while optimizing for the customer-facing context of email. See [Email copy](#email-copy-b44).
+**[B45]** DOWN/RECOVERED email alerts do not use this wording. They are a machine-parsed format read by a Power Automate flow that renders a Teams card, so they name the layer through their `SERVICE`/`DESCRIPTION` lines in business terms. See [Email copy](#email-copy-b45).
 
 ## Failure classification
 
@@ -142,6 +142,31 @@ Unrecognized reasons fail *safe as Soft* — ambiguous evidence stays cautious r
 † Never actually emitted by any probe today — see [Known limitations](#known-limitations) #3 (tracked as B20).
 
 ‡ Reachable only from `scripts/`, never from the scheduler — see the taxonomy note above (tracked as B21). Listed here explicitly rather than relying on the "anything unrecognized" fallback: it scored Soft either way, but a reason absent from this table reads as one the ladder forgot rather than one deliberately placed.
+
+### Config-class is an allowlist, not a default [D1, decided 2026-09-08]
+
+A Config-class `fail_reason` is returned only when **(a)** a configured pattern positively
+matches (`AUTH_REJECTED_TEXT`), or **(b)** the monitor positively knows it cannot act — no
+`TOTP_SECRET`, or a secret that is not valid base32. **Every screen the classifier does not
+recognise is platform evidence**: `auth_unavailable` when the page is displaying a message,
+`timeout` when it is not. Both score toward DOWN; neither halts the track.
+
+The evidence for inverting this. In the week 2026-08-31 → 09-07 the monitor latched CONFIG_ERROR
+three times for a total of ~21 hours blind, and **not one was a configuration problem**. Two were
+the bank announcing an outage in plain English — *"We are temporarily experiencing technical
+difficulties"* and *"Login is currently unavailable. Please try again later."* — recorded as our
+own misconfiguration and never paged. And all-time, the only Config-class reasons ever emitted are
+`bot_challenge` (8) and `mfa_failed` (11, ten of them from the pre-`TOTP_SECRET` era where the
+latch was correct). **`auth_rejected` — the one reason that genuinely means "a human must look" —
+has never fired.**
+
+The asymmetry that decides it: the set of ways a bank announces trouble is unbounded, while
+credential rejections are a short, stable, capturable list. Enumerate the bounded side and default
+the unbounded one. What protects the account is Rule 5's breaker, not the classification.
+
+The classifiers answer **"did sign-in progress?"** structurally — authed marker visible, MFA
+heading visible, still on the login form — rather than by reading banners. Banner text only ever
+*downgrades* an outcome to Config-class; it is never what detects failure.
 
 ### Unexpected browser errors
 
@@ -225,7 +250,28 @@ If the session is broken, burst probes each fail fast on the cheap path. That fa
 
 ### CONFIG_ERROR
 
-Latches. Alerts once, never re-alerts, and never pages (it is not an outage). While the **auth** track is CONFIG_ERROR it is skipped entirely each cycle, so it cannot self-clear — clear it with `python -m scripts.clear_config_error --track auth`, or by a passing manual drill run. The **main** track is never skipped, so it self-clears once the affected layer passes `RECOVERY_PASSES` (3) times in a row — the same corroboration leaving a DOWN incident requires, since a premature “all clear” is the same class of error either way.
+**[2026-09-08]** Backs off ~5 minutes and retries rather than latching on first sight; it latches only on repetition (see Rule 6). Alerts once per transition, never re-alerts, and never pages (it is not an outage). While the **auth** track is CONFIG_ERROR it is skipped entirely each cycle, so it cannot self-clear — clear it with `python -m scripts.clear_config_error_and_stuck_down --track auth --confirm`, or by a passing manual drill run. The **main** track is never skipped, so it self-clears once the affected layer passes `RECOVERY_PASSES` (3) times in a row — the same corroboration leaving a DOWN incident requires, since a premature “all clear” is the same class of error either way.
+
+### `BLIND` — a notification, not a verdict [2026-09-08]
+
+When the auth track has produced **no passing check for 15 minutes**, the monitor says so:
+one email to `ADMIN_EMAIL` on entry, one escalation at 2 hours, one on recovery, nothing in
+between.
+
+`BLIND` is deliberately **not** a status and is **never written to `cycles.verdict`**. It is a
+statement about the *monitor*, not the platform — filing "we could not measure" in the same
+column as "the bank is down" is the conflation `uptime_pct` was rewritten to remove. It therefore
+does not enter the severity ladder, `unified_verdict`, the CSV value set, or the dashboard
+palette; it is an event type plus a field on `/api/status`.
+
+It exists because the monitor could previously only say two things, "everything is fine" and "the
+bank is down", with no way to say "I cannot currently tell you" — and in the week of 2026-08-31
+that third state occurred repeatedly and silently: three CONFIG_ERROR latches and a 9.5-hour host
+suspend, none of which notified anyone.
+
+It fires even when the host was asleep. The monitor is supposed to be running, so a suspend is
+something to be told about rather than filtered out; the notification names *why* checking
+stopped, which is what separates a benign cause from an alarming one at a glance.
 
 ### Self-health (`DEGRADED` / `internal_error`)
 
@@ -287,30 +333,61 @@ Connections open with `PRAGMA journal_mode=WAL` and `busy_timeout=15000` — rol
 
 Dashboard log is one row per minute: three layer badges (pulse / render / authed), verdict, session-reused marker, burst badge when applicable. Failed cycles expand to their probes. Bursts are first-class and cannot be hidden. Only DOWN wears alarm red; CONFIG_ERROR and DEGRADED are gold.
 
-## Email copy [B44]
+## Email copy [B45]
 
-[B44 / 2026-08-31] Redesigned for customer-friendly language and operational clarity. Emails are now multipart MIME with plain-text body + screenshot attachment on DOWN events. Rule 10 "every DOWN names its layer" is satisfied by plain-English layer descriptions rather than locked technical wording.
+[B45 / 2026-09-04] DOWN and RECOVERED emails are a **machine-parsed format**, not prose. A Power Automate flow in M365 reads them and renders a Teams card, so the subject's field order and the body's key names are a contract — changing either breaks the card. Treat this section as a schema.
 
-**Subject lines** always name the platform and layer clearly:
+Both events emit a multipart MIME message: plain-text body, plus the screenshot attachment on DOWN. Rule 10 "every DOWN names its layer" is satisfied by the `SERVICE` and `DESCRIPTION` lines, which name the failed layer the way a business reader would name it.
 
-| Scenario | Subject |
-|---|---|
-| Login page unreachable or broken | `[MONITOR] {name} Online Banking DOWN — website not responding` |
-| Sign-in form not loading | `[MONITOR] {name} Online Banking DOWN — sign-in page not loading` |
-| Account area not loading (authed) | `[MONITOR] {name} Online Banking DOWN — not loading after sign-in` |
-| Recovered from outage | `[MONITOR] {name} Online Banking Recovered` |
-| Configuration error | `[MONITOR-CONFIG] {name} needs attention` |
+**Subject — four pipe-delimited fields:**
 
-**Body text** (plain-text part) includes:
-- Monitor identification: "This is Online Banking Monitor Lite — a monitor built by [team names] from [org]."
-- Customer-facing symptom in plain English (what they would experience)
-- When it started (Eastern time) and how long ago
-- How many checks failed in a row
-- What the checks showed (translated to plain English, e.g., "the server did not respond in time" not "timeout")
-- The URL that was being monitored
-- For DOWN events: screenshot attachment (masked for PII per Rule 16)
+```
+[OLB MONITOR LITE]|{STATUS}|{TARGET_NAME} Online Banking|{Eastern stamp}
+```
 
-**Attachment (DOWN events only):** One screenshot from the failed check, named with Eastern timestamp and layer (e.g., `20260831T103205-0400_authed_check.png`).
+`STATUS` is `DOWN` or `RECOVERED`. The stamp is `to_eastern_without_offset()` — `2026-09-01 14:32:15 EDT`, Eastern with the zone abbreviation and no parenthetical, because the parenthetical would read as a fifth field. DOWN stamps the incident start; RECOVERED stamps its end.
+
+**Body — nine keys, always all nine, always this order.** A key that does not apply to the event carries `N/A` rather than being omitted, so one parser reads both event types without branching:
+
+```
+MONITOR: Online Banking Monitor Lite
+
+STATUS: DOWN
+
+SERVICE: {name} Online Banking Website
+
+DESCRIPTION:
+{name}'s website is not responding. Customers may be unable to access Online Banking.
+
+START_TIME: 2026-09-01 14:32:15 EDT
+
+END_TIME: N/A
+
+DURATION: N/A
+
+URL: https://...
+
+SOURCE: Teachers RPA Team
+```
+
+On DOWN, `END_TIME` and `DURATION` are `N/A` — the incident is still open. On RECOVERED all three time fields are filled.
+
+**`SERVICE` and `DESCRIPTION` are the only lines that vary by layer.** The wording lives in `monitor/verdict.py` (`email_service_name`, `email_description`) and nowhere else:
+
+| Layer | SERVICE | DOWN description |
+|---|---|---|
+| `pulse` | `{name} Online Banking Website` | website is not responding; customers may be unable to access Online Banking |
+| `render` | `{name} Online Banking Login Page` | sign-in page is not loading; customers reach the site but the login form never appears |
+| `authed` | `{name} Online Banking Account Access` | not loading after sign-in; customers sign in but accounts do not appear |
+| unmapped / `None` | `{name} Online Banking` | Online Banking is not available |
+
+The fallback row is load-bearing, not padding: `RecoveryEvent.trigger_layer` is `Optional`, so an alert must still send with vaguer wording rather than not send at all.
+
+**What the email deliberately does NOT contain:** no layer name, no `fail_reason`, no probe count. The audience is business readers on a Teams card; the screenshot and the dashboard carry the diagnostic detail. `URL` follows the failed layer — `AUTHED_URL` for `authed`, `TARGET_URL` otherwise, since the authed check navigates `AUTHED_URL` directly and naming `TARGET_URL` there would cite a page that was never probed.
+
+**Attachment (DOWN only):** one screenshot from the failed check, named with an Eastern timestamp and layer (e.g. `20260831T103205-0400_authed_check.png`), masked for PII per Rule 16.
+
+**CONFIG_ERROR email is out of this format** and keeps its pre-B45 prose subject and body — it goes to `ADMIN_EMAIL` only, is not a customer-facing outage, and never pages.
 
 One DOWN email and one RECOVERY email per incident, ever. One CONFIG-ERROR email per transition to CONFIG_ERROR state, never re-emitting while latched.
 
@@ -326,11 +403,13 @@ One DOWN email and one RECOVERY email per incident, ever. One CONFIG-ERROR email
 
 `BURST_DELAYS_S` and `BURST_WINDOW_S` were retired 2026-08-30 and are no longer read.
 
-**Session & budget:** `SESSION_STATE_PATH`, `SESSION_MAX_AGE_S=600`, `LOGIN_INTERVAL_S=120` (floor 60; never equal to `SESSION_MAX_AGE_S`).
+**Session & budget:** `SESSION_STATE_PATH`, `SESSION_MAX_AGE_S=600`, `LOGIN_INTERVAL_S=120` (floor 60; never equal to `SESSION_MAX_AGE_S`), `MAX_CONSECUTIVE_LOGIN_FAILURES=5` (must exceed `AUTH_MIN_FAILED_PROBES`), `LOGIN_BREAKER_COOLDOWN_S=600`.
 
 **Screenshots:** `MASK_TEXT` (semicolon-separated regexes), `MASKING_ENABLED=true`.
 
-**Alerts:** `ALERT_CHANNELS`, `RECIPIENTS_EMAIL`, `GMAIL_USER`, `GMAIL_APP_PASSWORD`, plus Twilio/gateway settings.
+**Alerts:** `ALERT_CHANNELS`, `RECIPIENTS_EMAIL`, `GMAIL_USER`, `GMAIL_APP_PASSWORD`, `ADMIN_EMAIL` (CONFIG_ERROR and `BLIND` go here only), `BLIND_AFTER_S=900`, plus Twilio/gateway settings.
+
+**Sign-in classification:** `AUTH_REJECTED_TEXT=does not match our records` — semicolon-separated patterns that positively identify a credential rejection. Confirmed against captured markup 2026-09-08 (Rule 12); the full banner reads *"The Username and/or Password you entered does not match our records. Try again."* and `get_by_text` matches on substring. This is the **only** list whose absence changes a verdict's class, so it is deliberately short and stable.
 
 Eastern-time presentation is handled in code, not configured. `.env.example` carries the worked examples — keep it in sync when a value moves.
 
@@ -339,9 +418,11 @@ Eastern-time presentation is handled in code, not configured. `.env.example` car
 1. **`state.py` stays pure** — no I/O, fully unit-tested: burst evaluation, confidence scoring, floors, suppression.
 2. **Alert only on transitions.** DOWN requires **4 consecutive failed probes on one layer** with no intervening pass of that layer — on both tracks, with no time window. Recovery requires 3 consecutive passes of the layer that caused it. One DOWN + one RECOVERY email per incident, ever.
 3. **`session_expired` never scores.** It routes to the recovery-login path and is recorded, but it cannot contribute to DOWN confidence or the probe floor on any track.
-4. **Never retry a credential rejection.** `auth_rejected` → CONFIG_ERROR, logins halt until a human clears it. Always, everywhere.
-5. **The login budget is a hard limit.** Burst re-probes on the auth track MUST use `run_authed_check()` — a burst consumes zero logins. Every attempt is ledgered, including failures.
-6. **Bot challenges: detect, never defeat.** `bot_challenge` → CONFIG_ERROR, never pages. patchright is the one approved, scoped mitigation.
+4. **Never retry a credential rejection.** `auth_rejected` → CONFIG_ERROR, logins halt until a human clears it. Always, everywhere. **[2026-09-08]** `auth_rejected` is returned **only when a configured `AUTH_REJECTED_TEXT` pattern positively matches** — never as the fallback for a screen the classifier did not recognise.
+5. **The login budget is a hard limit.** Burst re-probes on the auth track MUST use `run_authed_check()` — a burst consumes zero logins. Every attempt is ledgered, including failures. **[2026-09-08] `MAX_CONSECUTIVE_LOGIN_FAILURES` (5) consecutive failed attempts halts logins regardless of why they failed** — screen-independent, so it also covers screens nobody has captured. It MUST exceed `AUTH_MIN_FAILED_PROBES` so a DOWN pages *before* the monitor stops trying; `config.py` refuses to start otherwise. On trip: logins stop, an admin note is sent, and the track's status stays as the evidence left it — it is **not** downgraded to CONFIG_ERROR. Forcing CONFIG_ERROR there would zero the accumulated evidence, flip a DOWN you were paged for three minutes earlier into a non-paging "needs attention", exclude the rest of a real outage from `uptime_pct`, and orphan the open incident ([B2](#), [B3](#) in the tracker). The platform did not recover — the monitor stopped trying. The "make it loud" requirement is met by the admin note, not by rewriting the verdict.
+
+**The breaker resets on a cooldown, not only by hand.** While tripped it permits **one** attempt every `LOGIN_BREAKER_COOLDOWN_S` (600) and resets on the first success. Without that the auth track is frozen: no logins means no session, which means no cheap checks either, so it would sit at DOWN long after the platform recovered — the exact failure this whole effort exists to remove. 6 attempts/hour is close to the ~5.5/hour the monitor already performs when perfectly healthy, and the credential case does not reach here anyway: a genuine rejection matches `AUTH_REJECTED_TEXT` and latches at failure #1 under Rule 4. Recovery lands within ~12 minutes of the platform returning.
+6. **Bot challenges: detect, never defeat.** patchright is the one approved, scoped mitigation. **[2026-09-08]** `bot_challenge` is returned **only on positive detection** of a challenge — never as the fallback for an unrecognised screen. No such detector exists yet and no captured DOM anywhere in `data/dom_dumps/` shows a real challenge, so nothing currently emits it (see [Known limitations](#known-limitations) 3). A Config-class failure **backs off ~5 minutes and retries** rather than latching on first sight; it latches only on repetition. The old first-sight latch produced three blind windows totalling ~21 hours in the week of 2026-08-31, none of them a configuration problem.
 7. **Only DOWN pages.** `DEGRADED` and `CONFIG_ERROR` never do.
 8. **A monitor bug is never evidence about the bank.** Self-health rows bypass `apply_check()` entirely; `internal_error` never reaches `classify()` and is never returned by a probe.
 9. **No minute may vanish.** Every cycle writes a `cycles` row even when it crashes.
@@ -360,15 +441,15 @@ Eastern-time presentation is handled in code, not configured. `.env.example` car
 Open and deliberate. Read this before diagnosing a bug — several "bugs" are already on this list.
 
 1. **False-UP blind spot on the authed marker (iframe scope).** The live target's banking content lives inside a separate `nxg-olb` iframe; `authed_marker()` builds **page-level locators only**, and `get_by_text` does not pierce iframes. The configured marker is outer-shell chrome, so if the iframe fails to render — which is literally "online banking behind login not rendering" — the check still reports **UP**. This contradicts the definition of UP and is a silent false negative. Fix needs `frame_locator` support in `journey.py` plus a frame-URL setting.
-2. **Three unverified `classify_*` fallback mappings.** `classify_after_submit` → `bot_challenge` (this one already fired wrongly on a live MFA screen and parked the auth track in CONFIG_ERROR); `classify_after_totp` → `mfa_failed`; `classify_authed` with marker *and* error banner both visible → `element_missing`. The MFA **locators** are now confirmed against captured DOM; these **fallbacks** are not.
-3. **The authed layer's evidence vocabulary is narrower than this spec claims.** `auth_unavailable` and `rate_limited` exist only in `state.py`'s classification sets — nothing emits them; `classify_after_submit` lumps "bot challenge / auth service down / rate limited" into `bot_challenge`, which is Config-class and **never pages**, so a genuinely unavailable auth service reads as a config problem. `logout_failed`‡ is only reachable from the drill script (the scheduler always runs `should_logout=False`) — a different case from the other two, and marked separately in the taxonomy: the code exists and works, only the scheduler never calls it. Worse, `run_authed_check()` collapses *every* navigation exception to `nav_error`, so on the `authed` layer `dns` and `conn_refused` are unreachable too — its only Hard evidence is `bad_status:5xx`, and a hard network failure there scores Soft. Tracked as **B20/B21** in `personal/ISSUES.md`.
+2. **The `classify_*` fallbacks were verified wrong, and are being replaced.** `classify_after_submit` → `bot_challenge` fired wrongly on a live MFA screen (2026-08-25) and again on a bank outage banner (2026-09-03); `classify_after_totp` → `mfa_failed` fired on *"Login is currently unavailable"* (2026-09-06), 13.7 hours blind. Both are superseded by [Config-class is an allowlist](#config-class-is-an-allowlist-not-a-default-d1-decided-2026-09-08). The third, `classify_authed` with marker *and* error banner both visible → `element_missing`, remains unverified and is untouched by that work.
+3. **The authed layer's evidence vocabulary is narrower than this spec claims.** `rate_limited` exists only in `state.py`'s classification sets — nothing emits it. **[2026-09-08]** `auth_unavailable` gains its first real producer ("the sign-in path displayed something we do not recognise") and `bot_challenge` loses its only one, becoming declared-but-unreachable until a positive challenge detector exists; `classify_after_submit` lumps "bot challenge / auth service down / rate limited" into `bot_challenge`, which is Config-class and **never pages**, so a genuinely unavailable auth service reads as a config problem. `logout_failed`‡ is only reachable from the drill script (the scheduler always runs `should_logout=False`) — a different case from the other two, and marked separately in the taxonomy: the code exists and works, only the scheduler never calls it. Worse, `run_authed_check()` collapses *every* navigation exception to `nav_error`, so on the `authed` layer `dns` and `conn_refused` are unreachable too — its only Hard evidence is `bad_status:5xx`, and a hard network failure there scores Soft. Tracked as **B20/B21** in `personal/ISSUES.md`.
 4. **`element_missing` conflates absence with ambiguity.** A locator matching 2+ elements fails `to_be_visible` identically to one matching 0. `.first` guards the known free-text locators; anything else raises and lands on `nav_error` via `unexpected_fail_reason` — Soft, and therefore scoring.
 5. **A *persistent* monitor-side defect can page — and the 2026-08-30 rework made this materially more likely.** The monitor cannot distinguish "the page does not render" from "my locator is wrong": both are `element_missing` on the `render` layer. The old design suppressed both, because the burst's alternating pulse probe passed and wiped the evidence — that suppression *was* B37, and fixing B37 necessarily removed it. A locator regression that fails every render probe now reaches the floor in one cycle and pages.
 
    This is the deliberate cost of the fix and there is no version of "detect single-layer outages" that does not carry it. What bounds the risk today: the render and authed locators are `.first`-guarded against strict-mode ambiguity, and `unexpected_fail_reason` maps unforeseen browser errors to Soft rather than Hard. What does **not** bound it: nothing distinguishes a monitor error from a platform error in the taxonomy. Closing it needs a distinct non-scoring monitor-error class — a spec change, not a code tweak. **Re-read this before changing any locator.**
 6. **Masking cannot redact `<input>` values.** `get_by_text` matches text nodes, so a filled login-ID field appears in any post-submit failure screenshot. A `MASK_TEXT` pattern that matches nothing fails *open* (no mask, no error). An empty `MASK_TEXT` under `MASKING_ENABLED=true` warns loudly but does not block. The current target is a security-team test site with fake data; this must be populated before pointing at a real account.
 7. **TOTP is not yet captured.** The live step-up offers SMS / call / authenticator. Without a real `TOTP_SECRET`, any recovery login reports `mfa_failed` → CONFIG_ERROR. The code-entry screen also carries an unhandled device-registration choice ("register my private device" / "this is a public device") that `submit_totp` ignores — may matter for unattended logins.
-8. **The auth track's CONFIG_ERROR cannot self-clear** (the track is skipped while latched). No dashboard or API control exists — use `scripts/clear_config_error.py` or a passing drill.
+8. **The auth track's CONFIG_ERROR cannot self-clear** (the track is skipped while latched). No dashboard or API control exists — use `scripts/clear_config_error_and_stuck_down.py` or a passing drill.
 9. **`SESSION_STATE_PATH` defaults inside the synced repo tree**, and `os.chmod(0o600)` is a silent no-op on Windows despite `session.py` asserting it.
 10. **`.env.example` declares `LOGIN_STRESS_MODE`, which `config.py` deliberately does not read.** Reserved for a future sanctioned stress window; it is not implemented.
 11. **A burst has no wall-clock ceiling, and a long one is indistinguishable from a hang.** A burst's footprint is `BURST_PROBES × (gap + probe duration)`, and nothing bounds probe duration (**B43**: an authed probe has been observed at 95s against 15s/25s call timeouts). A worst-case authed burst therefore runs several minutes, printing `skip cycle` every minute — exactly what the 13.5-hour hang of 2026-08-30 printed (**B42**). Any watchdog on the cycle lock must sit above the longest legitimate burst.
