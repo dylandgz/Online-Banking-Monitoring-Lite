@@ -146,6 +146,12 @@ class RecoveryEvent:
     duration_s: int
     confidence: int
     fail_reasons: tuple[str, ...]
+    # [B59] What this incident is recovering FROM. Both DOWN and CONFIG_ERROR leave through
+    # the same path, so without this a channel cannot tell "the outage ended" from "a human
+    # cleared a config latch" -- and the email channel told every recipient that an outage
+    # they were never notified of had recovered, with a duration measuring how long a human
+    # took to notice. CONFIG_ERROR is explicitly not an outage (Rule 7).
+    from_status: Optional[str] = None
     # Optional fields added by main.py after DB operations
     trigger_layer: Optional[str] = None
     page_url: Optional[str] = None
@@ -277,6 +283,7 @@ def apply_check(
                 confidence=state.confidence,
                 fail_reasons=state.fail_reasons,
                 trigger_layer=state.cause_layer,
+                from_status=state.status,
             )
             # Now it is safe to discard: the event carries the record forward.
             return MonitorState(status="UP", since_ts=ts,

@@ -13,6 +13,21 @@ from monitor.timeutil import to_eastern, to_eastern_without_offset
 from monitor.verdict import email_description, email_service_name
 
 
+# [B61] Socket timeout for the whole SMTP conversation. Without it the socket inherits the
+# global default -- None -- and a stalled send hangs forever.
+#
+# That is not a theoretical leak. send() is called via asyncio.to_thread from dispatch(),
+# which is awaited inside run_cycle, which runs inside guarded_cycle's `async with lock`. A
+# hung send therefore holds the cycle lock for as long as the socket hangs, and the scheduler
+# prints "skip cycle" every 60s while the monitor stops probing and keeps serving the last
+# verdict. That is B42 exactly: 13h 34m on 2026-08-29, reporting UP throughout.
+#
+# 30s is generous for this payload -- a DOWN email carries a screenshot and measures ~220KB --
+# while capping the damage at half a cycle. NOTE this bounds the hang; it does not fix B42.
+# The structural fix is dispatching off the cycle lock, which is still open.
+_SMTP_TIMEOUT_S = 30
+
+
 def _parse_email_list(emails_str: str) -> list:
     """Parse comma-separated email list from env var. Returns empty list if not set."""
     return [e.strip() for e in (emails_str or "").split(",") if e.strip()]
@@ -104,6 +119,29 @@ def _build_recovery_body(event: RecoveryEvent) -> str:
     )
 
 
+def _build_config_cleared_subject(event: RecoveryEvent) -> str:
+    """[B59] Deliberately prose and admin-only, matching the CONFIG_ERROR alert it closes --
+    NOT the machine-parsed RECOVERED format, which the Power Automate flow reads."""
+    return (f"[MONITOR-CONFIG] {config.TARGET_NAME} configuration error cleared "
+            f"{to_eastern_without_offset(event.ended_at)}")
+
+
+def _build_config_cleared_body(event: RecoveryEvent) -> str:
+    reasons = ", ".join(event.fail_reasons) or "unknown"
+    return (
+        f"The configuration error reported earlier has cleared and sign-in checks have "
+        f"resumed.\n"
+        f"\n"
+        f"Raised:   {to_eastern(event.since_ts)} ({reasons})\n"
+        f"Cleared:  {to_eastern(event.ended_at)}\n"
+        f"Latched:  {_format_duration(event.duration_s)}\n"
+        f"\n"
+        f"This was NOT a platform outage -- online banking was not reported down, and this "
+        f"period is excluded from uptime. The duration above is how long the check was "
+        f"paused, not how long anything was broken."
+    )
+
+
 def _build_config_subject(event: ConfigErrorEvent) -> str:
     """Build the CONFIG_ERROR email subject line."""
     # Extract time from ISO timestamp (e.g., "2026-08-11T14:00:00+00:00" -> "14:00")
@@ -133,10 +171,28 @@ class EmailGmailChannel(AlertChannel):
             screenshot = event.screenshot_path
             recipients = _parse_email_list(config.RECIPIENTS_EMAIL)
         elif isinstance(event, RecoveryEvent):
-            subject = _build_recovery_subject(event)
-            body = _build_recovery_body(event)
-            screenshot = None  # no screenshot for recovery
-            recipients = _parse_email_list(config.RECIPIENTS_EMAIL)
+            # [B59] A cleared CONFIG_ERROR is NOT an outage recovery and must not be
+            # announced as one. Both leave through the same state-machine path, so without
+            # this discriminator the channel mailed every recipient "...has recovered and is
+            # now loading normally. The outage lasted 5m 0s." Two falsehoods at once: they
+            # were never told of an outage (CONFIG_ERROR goes to ADMIN_EMAIL only), and there
+            # was no outage -- Rule 7 says so, and uptime_pct excludes it from both sides for
+            # exactly this reason. The duration measured how long a human took to notice.
+            #
+            # It also protects the Teams card: RECOVERED is a machine-parsed format, so a
+            # bogus one renders a card for an incident the flow never saw open.
+            if event.from_status == "CONFIG_ERROR":
+                if not config.ADMIN_EMAIL:
+                    return  # same routing as the CONFIG_ERROR alert this pairs with
+                subject = _build_config_cleared_subject(event)
+                body = _build_config_cleared_body(event)
+                screenshot = None
+                recipients = [config.ADMIN_EMAIL.strip()]
+            else:
+                subject = _build_recovery_subject(event)
+                body = _build_recovery_body(event)
+                screenshot = None  # no screenshot for recovery
+                recipients = _parse_email_list(config.RECIPIENTS_EMAIL)
         elif isinstance(event, ConfigErrorEvent):
             if not config.ADMIN_EMAIL:
                 return  # ADMIN_EMAIL not configured; CONFIG_ERROR notifications disabled
@@ -194,7 +250,7 @@ class EmailGmailChannel(AlertChannel):
         # Send via SMTP to all recipients (To + Cc + Bcc)
         all_recipients = to_list + cc_list + bcc_list
         try:
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=_SMTP_TIMEOUT_S) as server:
                 server.login(config.GMAIL_USER, config.GMAIL_APP_PASSWORD)
                 server.sendmail(config.GMAIL_USER, all_recipients, msg.as_string())
         except Exception as exc:
