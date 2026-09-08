@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS checks (
     burst_id TEXT,
     page_url TEXT,
     screenshot_path TEXT,
+    evidence_text TEXT,
     scored INTEGER NOT NULL DEFAULT 1
 );
 
@@ -212,6 +213,19 @@ def _migrate_evidence_columns(conn: sqlite3.Connection) -> None:
     _add_missing_columns(conn, "checks", {"page_url": "TEXT", "screenshot_path": "TEXT"})
 
 
+def _migrate_evidence_text(conn: sqlite3.Connection) -> None:
+    """[B63] checks gains evidence_text: what the page actually SAID when it failed.
+
+    Additive, no backfill -- historic rows carry NULL because nothing captured it. Diagnosing
+    the 2026-09-03 and 2026-09-06 latches both required finding and opening a screenshot to
+    read one sentence off it, and on 2026-09-04 eleven failures captured no screenshot at all
+    (B65), leaving nothing to read. The reason code alone (`mfa_failed`) does not say that the
+    bank was displaying "Login is currently unavailable. Please try again later."
+
+    Diagnostics only: no classifier reads this column."""
+    _add_missing_columns(conn, "checks", {"evidence_text": "TEXT"})
+
+
 def _migrate_scored(conn: sqlite3.Connection) -> None:
     """[B7] checks gains `scored`. A probe taken while the monitor demonstrably was not
     running is recorded but does not count toward DOWN -- and without this column the row
@@ -243,6 +257,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _migrate_evidence_columns(conn)
     _migrate_layer_state(conn)
     _migrate_scored(conn)
+    _migrate_evidence_text(conn)
     _migrate_b44_incidents_page_url(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_checks_burst_id ON checks(burst_id)")
@@ -269,14 +284,15 @@ def append_check(
     cycle_id: str | None = None,
     page_url: str | None = None,
     screenshot_path: str | None = None,
+    evidence_text: str | None = None,
     scored: bool = True,
 ) -> None:
     conn.execute(
         "INSERT INTO checks (ts, ok, http_status, latency_ms, fail_reason, browser_mode, layer, "
-        "burst_id, cycle_id, page_url, screenshot_path, scored) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "burst_id, cycle_id, page_url, screenshot_path, evidence_text, scored) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (ts, int(ok), http_status, latency_ms, fail_reason, browser_mode, layer, burst_id, cycle_id,
-         page_url, screenshot_path, int(scored)),
+         page_url, screenshot_path, evidence_text, int(scored)),
     )
     conn.commit()
 
