@@ -102,8 +102,10 @@ BROWSER_TIMEOUT_MS = int(os.getenv("BROWSER_TIMEOUT_MS", "15000"))
 MAIN_BURST_GAP_S = int(os.getenv("MAIN_BURST_GAP_S", os.getenv("BURST_GAP_S", "25")))
 AUTH_BURST_GAP_S = int(os.getenv("AUTH_BURST_GAP_S", str(MAIN_BURST_GAP_S)))
 
-# Confirmation probes after the one that opened the run. With MIN_FAILED_PROBES=4 the floor
-# is reached on the 4th probe, so the burst resolves before exhausting these.
+# Confirmation probes after the one that opened the run. Sized so a burst resolves before
+# exhausting them on EITHER track: the main floor of 4 is reached on the 4th probe, the auth
+# floor of 2 on the 2nd. Lower this below a track's floor and that track can never page from
+# a burst -- which was B13.
 BURST_PROBES = int(os.getenv("BURST_PROBES", "4"))
 
 # [B7] How long probes are recorded but not scored after the monitor notices it was not

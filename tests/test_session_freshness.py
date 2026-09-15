@@ -15,7 +15,7 @@ import time
 
 import config
 from monitor.session import is_session_fresh
-from monitor.state import MonitorState, apply_check
+from monitor.state import MonitorState, apply_check, classify
 
 
 def _write(tmp_path, name, content, age_s=0):
@@ -82,5 +82,10 @@ def test_four_repeated_soft_failures_would_have_paged(tmp_path):
 
     assert state.status == "DOWN"
     assert len(events_seen) == 1
-    # ...and nothing paged before the floor was met.
-    assert config.AUTH_MIN_FAILED_PROBES == 4
+    # ...and nothing paged before the floor was met. Asserted as the invariant rather than a
+    # literal floor: a Soft probe weighs 1, so `1 * floor >= confidence` is exactly the
+    # statement that the weakest evidence still has to reach the floor before anything pages.
+    # The `== 4` that used to sit here fired when the auth floor moved 4 -> 2 on 2026-09-15 --
+    # the tripwire working, but the number was never the property.
+    soft_weight = classify("nav_error")[1]
+    assert soft_weight * config.AUTH_MIN_FAILED_PROBES >= config.AUTH_DOWN_CONFIDENCE

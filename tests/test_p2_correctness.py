@@ -117,13 +117,27 @@ def test_a_5xx_behind_login_is_hard_evidence_not_a_session_problem():
     cls, weight = classify("bad_status:500")
     assert (cls, weight) == ("hard", 2)
 
-    # [2026-08-30 / B37] The probe floor is what governs timing, and now solely so: two hard
-    # probes still reach DOWN_CONFIDENCE, but with the floor at 4 the score can never be the
-    # binding constraint. Deliberate -- hard-class is `dns`, and `dns` is what a laptop
-    # resuming from suspend produces (B7), so letting severity shortcut the floor would
-    # reopen the false-positive class that produced every page this monitor has ever sent.
+    # [2026-08-30 / B37, amended 2026-09-15] The probe floor governs timing, and solely so:
+    # the score can never be the binding constraint, because the weakest possible evidence AT
+    # the floor already meets the threshold. Deliberate -- letting severity shortcut the floor
+    # would mean Hard evidence pages faster than Soft, and hard-class includes `dns`, which is
+    # what a laptop resuming from suspend produces (B7).
+    #
+    # This is now asserted as that INVARIANT rather than as a literal floor. The line here
+    # used to read `assert config.AUTH_MIN_FAILED_PROBES == 4`, which made it a tripwire for
+    # any floor change -- it fired exactly as designed when the auth floor moved 4 -> 2 on
+    # 2026-09-15. But the property worth keeping is the relationship, not the number.
     assert weight * 2 >= config.AUTH_DOWN_CONFIDENCE
-    assert config.AUTH_MIN_FAILED_PROBES == 4
+    soft_weight = classify("nav_error")[1]
+    assert soft_weight * config.AUTH_MIN_FAILED_PROBES >= config.AUTH_DOWN_CONFIDENCE, \
+        "the floor must stay the binding constraint: the weakest evidence at the floor must " \
+        "still clear the score, or Hard evidence would page sooner than Soft"
+
+    # The MAIN track keeps its floor of 4, and THAT literal is worth pinning, because the B7
+    # rationale above is specifically about `dns` -- a main-track reason. The authed layer
+    # cannot emit it at all: run_authed_check collapses every navigation failure to nav_error
+    # (CLAUDE.md known limitation 3), so its only Hard evidence is bad_status:5xx.
+    assert config.MIN_FAILED_PROBES == 4
 
 
 def test_missing_authed_content_now_scores_instead_of_being_inert():
