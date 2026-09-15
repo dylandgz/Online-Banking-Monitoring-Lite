@@ -15,6 +15,12 @@ from monitor.state import (
     apply_check, classify,
 )
 
+# Fixtures, NOT a mirror of .env. state.py is track-agnostic -- it has no `track` parameter
+# and the caller passes the floor in (main.py:574) -- so these are just the defaults step()
+# uses. Tests that care about a specific floor pass it positionally instead: see
+# test_b7_hard_evidence_still_needs_the_floor (floor 3) and the floor-2 section at the end,
+# which exercises the auth track's 2/2. Do not "correct" these to match whatever .env holds;
+# reading config here would mean a broken config could never fail a test.
 DOWN_CONFIDENCE = 4
 FLOOR = 4
 STALE = 600
@@ -430,3 +436,91 @@ def test_config_error_is_cleared_by_a_pass_of_its_own_layer():
     state, events = step(state, True, None, T(120), "authed")
     assert state.status == "UP"
     assert isinstance(events[0], RecoveryEvent)
+
+
+# --- [2026-09-15] the auth track's floor of 2 -----------------------------------------
+#
+# AUTH_MIN_FAILED_PROBES drops 4 -> 2 (with AUTH_DOWN_CONFIDENCE to match), so a
+# customer-visible failure behind login confirms in ~56s instead of ~267s. The floor is the
+# only false-positive guarantee left on that track once confidence equals it, so the machine
+# is pinned at 2/2 here directly. state.py takes both as arguments, so none of this depends
+# on what .env happens to hold.
+
+FLOOR_2 = 2
+CONFIDENCE_2 = 2
+
+
+def step2(state, ok, reason, ts, layer="authed", **kw):
+    """step() at the auth track's 2/2, with the real RECOVERY_PASSES."""
+    kw.setdefault("recovery_passes", RECOVERY)
+    return apply_check(state, ok, reason, ts, layer, CONFIDENCE_2, FLOOR_2, STALE, **kw)
+
+
+def test_floor_two_pages_on_two_probes_and_never_on_one():
+    """The executive commitment this supersedes was "no alert ever fires on fewer than 3
+    failed probes". Two is now the number, and one must still be impossible -- a single probe
+    is a wobble at every floor this project has ever shipped."""
+    state, events = step2(UP, False, "element_missing", T(0))
+    assert state.status == "UP" and not downs(events), "one probe never pages"
+
+    state, events = step2(state, False, "element_missing", T(25))
+    assert state.status == "DOWN"
+    assert len(downs(events)) == 1, "exactly one DownEvent per incident (Rule 2)"
+
+
+def test_a_single_hard_failure_does_not_page_at_floor_two():
+    """With AUTH_DOWN_CONFIDENCE=2, one Hard probe (weight 2) already MEETS the confidence
+    threshold. The floor is what holds the line, and it is the only thing that does -- which
+    is the whole reason the pair moves together. Set confidence above the floor and Hard
+    evidence would page faster than Soft, the asymmetry CLAUDE.md forbids because `dns` is
+    what a waking laptop produces (B7)."""
+    state, events = step2(UP, False, "bad_status:500", T(0))
+    assert state.layers["authed"].confidence >= CONFIDENCE_2, \
+        "one hard probe already clears the score"
+    assert state.status == "UP" and not downs(events), "but the floor is not met, so no page"
+
+
+def test_session_expired_is_still_inert_at_floor_two():
+    """Rule 3. Halving the floor must not make the one reason that never scores start
+    scoring -- at floor 2 a single accidental increment would be half an incident."""
+    state = UP
+    for i in range(5):
+        state, events = step2(state, False, "session_expired", T(i * 25))
+        assert state.status == "UP" and not events, "session_expired never scores, ever"
+    assert state.layers.get("authed", LayerEvidence()).consecutive == 0
+
+    # and it does not CLEAR a run either -- it is inert in both directions
+    state, _ = step2(UP, False, "element_missing", T(0))
+    state, _ = step2(state, False, "session_expired", T(10))
+    state, events = step2(state, False, "element_missing", T(25))
+    assert state.status == "DOWN", "the run survived an inert probe between its two failures"
+
+
+def test_a_pass_on_another_layer_does_not_clear_the_authed_run_at_floor_two():
+    """B37 at the new floor. The burst gathers per-layer evidence precisely so a pass on a
+    layer nobody asked about cannot discard it -- and at floor 2 there is only one other
+    failure holding the incident up, so this matters more, not less."""
+    state, _ = step2(UP, False, "element_missing", T(0), "authed")
+    state, _ = step2(state, True, None, T(10), "pulse")
+    state, events = step2(state, False, "element_missing", T(25), "authed")
+    assert state.status == "DOWN", "a passing pulse says nothing about the authed layer"
+    assert len(downs(events)) == 1
+
+
+def test_recovery_still_needs_three_passes_at_floor_two():
+    """Deliberately asymmetric: 2 probes to page, 3 to un-page. B39 was filed for the
+    opposite imbalance (one probe to un-page), and a premature RECOVERED tells an operator to
+    stop looking at something still broken."""
+    state, _ = step2(UP, False, "element_missing", T(0))
+    state, _ = step2(state, False, "element_missing", T(25))
+    assert state.status == "DOWN"
+
+    for n, ts in enumerate((T(50), T(75)), start=1):
+        state, events = step2(state, True, None, ts, "authed")
+        assert state.status == "DOWN", f"{n} consecutive passes must not close the incident"
+        assert not [e for e in events if isinstance(e, RecoveryEvent)]
+
+    state, events = step2(state, True, None, T(100), "authed")
+    assert state.status == "UP"
+    assert len([e for e in events if isinstance(e, RecoveryEvent)]) == 1, \
+        "exactly one RecoveryEvent per incident (Rule 2)"
