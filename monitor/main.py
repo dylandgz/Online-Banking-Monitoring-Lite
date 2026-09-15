@@ -187,7 +187,15 @@ _GRACE: dict = {"until": None}
 def _open_grace_if_process_gap(conn) -> None:
     """Called once per cycle. If more wall-clock passed since the newest recorded probe than
     the monitor could possibly have taken while running, it wasn't running -- a suspend, a
-    restart, or a hung cycle (B42). Open a grace period."""
+    restart, or a hung cycle (B42). Open a grace period.
+
+    [2026-09-15] This is now the ONLY thing that moves the grace. It runs for the full
+    WAKE_GRACE_S and expires on the clock; nothing cancels it early. See the commented-out
+    _lift_grace_on_pass below for what was removed and why.
+
+    Note this fires on every restart with more than 2 x CHECK_INTERVAL_S of downtime, so the
+    first ~2 minutes after any restart are recorded but do not score. That is intended, and
+    it is the thing most likely to look like a broken monitor during a manual drill."""
     last_ts = db.get_last_check_ts(conn)
     if last_ts is None:
         return
@@ -203,13 +211,34 @@ def _scoring_now() -> bool:
     return not (until is not None and datetime.now(timezone.utc) < until)
 
 
-def _lift_grace_on_pass(ok: bool) -> None:
-    """A passing probe is positive proof the host is healthy again, so the grace can end
-    early. The WAKE_GRACE_S bound exists for the opposite case: if the monitor wakes INTO a
-    real outage no probe ever passes, and 'suppress until a pass' would leave it blind
-    indefinitely. Both halves are load-bearing; simulated."""
-    if ok and _GRACE["until"] is not None:
-        _GRACE["until"] = None
+# [2026-09-15] REMOVED -- kept commented rather than deleted, because the argument for it is
+# still readable and someone will propose it again.
+#
+# The claim was that "a passing probe is positive proof the host is healthy again, so the
+# grace can end early". It is not. The pulse probe is the first and fastest thing in a cycle
+# (~200ms) and the network is usually back before the browser stack, the session and the
+# filesystem are. So a passing pulse cancelled the grace at line ~727, `scoring` was computed
+# True on the very next line, and the authed probe -- slow, browser-backed, session-backed --
+# ran in that same cycle with no protection at all, seconds after the host woke.
+#
+# B57 recorded both outcomes on one day:
+#     2026-09-03 11:15   pulse FAILED dns   grace HELD     login scored 0   nothing latched
+#     2026-09-03 00:36   pulse OK           grace LIFTED   login scored 1   7h 16m blind
+# Whether post-wake failures counted came down to whether the pulse happened to pass.
+#
+# The measurement that settled it: 23 process gaps in the 7 days to 2026-09-14, against 17
+# probes written scored=0 in the entire history of the database. Each gap should suppress
+# roughly two cycles. The grace was being cancelled almost every time -- it had effectively
+# never worked.
+#
+# What is NOT lost by removing it: the WAKE_GRACE_S bound was always the half that mattered,
+# and it still guarantees the monitor cannot go blind indefinitely if it wakes INTO a real
+# outage. The cost is up to 120s of non-scoring per wake (~45 min/week at the observed rate,
+# ~0.4% of the time), with every probe still RECORDED throughout.
+#
+# def _lift_grace_on_pass(ok: bool) -> None:
+#     if ok and _GRACE["until"] is not None:
+#         _GRACE["until"] = None
 
 
 async def _wait_burst_gap(gap_s: int) -> None:
@@ -724,7 +753,10 @@ async def run_cycle(conn, channels, auth_enabled: bool, cycle_id: str | None = N
     # reached and passed; record that against the pulse layer before scoring the render
     # result, or the pulse layer only ever hears about its own failures and a pulse-caused
     # incident can never recover. No extra checks row -- the one row covers both legs.
-    _lift_grace_on_pass(main_result.ok)
+    # [2026-09-15] _lift_grace_on_pass(main_result.ok) used to run HERE, one line above
+    # `scoring` is computed -- which is exactly why it defeated the grace: a 200ms pulse pass
+    # cancelled it before the slow authed probe in the same cycle was ever asked whether it
+    # should score. The grace now expires only on the clock.
     scoring = _scoring_now()
 
     if main_result.layer == "render":

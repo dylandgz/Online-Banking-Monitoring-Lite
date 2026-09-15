@@ -145,7 +145,24 @@ def test_probes_after_a_process_gap_are_recorded_but_do_not_score(conn, monkeypa
         "but the probe is still recorded -- every probe writes a row"
 
 
-def test_the_grace_lifts_on_a_passing_probe(conn, monkeypatch):
+def test_the_grace_does_not_lift_on_a_passing_probe(conn, monkeypatch):
+    """[2026-09-15] INVERTED. This test previously asserted the opposite -- that "a pass is
+    positive proof the host is healthy again" -- and that assumption is what defeated the
+    grace in practice.
+
+    The pulse probe is the first and fastest thing in a cycle (~200ms), and the network comes
+    back before the browser stack, the session and the filesystem do. So a passing pulse
+    cancelled the grace one line before `scoring` was computed, and the authed probe -- slow,
+    browser-backed, session-backed -- ran in that same cycle unprotected, seconds after the
+    host woke. B57 caught both outcomes on one day: a wake whose pulse failed held the grace
+    and latched nothing; a wake whose pulse passed lifted it and went blind for 7h 16m.
+
+    The measurement: 23 process gaps in the 7 days to 2026-09-14, against 17 scored=0 rows in
+    the entire history of the database. The grace was being cancelled almost every time.
+
+    The WAKE_GRACE_S bound still guarantees it cannot stay blind indefinitely -- that half was
+    always the load-bearing one, and test_an_outage_beginning_at_a_wake_is_delayed_not_lost
+    pins it."""
     _seed_stale_probe(conn)
     monkeypatch.setattr(check, "perform_check", _fail("pulse", "dns"))
     monkeypatch.setattr(check, "pulse_only_probe", _fail("pulse", "dns"))
@@ -154,7 +171,22 @@ def test_the_grace_lifts_on_a_passing_probe(conn, monkeypatch):
 
     monkeypatch.setattr(check, "perform_check", _pass_all)
     asyncio.run(main.run_cycle(conn, [], auth_enabled=False))
-    assert main._scoring_now(), "a pass is positive proof the host is healthy again"
+    assert not main._scoring_now(), \
+        "a 200ms pulse pass is not proof the browser, session and network stack have settled"
+
+
+def test_the_grace_expires_only_on_the_clock(conn, monkeypatch):
+    """The complement of the test above: nothing cancels the grace early any more, so the
+    only way out is WAKE_GRACE_S elapsing. Pinned because the practical consequence surprises
+    people -- EVERY restart with more than 2 x CHECK_INTERVAL_S of downtime opens the grace,
+    so the first ~2 minutes after any restart are recorded but do not score."""
+    _seed_stale_probe(conn)
+    monkeypatch.setattr(check, "perform_check", _pass_all)
+    asyncio.run(main.run_cycle(conn, [], auth_enabled=False))
+    assert not main._scoring_now(), "a passing cycle does not end the grace"
+
+    main._GRACE["until"] = None          # stand-in for the bound elapsing
+    assert main._scoring_now(), "and once it expires, scoring resumes normally"
 
 
 def test_an_outage_beginning_at_a_wake_is_delayed_not_lost(conn, monkeypatch):
