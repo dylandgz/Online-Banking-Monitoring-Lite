@@ -6,7 +6,7 @@ A monitor that answers ONE question every 60 seconds: **is the online banking pl
 
 **UP** = the authenticated area behind login returns HTTP 200 **and renders the expected content.**
 
-The public pulse and login-page render checks are *precursor* evidence for that same question — not a separate product. This replaces a Selenium tool that false-positived on DOM changes, so **low false positives outrank everything else**, and no alert ever fires on fewer than 3 failed probes (executive commitment).
+The public pulse and login-page render checks are *precursor* evidence for that same question — not a separate product. This replaces a Selenium tool that false-positived on DOM changes, so **low false positives outrank everything else**, and no alert ever fires on fewer than **two** failed probes. **[2026-09-15]** That floor was three, as an executive commitment; the online-banking team lowered the auth track to two because a customer-visible failure behind login is a true positive even at two minutes, and a floor of four could not catch one. The main track is unchanged at four. See PROGRESS.md 2026-09-15.
 
 Results go to SQLite (audit-grade — every probe writes a row, pass or fail). Email alerts fire on state transitions only. A FastAPI dashboard reads the same data.
 
@@ -174,11 +174,13 @@ No `page.*` call may raise out of a probe. Anything unforeseen resolves through 
 
 ## The DOWN algorithm
 
-**DOWN = `MIN_FAILED_PROBES` (4) CONSECUTIVE failed probes on ONE layer, with no intervening pass of that layer.**
+**DOWN = that track's floor in CONSECUTIVE failed probes on ONE layer, with no intervening pass of that layer.** The main track's floor is `MIN_FAILED_PROBES` (4); the auth track's is `AUTH_MIN_FAILED_PROBES` (2).
 
-Both tracks use the same number (`AUTH_MIN_FAILED_PROBES=4`). There is **no time window** — a slow probe delays detection, it cannot prevent it.
+**[2026-09-15]** The tracks no longer use the same number. There is **no time window** on either — a slow probe delays detection, it cannot prevent it.
 
-`DOWN_CONFIDENCE` (4) is still checked and is currently **inert by arithmetic**: the weakest possible evidence at four probes is four Soft failures worth 1 each, which already meets it. It is retained deliberately — lowering the floor to 3 re-arms it, because three Soft failures total 3. Verified exhaustively over every four-failure combination.
+The floors differ because the *probe* costs differ, and a burst's wall-clock span is the floor times the probe cost plus the gaps. A pulse failure costs ~0.1s; an authed failure costs the whole frame budget, because a missing marker can only be proved by exhausting it. At 4/25s the auth track's span was 267s against pulse's 77s — the layer that *defines* UP was by far the slowest to confirm, and every frame-content failure on record (7 episodes, longest consecutive run 2) fell short of the floor before it could page. At 2 probes and a 10s gap the auth span is ~56s, and pulse is untouched at 77s.
+
+`DOWN_CONFIDENCE` / `AUTH_DOWN_CONFIDENCE` are still checked and are **inert by arithmetic on both tracks**: the weakest possible evidence at the floor is that many Soft failures worth 1 each, which exactly meets the threshold (4 Soft = 4 on main, 2 Soft = 2 on auth). They are retained deliberately, and the rule is that **confidence moves with the floor**. Lower a floor without lowering its confidence and the threshold re-arms against Soft evidence only — so Hard evidence would page sooner than Soft, which is precisely what [Confidence weights](#confidence-weights-identical-on-both-tracks) forbids, because Hard includes `dns` and `dns` is what a waking laptop produces. The invariant to hold is `weakest_weight × floor ≥ confidence`; it is pinned in `tests/test_p2_correctness.py` and `tests/test_session_freshness.py`.
 
 > **Rewritten 2026-08-30.** The previous rule was "accumulated score ≥ threshold AND ≥ 3 distinct failed probes within a 90s window". Simulated against 1,200 randomised worlds it missed **48% of real outages** and **42% of its pages were false** — and the live record agreed, every main-track page it ever produced being a laptop resuming from suspend. Three independent causes, each reproduced against the state machine before the change: a pass on *any* layer wiped *all* layers (B37); the 90s window was narrower than two 60s cycles, so cycle-cadence failures could never reach the floor (B38); and `dns` from a waking host is indistinguishable from `dns` from a dead bank (B7). The replacement misses ~2% and pages falsely 0 times.
 
@@ -206,17 +208,22 @@ The two halves are inseparable. Per-layer evidence with a layer-alternating burs
 
 ### Bursts
 
-A burst launches whenever a failure produces evidence (session- and config-class reasons open no run, so nothing is confirmed and no probes are spent). It re-probes **the layer that failed**, `BURST_PROBES` (4) times, each starting `BURST_GAP_S` (25s) ± `BURST_JITTER_S` (5s) after the previous probe **finished**. It stops the moment the run resolves — DOWN fired, or a pass cleared it.
+A burst launches whenever a failure produces evidence (session- and config-class reasons open no run, so nothing is confirmed and no probes are spent). It re-probes **the layer that failed**, `BURST_PROBES` (4) times, each starting that track's gap — `MAIN_BURST_GAP_S` (25s) or `AUTH_BURST_GAP_S` (10s) — ± `BURST_JITTER_S` (5s) after the previous probe **finished**. It stops the moment the run resolves — DOWN fired, or a pass cleared it.
 
 - Offsets from a fixed origin were retired with the window. They held the burst to a fixed footprint only while probes were fast enough to leave idle time; past that the sleep clamped to zero, probes ran back to back, and the last one timestamped itself outside the window it was scheduled in.
-- **25s is the false-positive dial, and the only one.** Simulated: at 10s six nuisance events paged, at 15s three, at 25s none. Shorter gaps crowd four probes into a span a brief wobble can survive.
+- **`MAIN_BURST_GAP_S` (25s) is the main track's false-positive dial.** Simulated: at 10s six nuisance events paged, at 15s three, at 25s none. Shorter gaps crowd four probes into a span a brief wobble can survive. It is load-bearing precisely because a pulse failure costs ~0.1s, so the gap supplies essentially *all* of that burst's spacing.
+- **`AUTH_BURST_GAP_S` (10s) is the auth track's, and it is a different problem.** **[2026-09-15]** A failing authed probe already costs the whole frame budget, so it spaces itself; piling 25s on top put the auth span at 267s. At 10s ± 5s jitter the span is 51–61s and the gap never reaches zero. Do not collapse these back into one value — one number cannot be right for probes whose costs differ by two orders of magnitude.
 - **Auth track** re-probes with `run_authed_check()` only. **A burst consumes zero logins.**
 - Every burst probe carries `burst_id` and `cycle_id`.
 - A burst's footprint is `BURST_PROBES × (gap + probe duration)`, so it is bounded by the probe's own cost — and nothing currently bounds that (**B43**), which is why a worst-case authed burst can run several minutes. It logs `skip cycle` throughout, which is also what a hung cycle looks like (**B42**).
 
 ### The wake grace
 
-When the wall-clock gap since the newest recorded probe exceeds `2 × CHECK_INTERVAL_S`, the monitor cannot have been running — a suspend, a restart, or a hung cycle. Probes are then **recorded but do not score** until either a probe passes or `WAKE_GRACE_S` (120s) elapses.
+When the wall-clock gap since the newest recorded probe exceeds `2 × CHECK_INTERVAL_S`, the monitor cannot have been running — a suspend, a restart, or a hung cycle. Probes are then **recorded but do not score** until `WAKE_GRACE_S` (120s) elapses.
+
+**[2026-09-15]** It used to lift early on the first passing probe, and that is what stopped it working. The pulse probe is the first and fastest thing in a cycle (~200ms), and the network returns before the browser stack, the session and the filesystem do — so a passing pulse cancelled the grace one line before `scoring` was computed, and the slow authed probe in that same cycle scored in full, seconds after the host woke. B57 caught both outcomes on one day: a wake whose pulse *failed* held the grace and latched nothing; a wake whose pulse *passed* lifted it and went blind for 7h 16m. Measured across the week to 2026-09-14: 23 process gaps against 17 `scored=0` rows in the entire database — it was being cancelled almost every time.
+
+The grace now expires only on the clock. Note this fires on **every restart** with more than two minutes of downtime, so the first ~2 minutes after any restart are recorded but do not score — the thing most likely to look like a broken monitor during a manual drill.
 
 Both halves are load-bearing. "Suppress until a pass" alone never lifts if the monitor wakes *into* a real outage, and would leave it blind indefinitely; the bound means such an outage is delayed by about two cycles rather than lost. The gap is measured **process-wide, not per layer** — during a long burst one layer legitimately goes unprobed for minutes, and that is the monitor working, not sleeping.
 
@@ -224,15 +231,18 @@ Both halves are load-bearing. "Suppress until a pass" alone never lifts if the m
 
 Detection time is `floor × probe_cost + (floor − 1) × gap`. The 75s of waiting is fixed; probe cost is the only variable.
 
-| Scenario | Outcome |
-|---|---|
-| Total outage (`dns`), pulse ~0.5s | **DOWN** at ≈77s |
-| Login page broken, render ~3.2s | **DOWN** at ≈88s |
-| Behind login broken, authed ~6.9s | **DOWN** at ≈103s |
-| Behind login broken, slow 27s probes | **DOWN** at ≈183s |
-| 3 consecutive failures, then a pass | run cleared, logged as a flap, **no alert** |
-| Any outage shorter than ~80s | **never** pages — deliberate; 74% of recorded failure runs are 1–2 probes |
-| `dns` burst on a waking laptop | **never** pages |
+| Scenario | Track | Outcome |
+|---|---|---|
+| Total outage (`dns`), pulse ~0.1s | main | **DOWN** at ≈77s |
+| Login page broken, render ~3.2s | main | **DOWN** at ≈88s |
+| Behind login broken, authed | auth | **DOWN** at ≈56s |
+| 1 failure, then a pass (either track) | — | run cleared, logged as a flap, **no alert** |
+| 3 consecutive failures, then a pass | main | run cleared, **no alert** — the floor is 4 |
+| 3 consecutive failures, then a pass | auth | already **DOWN** at the 2nd — the floor is 2 |
+| Any main-track outage shorter than ~77s | main | **never** pages — deliberate |
+| Any auth-track outage shorter than ~56s | auth | **never** pages |
+| `dns` burst on a waking laptop | main | **never** pages |
+| Any failure in the 2 minutes after a restart | both | recorded `scored=0`, **never** pages |
 
 The shortest detectable outage rose from ~40s to ~80s. That is the same dial that took false positives to zero: a 40-second wobble and a laptop waking up are indistinguishable, so sensitivity to one is sensitivity to the other.
 
@@ -399,11 +409,11 @@ One DOWN email and one RECOVERY email per incident, ever. One CONFIG-ERROR email
 
 **Timing:** `CHECK_INTERVAL_S=60`, `BROWSER_TIMEOUT_MS=15000`, `CHALLENGE_TIMEOUT_MS=25000`.
 
-**Detection:** `BURST_GAP_S=25`, `BURST_PROBES=4`, `BURST_JITTER_S=5`, `MIN_FAILED_PROBES=4`, `AUTH_MIN_FAILED_PROBES=4`, `EVIDENCE_STALE_AFTER_S=600`, `RECOVERY_PASSES=3`, `WAKE_GRACE_S=120`, `DOWN_CONFIDENCE=4` / `AUTH_DOWN_CONFIDENCE=4` (inert — see [The DOWN algorithm](#the-down-algorithm)).
+**Detection:** `MAIN_BURST_GAP_S=25`, `AUTH_BURST_GAP_S=10`, `BURST_PROBES=4`, `BURST_JITTER_S=5`, `MIN_FAILED_PROBES=4`, `AUTH_MIN_FAILED_PROBES=2`, `EVIDENCE_STALE_AFTER_S=600`, `RECOVERY_PASSES=3`, `WAKE_GRACE_S=120`, `DOWN_CONFIDENCE=4` / `AUTH_DOWN_CONFIDENCE=2` (inert on both — see [The DOWN algorithm](#the-down-algorithm); each must move *with* its floor). `MAIN_BURST_GAP_S` still reads the retired name `BURST_GAP_S` if unset, and `AUTH_BURST_GAP_S` defaults to it, so an unmigrated `.env` behaves exactly as before.
 
 `BURST_DELAYS_S` and `BURST_WINDOW_S` were retired 2026-08-30 and are no longer read.
 
-**Session & budget:** `SESSION_STATE_PATH`, `SESSION_MAX_AGE_S=600`, `LOGIN_INTERVAL_S=120` (floor 60; never equal to `SESSION_MAX_AGE_S`), `MAX_CONSECUTIVE_LOGIN_FAILURES=5` (must exceed `AUTH_MIN_FAILED_PROBES`), `LOGIN_BREAKER_COOLDOWN_S=600`.
+**Session & budget:** `SESSION_STATE_PATH`, `SESSION_MAX_AGE_S=600`, `LOGIN_INTERVAL_S=120` (floor 60; never equal to `SESSION_MAX_AGE_S`), `MAX_CONSECUTIVE_LOGIN_FAILURES=8` (must exceed `AUTH_MIN_FAILED_PROBES`), `LOGIN_BREAKER_COOLDOWN_S=600`.
 
 **Screenshots:** `MASK_TEXT` (semicolon-separated regexes), `MASKING_ENABLED=true`.
 
@@ -416,10 +426,10 @@ Eastern-time presentation is handled in code, not configured. `.env.example` car
 ## Rules (non-negotiable)
 
 1. **`state.py` stays pure** — no I/O, fully unit-tested: burst evaluation, confidence scoring, floors, suppression.
-2. **Alert only on transitions.** DOWN requires **4 consecutive failed probes on one layer** with no intervening pass of that layer — on both tracks, with no time window. Recovery requires 3 consecutive passes of the layer that caused it. One DOWN + one RECOVERY email per incident, ever.
+2. **Alert only on transitions.** DOWN requires **that track's floor in consecutive failed probes on one layer** with no intervening pass of that layer — 4 on main, **2 on auth** — with no time window on either. Recovery requires 3 consecutive passes of the layer that caused it. One DOWN + one RECOVERY email per incident, ever.
 3. **`session_expired` never scores.** It routes to the recovery-login path and is recorded, but it cannot contribute to DOWN confidence or the probe floor on any track.
 4. **Never retry a credential rejection.** `auth_rejected` → CONFIG_ERROR, logins halt until a human clears it. Always, everywhere. **[2026-09-08]** `auth_rejected` is returned **only when a configured `AUTH_REJECTED_TEXT` pattern positively matches** — never as the fallback for a screen the classifier did not recognise.
-5. **The login budget is a hard limit.** Burst re-probes on the auth track MUST use `run_authed_check()` — a burst consumes zero logins. Every attempt is ledgered, including failures. **[2026-09-08] `MAX_CONSECUTIVE_LOGIN_FAILURES` (5) consecutive failed attempts halts logins regardless of why they failed** — screen-independent, so it also covers screens nobody has captured. It MUST exceed `AUTH_MIN_FAILED_PROBES` so a DOWN pages *before* the monitor stops trying; `config.py` refuses to start otherwise. On trip: logins stop, an admin note is sent, and the track's status stays as the evidence left it — it is **not** downgraded to CONFIG_ERROR. Forcing CONFIG_ERROR there would zero the accumulated evidence, flip a DOWN you were paged for three minutes earlier into a non-paging "needs attention", exclude the rest of a real outage from `uptime_pct`, and orphan the open incident ([B2](#), [B3](#) in the tracker). The platform did not recover — the monitor stopped trying. The "make it loud" requirement is met by the admin note, not by rewriting the verdict.
+5. **The login budget is a hard limit.** Burst re-probes on the auth track MUST use `run_authed_check()` — a burst consumes zero logins. Every attempt is ledgered, including failures. **[2026-09-08] `MAX_CONSECUTIVE_LOGIN_FAILURES` (8) consecutive failed attempts halts logins regardless of why they failed** — screen-independent, so it also covers screens nobody has captured. **[2026-09-15]** Raised 5 → 8 alongside `CHALLENGE_TIMEOUT_MS` 45000 → 20000: a tighter challenge budget turns slow-but-healthy logins into *failed* ones, and being screen-independent the breaker cannot tell those apart. Measured over 30 days, at a 20s budget a threshold of 5 trips 8 times — one of them entirely false (five consecutive healthy logins at 21–25s) — while 8 trips once, fewer than the 5 trips the old 45000/5 pairing produced. It MUST exceed `AUTH_MIN_FAILED_PROBES` so a DOWN pages *before* the monitor stops trying; `config.py` refuses to start otherwise. On trip: logins stop, an admin note is sent, and the track's status stays as the evidence left it — it is **not** downgraded to CONFIG_ERROR. Forcing CONFIG_ERROR there would zero the accumulated evidence, flip a DOWN you were paged for three minutes earlier into a non-paging "needs attention", exclude the rest of a real outage from `uptime_pct`, and orphan the open incident ([B2](#), [B3](#) in the tracker). The platform did not recover — the monitor stopped trying. The "make it loud" requirement is met by the admin note, not by rewriting the verdict.
 
 **The breaker resets on a cooldown, not only by hand.** While tripped it permits **one** attempt every `LOGIN_BREAKER_COOLDOWN_S` (600) and resets on the first success. Without that the auth track is frozen: no logins means no session, which means no cheap checks either, so it would sit at DOWN long after the platform recovered — the exact failure this whole effort exists to remove. 6 attempts/hour is close to the ~5.5/hour the monitor already performs when perfectly healthy, and the credential case does not reach here anyway: a genuine rejection matches `AUTH_REJECTED_TEXT` and latches at failure #1 under Rule 4. Recovery lands within ~12 minutes of the platform returning.
 6. **Bot challenges: detect, never defeat.** patchright is the one approved, scoped mitigation. **[2026-09-08]** `bot_challenge` is returned **only on positive detection** of a challenge — never as the fallback for an unrecognised screen. No such detector exists yet and no captured DOM anywhere in `data/dom_dumps/` shows a real challenge, so nothing currently emits it (see [Known limitations](#known-limitations) 3). A Config-class failure **backs off ~5 minutes and retries** rather than latching on first sight; it latches only on repetition. The old first-sight latch produced three blind windows totalling ~21 hours in the week of 2026-08-31, none of them a configuration problem.
@@ -453,7 +463,7 @@ Open and deliberate. Read this before diagnosing a bug — several "bugs" are al
 9. **`SESSION_STATE_PATH` defaults inside the synced repo tree**, and `os.chmod(0o600)` is a silent no-op on Windows despite `session.py` asserting it.
 10. **`.env.example` declares `LOGIN_STRESS_MODE`, which `config.py` deliberately does not read.** Reserved for a future sanctioned stress window; it is not implemented.
 11. **A burst has no wall-clock ceiling, and a long one is indistinguishable from a hang.** A burst's footprint is `BURST_PROBES × (gap + probe duration)`, and nothing bounds probe duration (**B43**: an authed probe has been observed at 95s against 15s/25s call timeouts). A worst-case authed burst therefore runs several minutes, printing `skip cycle` every minute — exactly what the 13.5-hour hang of 2026-08-30 printed (**B42**). Any watchdog on the cycle lock must sit above the longest legitimate burst.
-12. **Intermittent failures around 50% are detected slowly.** The rule needs four failures *in a row*; at a 50% failure rate that takes minutes of sampling. Above 60% the design is comparable to the old one and above 80% it is faster. If half-failure matters it needs its own mechanism — a rolling error rate — not a return to the window, which never helped here either (measured: identical results with and without it, at the same probe spacing).
+12. **Intermittent failures around 50% are detected slowly.** The rule needs the track's floor in failures *in a row* (4 on main, 2 on auth — the auth track is correspondingly less affected since 2026-09-15); at a 50% failure rate that takes minutes of sampling. Above 60% the design is comparable to the old one and above 80% it is faster. If half-failure matters it needs its own mechanism — a rolling error rate — not a return to the window, which never helped here either (measured: identical results with and without it, at the same probe spacing).
 13. **`db.count_login_events_since()` has no callers** — it was the daily-cap query, and was deliberately kept because the deferred `/api/logins` budget gauge is exactly that query. Wire it or drop it; don't leave it parked (**B22**).
 
 ## Out of scope

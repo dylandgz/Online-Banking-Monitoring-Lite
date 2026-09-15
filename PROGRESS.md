@@ -682,3 +682,74 @@ while latched) and is deferred.
 **Still open and worth knowing:** B42 (dispatch off the cycle lock -- the SMTP timeout bounds it
 but does not fix it), B58 (an unset `ADMIN_EMAIL` silences the channel entirely, which now also
 silences BLIND), B5/D2 above, and B46 (a restart produces either a DEGRADED row or no row at all).
+
+
+## Auth track lowered to a floor of 2, and the wake grace made to hold -- 2026-09-15
+
+Prompted by a live blip: **2026-09-14 00:43-00:45 ET**, the authed check failed twice with
+`element_missing` and the cycle was written **UP**. The screenshots show the shell perfectly
+intact -- signed in, `Logout` present, nav and Smart Offers rendered -- and the `nxg-olb` iframe
+displaying *"There was an error loading Internal accounts. Please try again later."* Customers
+were signed in and their accounts did not appear. That is CLAUDE.md's definition of not-UP, and
+nothing alerted.
+
+**Why it could not alert.** Two consecutive failures against a floor of 4. Not a state-machine
+bug -- `state.py` did exactly what Rule 2 says. The structural reason is that a *failing* authed
+probe costs the full `CHALLENGE_TIMEOUT_MS`, because a missing marker can only be proved by
+exhausting the budget. At 45s that made each failure ~48s, so the floor needed
+`4 x 48 + 3 x 25 = 267s` of continuous failure. The outage ran ~2.5 minutes. Across all seven
+frame-content episodes on record the longest consecutive run is **2** -- the class had never been
+able to page.
+
+**Decision (online-banking team, 2026-09-15): floor 2.** A customer-visible failure behind login
+is a true positive even at two minutes. **This supersedes the "no alert ever fires on fewer than
+3 failed probes" executive commitment**, which is why it is recorded here rather than left to
+`.env`. Detection goes ~267s -> ~56s.
+
+**Changed:**
+- `AUTH_MIN_FAILED_PROBES` 4 -> 2, `AUTH_DOWN_CONFIDENCE` 4 -> 2. The confidence moves *with* the
+  floor, always: at 2/2 the weakest evidence (2 Soft) still exactly meets the score, so the floor
+  stays the binding constraint. Left at 4 it would mean two Hard failures page while two Soft ones
+  do not -- Hard outrunning Soft, which B7 forbids.
+- `CHALLENGE_TIMEOUT_MS` 45000 -> 20000, and `MAX_CONSECUTIVE_LOGIN_FAILURES` 5 -> 8 to absorb it.
+  A tighter budget turns slow-but-healthy logins into failed ones and the breaker cannot tell them
+  apart. Measured over 30d: at 20s a breaker of 5 trips 8 times (one entirely false --
+  2026-09-03 17:05, five consecutive healthy logins at 21-25s); at 8 it trips once, fewer than the
+  5 the old 45000/5 pairing produced.
+- `BURST_GAP_S` split into `MAIN_BURST_GAP_S` (25) and `AUTH_BURST_GAP_S` (10). A burst's span is
+  the gap PLUS the failing probe's own duration, and the tracks are two orders of magnitude apart
+  on that second term. Both names fall back, so an unmigrated `.env` is unchanged.
+- **The wake grace no longer lifts on a passing probe.** `_lift_grace_on_pass` is commented out,
+  not deleted. B57 had caught both outcomes on one day -- a wake whose pulse failed held the grace
+  and latched nothing; a wake whose pulse passed lifted it and went blind for 7h 16m. The
+  measurement that settled it: 23 process gaps in the week to 2026-09-14 against **17** `scored=0`
+  rows in the entire database. It was being cancelled almost every time.
+
+**Regression review against the fixed-bug record** (the reason this took a day rather than an
+hour). Checked B70, B47, B52/B57, B39, B8, B66, B2/B3, B13, B37/B38, B49/B50, B42/B43. Findings
+that survived scrutiny: B47's mechanism is closed by D1 so the timeout may safely come back down;
+B52/B57 was live, not theoretical, on a host with 7 process gaps in 3 days; B70 makes the sign-in
+drill twice as easy to page from and is still open. Two findings I raised and then withdrew are
+recorded honestly in the tracker rather than quietly dropped.
+
+**Two deliberate tripwires fired, as designed.** `test_p2_correctness.py` and
+`test_session_freshness.py` both asserted `AUTH_MIN_FAILED_PROBES == 4` with comments explaining
+why. Both now assert the invariant they were really protecting -- `weakest_weight x floor >=
+confidence` -- which holds at 2/2 and at 4/4 and fails loudly on a bad pairing at any floor. The
+literal 4 is kept where its rationale applies: the main track, since `dns` is a main-track reason
+the authed layer cannot emit at all.
+
+**Reading the incidents table across this change.** Before 2026-09-15 an auth incident with fewer
+than 3 failed checks indicated a pre-v3.8 row (B8). After it, `checks_failed=2` is a normal
+floor-2 incident. `incidents.started_at` is the discriminator.
+
+**Not yet run against the live target.** The suite is 261 green with mocked probes; none of this
+has executed against the bank. The monitor was still running the old code throughout -- the
+process started 09:16, the edits landed 11:58 onward -- so nothing changed underneath it. The
+manual plan (T0-T14) runs after a restart, with recipients repointed first.
+
+**Still open:** B70 (the drill writes to live state with real channels -- fix before any
+wrong-password drill), B66 (BLIND still fires inside an open incident; admin-only, deferred),
+B57's other half (a probe that straddles the sleep is not covered by the grace change, because
+the gap is not detectable until the next cycle starts), and B72 (README describes the
+pre-2026-08-30 design, filed 2026-09-14, out of scope here).
