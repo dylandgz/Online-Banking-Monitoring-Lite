@@ -109,10 +109,17 @@ AUTH_BURST_GAP_S = int(os.getenv("AUTH_BURST_GAP_S", str(MAIN_BURST_GAP_S)))
 BURST_PROBES = int(os.getenv("BURST_PROBES", "4"))
 
 # [B7] How long probes are recorded but not scored after the monitor notices it was not
-# running. Lifts early on the first passing probe. The bound matters for the opposite case:
-# if the monitor wakes INTO a real outage no probe ever passes, and "suppress until a pass"
-# alone would leave it blind indefinitely -- so a real outage beginning at a wake is delayed
-# by about two cycles, never lost.
+# running. [2026-09-15] It runs the FULL duration and expires only on the clock; it no longer
+# lifts early on a passing probe. The pulse probe is the first and fastest thing in a cycle
+# (~200ms) and the network returns before the browser stack, the session and the filesystem
+# do, so a passing pulse was cancelling the grace one line before `scoring` was computed and
+# the slow authed probe in the same cycle scored unprotected (B52/B57 -- one such wake went
+# blind for 7h 16m). Measured: 23 process gaps in the week to 2026-09-14 against 17 scored=0
+# rows in the whole database; it was being cancelled almost every time.
+#
+# The bound still matters for the opposite case: if the monitor wakes INTO a real outage no
+# probe ever passes, so a real outage beginning at a wake is delayed by about two cycles,
+# never lost. Note this also means the first ~2 minutes after EVERY restart do not score.
 WAKE_GRACE_S = int(os.getenv("WAKE_GRACE_S", "120"))
 BURST_JITTER_S = int(os.getenv("BURST_JITTER_S", "5"))
 # [2026-08-30 / B38] BURST_WINDOW_S is retired. DOWN now requires N *consecutive* failed
@@ -351,8 +358,9 @@ BLIND_ESCALATE_AFTER_S = int(os.getenv("BLIND_ESCALATE_AFTER_S", "7200"))
 
 # The ordering is load-bearing, not a sanity check. DOWN must fire BEFORE the monitor stops
 # trying, or the breaker silences the track at the exact moment it has the most evidence and
-# nobody is told an outage is underway. With the floor at 4 and the breaker at 5, failure 4
-# pages and failure 5 stops the spending.
+# nobody is told an outage is underway. With the floor at 2 and the breaker at 8, failure 2
+# pages and failure 8 stops the spending -- a wider margin than the old 4/5 pairing, because
+# lowering the floor moves the alarm earlier while raising the breaker moves the halt later.
 if MAX_CONSECUTIVE_LOGIN_FAILURES <= AUTH_MIN_FAILED_PROBES:
     sys.exit(
         f"MAX_CONSECUTIVE_LOGIN_FAILURES={MAX_CONSECUTIVE_LOGIN_FAILURES} must be greater "
@@ -360,7 +368,7 @@ if MAX_CONSECUTIVE_LOGIN_FAILURES <= AUTH_MIN_FAILED_PROBES:
         "The breaker halts logins; the probe floor raises the alarm. If the breaker trips "
         "first the auth track goes quiet with nobody paged -- which is the failure mode the "
         "breaker exists to replace, reintroduced from the other direction. Shipped values "
-        "are AUTH_MIN_FAILED_PROBES=4 / MAX_CONSECUTIVE_LOGIN_FAILURES=5."
+        "are AUTH_MIN_FAILED_PROBES=2 / MAX_CONSECUTIVE_LOGIN_FAILURES=8."
     )
 
 

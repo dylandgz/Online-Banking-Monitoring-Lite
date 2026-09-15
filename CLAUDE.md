@@ -178,7 +178,7 @@ No `page.*` call may raise out of a probe. Anything unforeseen resolves through 
 
 **[2026-09-15]** The tracks no longer use the same number. There is **no time window** on either — a slow probe delays detection, it cannot prevent it.
 
-The floors differ because the *probe* costs differ, and a burst's wall-clock span is the floor times the probe cost plus the gaps. A pulse failure costs ~0.1s; an authed failure costs the whole frame budget, because a missing marker can only be proved by exhausting it. At 4/25s the auth track's span was 267s against pulse's 77s — the layer that *defines* UP was by far the slowest to confirm, and every frame-content failure on record (7 episodes, longest consecutive run 2) fell short of the floor before it could page. At 2 probes and a 10s gap the auth span is ~56s, and pulse is untouched at 77s.
+The floors differ because the *probe* costs differ, and a burst's wall-clock span is the floor times the probe cost plus the gaps. A pulse failure costs ~0.1s; an authed failure costs the whole frame budget, because a missing marker can only be proved by exhausting it. At 4/25s the auth track's span was 267s against pulse's 75s — the layer that *defines* UP was by far the slowest to confirm, and every frame-content failure on record (7 episodes, longest consecutive run 2) fell short of the floor before it could page. At 2 probes and a 10s gap the auth span is ~56s, and pulse is untouched at 75s.
 
 `DOWN_CONFIDENCE` / `AUTH_DOWN_CONFIDENCE` are still checked and are **inert by arithmetic on both tracks**: the weakest possible evidence at the floor is that many Soft failures worth 1 each, which exactly meets the threshold (4 Soft = 4 on main, 2 Soft = 2 on auth). They are retained deliberately, and the rule is that **confidence moves with the floor**. Lower a floor without lowering its confidence and the threshold re-arms against Soft evidence only — so Hard evidence would page sooner than Soft, which is precisely what [Confidence weights](#confidence-weights-identical-on-both-tracks) forbids, because Hard includes `dns` and `dns` is what a waking laptop produces. The invariant to hold is `weakest_weight × floor ≥ confidence`; it is pinned in `tests/test_p2_correctness.py` and `tests/test_session_freshness.py`.
 
@@ -233,18 +233,20 @@ Detection time is `floor × probe_cost + (floor − 1) × gap`. The 75s of waiti
 
 | Scenario | Track | Outcome |
 |---|---|---|
-| Total outage (`dns`), pulse ~0.1s | main | **DOWN** at ≈77s |
+| Total outage (`dns`), pulse ~0.1s | main | **DOWN** at ≈75s |
 | Login page broken, render ~3.2s | main | **DOWN** at ≈88s |
 | Behind login broken, authed | auth | **DOWN** at ≈56s |
 | 1 failure, then a pass (either track) | — | run cleared, logged as a flap, **no alert** |
 | 3 consecutive failures, then a pass | main | run cleared, **no alert** — the floor is 4 |
 | 3 consecutive failures, then a pass | auth | already **DOWN** at the 2nd — the floor is 2 |
-| Any main-track outage shorter than ~77s | main | **never** pages — deliberate |
+| Any main-track outage shorter than ~75s | main | **never** pages — deliberate |
 | Any auth-track outage shorter than ~56s | auth | **never** pages |
 | `dns` burst on a waking laptop | main | **never** pages |
 | Any failure in the 2 minutes after a restart | both | recorded `scored=0`, **never** pages |
 
-The shortest detectable outage rose from ~40s to ~80s. That is the same dial that took false positives to zero: a 40-second wobble and a laptop waking up are indistinguishable, so sensitivity to one is sensitivity to the other.
+The 2026-08-30 rework raised the shortest detectable **main-track** outage from ~40s to ~75s, and that was the same dial that took false positives to zero: a 40-second wobble and a laptop waking up are indistinguishable, so sensitivity to one is sensitivity to the other.
+
+**[2026-09-15]** The auth track now sits *below* that, at ~56s, and the reasoning deliberately does not transfer. The wobble being guarded against is `dns` from a waking host — a main-track reason the authed layer cannot emit at all (see [Known limitations](#known-limitations) 3, which collapses every navigation failure there to `nav_error`). And an authed failure costs two orders of magnitude more than a pulse failure, so a brief wobble cannot produce two of them cheaply: at a 10s gap the auth burst still spans 51–61s of wall clock.
 
 ## Special routing
 
