@@ -212,9 +212,15 @@ def _lift_grace_on_pass(ok: bool) -> None:
         _GRACE["until"] = None
 
 
-async def _wait_burst_gap() -> None:
+async def _wait_burst_gap(gap_s: int) -> None:
     """[2026-08-30 / B38] Idle time between confirmation probes, measured from when the
     PREVIOUS probe finished -- not from an absolute offset within the burst.
+
+    [2026-09-15] The gap is now a PARAMETER, not a single global. A burst's wall-clock span
+    is set by the gap plus the probe's own duration, and the two tracks sit at opposite
+    extremes -- a pulse failure costs ~0.1s so the gap is all the spacing there is, while an
+    authed failure costs the whole frame budget and already spaces itself. See config.py's
+    MAIN_BURST_GAP_S / AUTH_BURST_GAP_S for the measurements.
 
     The old scheduler slept until `burst_start + BURST_DELAYS_S[i]`, which held the burst to
     a fixed footprint only while probes were fast enough to leave idle time. Once a probe
@@ -231,14 +237,14 @@ async def _wait_burst_gap() -> None:
     Jitter is retained so that many monitors (or a restarted one) do not synchronise their
     re-probes onto the same instants."""
     jitter = random.uniform(-config.BURST_JITTER_S, config.BURST_JITTER_S)
-    await asyncio.sleep(max(0.0, config.BURST_GAP_S + jitter))
+    await asyncio.sleep(max(0.0, gap_s + jitter))
 
 
 async def _run_burst_reprobes(
     conn, channels, state: MonitorState, failed_layer: str, cycle_id: str, outcomes: dict,
 ) -> tuple[MonitorState, "check.CheckResult", str]:
     """Runs the confirmation burst inline: BURST_PROBES re-probes of THE LAYER THAT FAILED,
-    each starting BURST_GAP_S after the previous one finished. Stops the moment the burst
+    each starting MAIN_BURST_GAP_S after the previous one finished. Stops the moment the burst
     resolves -- DOWN fires, or a pass of that layer clears the run.
 
     [2026-08-30 / B37] The burst used to alternate render/pulse "so each is independent
@@ -264,7 +270,7 @@ async def _run_burst_reprobes(
         if state.status != "UP" or state.evidence(failed_layer).run_started_ts != run_started:
             break  # already resolved: DOWN fired, or a pass cleared the run
 
-        await _wait_burst_gap()
+        await _wait_burst_gap(config.MAIN_BURST_GAP_S)
 
         if failed_layer == "pulse":
             result = await check.pulse_only_probe(config.TARGET_URL)
@@ -535,7 +541,7 @@ async def _run_auth_burst_reprobes(
     conn, channels, state: MonitorState, cycle_id: str, main_down: bool,
 ) -> tuple[MonitorState, "check.CheckResult", str]:
     """[v3.8 / Stage R] Auth-track confirmation burst: re-probes with the cheap session-reuse
-    check, spaced by BURST_GAP_S like the main track -- zero logins, ever.
+    check, spaced by AUTH_BURST_GAP_S -- its own dial, not the main track's; zero logins, ever.
 
     [B45 / 2026-09-07] It now calls _cheap_authed_check() DIRECTLY. It used to call
     _run_auth_probe(), which contains the recovery-login path, so a burst probe silently became
@@ -564,7 +570,7 @@ async def _run_auth_burst_reprobes(
         if not _session_is_usable():
             break  # nothing to learn without spending a login, which Rule 5 forbids here
 
-        await _wait_burst_gap()
+        await _wait_burst_gap(config.AUTH_BURST_GAP_S)
 
         result = await _cheap_authed_check()
         last_result = result

@@ -72,7 +72,8 @@ def test_burst_probe_outcomes_reach_the_summary_row(conn, monkeypatch):
     failure, because the burst alternated layers. Under the same-layer burst (B37) a pulse
     failure is confirmed with pulse probes, so that exact sequence can no longer occur. The
     defect being pinned is unchanged: whatever the burst learns must reach the summary."""
-    monkeypatch.setattr(config, "BURST_GAP_S", 0)
+    monkeypatch.setattr(config, "MAIN_BURST_GAP_S", 0)
+    monkeypatch.setattr(config, "AUTH_BURST_GAP_S", 0)
     monkeypatch.setattr(config, "BURST_JITTER_S", 0)
 
     calls = {"n": 0}
@@ -102,7 +103,8 @@ def test_burst_probe_outcomes_reach_the_summary_row(conn, monkeypatch):
 def test_render_failure_during_a_burst_is_not_hidden_by_a_later_pass(conn, monkeypatch):
     """The inverse guard: a failure that happened must survive into the summary even though
     the burst went on to clear and the cycle's verdict is UP."""
-    monkeypatch.setattr(config, "BURST_GAP_S", 0)
+    monkeypatch.setattr(config, "MAIN_BURST_GAP_S", 0)
+    monkeypatch.setattr(config, "AUTH_BURST_GAP_S", 0)
     monkeypatch.setattr(config, "BURST_JITTER_S", 0)
 
     async def failing_render_probe(*a, **k):
@@ -144,7 +146,8 @@ def test_cycle_fail_layer_names_the_layer_that_opened_the_incident(conn, monkeyp
     """[B37] Once the pulse recovers, perform_check reports layer="render" again -- so
     taking fail_layer from the last probe logged a pulse-caused incident as "render: dns",
     naming a layer that was passing alongside a reason it never produced."""
-    monkeypatch.setattr(config, "BURST_GAP_S", 0)
+    monkeypatch.setattr(config, "MAIN_BURST_GAP_S", 0)
+    monkeypatch.setattr(config, "AUTH_BURST_GAP_S", 0)
     monkeypatch.setattr(config, "BURST_JITTER_S", 0)
 
     async def pulse_down(*a, **k):

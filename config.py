@@ -85,10 +85,22 @@ BROWSER_TIMEOUT_MS = int(os.getenv("BROWSER_TIMEOUT_MS", "15000"))
 # ran back to back, and the last one timestamped itself outside the window it was scheduled
 # in. A gap cannot fall behind a schedule it does not have.
 #
-# 25s was chosen by simulation over 1,200 randomised worlds. It is the false-positive dial:
-# at 10s six nuisance events paged, at 15s three, at 25s none. Shorter gaps crowd four probes
-# into a span a brief wobble can survive.
-BURST_GAP_S = int(os.getenv("BURST_GAP_S", "25"))
+# 25s was chosen by simulation over 1,200 randomised worlds. It is the MAIN track's
+# false-positive dial: at 10s six nuisance events paged, at 15s three, at 25s none. Shorter
+# gaps crowd four probes into a span a brief wobble can survive.
+#
+# [2026-09-15] Split per track, because one value cannot be right for both. How much wall
+# clock a burst spans is set by the gap AND the probe's own duration, and the two tracks sit
+# at opposite extremes: a pulse failure costs ~0.1s, so the gap supplies essentially all of
+# the spacing, while an authed failure costs the whole frame budget, so the probe already
+# supplies most of it. Sharing 25s put the auth track's span at 267s against pulse's 77s --
+# the layer that defines UP was the slowest to confirm. MAIN_BURST_GAP_S keeps the simulated
+# value for pulse/render; AUTH_BURST_GAP_S is tuned against the authed probe's own cost.
+#
+# Both fall back so an unmigrated .env behaves exactly as before: MAIN_BURST_GAP_S reads the
+# old BURST_GAP_S name, and AUTH_BURST_GAP_S defaults to whatever main resolved to.
+MAIN_BURST_GAP_S = int(os.getenv("MAIN_BURST_GAP_S", os.getenv("BURST_GAP_S", "25")))
+AUTH_BURST_GAP_S = int(os.getenv("AUTH_BURST_GAP_S", str(MAIN_BURST_GAP_S)))
 
 # Confirmation probes after the one that opened the run. With MIN_FAILED_PROBES=4 the floor
 # is reached on the 4th probe, so the burst resolves before exhausting these.

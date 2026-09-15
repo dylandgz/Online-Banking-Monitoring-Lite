@@ -193,7 +193,8 @@ def conn(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _no_waiting(monkeypatch):
-    monkeypatch.setattr(config, "BURST_GAP_S", 0)
+    monkeypatch.setattr(config, "MAIN_BURST_GAP_S", 0)
+    monkeypatch.setattr(config, "AUTH_BURST_GAP_S", 0)
     monkeypatch.setattr(config, "BURST_JITTER_S", 0)
     main._GRACE["until"] = None
     yield
@@ -256,3 +257,33 @@ def test_the_burst_stops_instead_of_spinning_without_a_session(conn, monkeypatch
     assert calls == [], "no probe should run without a usable session"
     assert last is None
     assert state.status == "UP", "the run is left open for the next cycle, not resolved"
+
+
+def test_the_auth_burst_waits_the_auth_gap(conn, monkeypatch):
+    """[2026-09-15] The auth track has its own gap. Sharing the main track's 25s put this
+    track's burst span at 267s against pulse's 77s -- the layer that DEFINES up was the
+    slowest to confirm, because its failing probe already costs the whole frame budget and
+    the gap was piled on top of that.
+
+    The assertion is which CONSTANT reaches this burst, not what it is set to, so retuning
+    either dial leaves this test alone."""
+    gaps = []
+
+    async def _record(gap_s):
+        gaps.append(gap_s)
+
+    monkeypatch.setattr(main, "_wait_burst_gap", _record)
+    monkeypatch.setattr(config, "MAIN_BURST_GAP_S", 25)
+    monkeypatch.setattr(config, "AUTH_BURST_GAP_S", 10)
+    monkeypatch.setattr(main, "_session_is_usable", lambda: True)
+
+    async def cheap():
+        return CheckResult(ok=False, http_status=None, latency_ms=1.0,
+                           fail_reason="element_missing", layer="authed")
+    monkeypatch.setattr(main, "_cheap_authed_check", cheap)
+
+    asyncio.run(main._run_auth_burst_reprobes(
+        conn, [], _open_run(conn), cycle_id="c1", main_down=False))
+
+    assert gaps, "the burst must have waited at least once"
+    assert set(gaps) == {10}, f"the auth burst must use AUTH_BURST_GAP_S, got {gaps}"

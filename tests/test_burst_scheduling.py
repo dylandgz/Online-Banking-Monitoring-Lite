@@ -34,7 +34,8 @@ def conn(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _no_waiting(monkeypatch):
-    monkeypatch.setattr(config, "BURST_GAP_S", 0)
+    monkeypatch.setattr(config, "MAIN_BURST_GAP_S", 0)
+    monkeypatch.setattr(config, "AUTH_BURST_GAP_S", 0)
     monkeypatch.setattr(config, "BURST_JITTER_S", 0)
     main._GRACE["until"] = None
     yield
@@ -213,3 +214,31 @@ def test_a_normal_probe_is_recorded_as_scored(conn, monkeypatch):
     asyncio.run(main.run_cycle(conn, [], auth_enabled=False))
 
     assert all(r["scored"] == 1 for r in conn.execute("SELECT scored FROM checks WHERE fail_reason IS NOT NULL"))
+
+
+# --- [2026-09-15] the gap is per track ------------------------------------------------
+
+def test_the_main_burst_waits_the_main_gap(conn, monkeypatch):
+    """A burst's wall-clock span is the gap PLUS the probe's own duration, and the two tracks
+    sit at opposite extremes. A pulse failure costs ~0.1s, so here the gap supplies
+    essentially all of the spacing -- which is why MAIN_BURST_GAP_S keeps the simulated 25s
+    (at 15s the same simulation paged three nuisance events, at 10s six). The auth track,
+    whose failing probe already spaces itself by seconds, gets its own smaller dial.
+
+    Pinning this stops a future edit from collapsing the two back into one value."""
+    gaps = []
+
+    async def _record(gap_s):
+        gaps.append(gap_s)
+
+    monkeypatch.setattr(main, "_wait_burst_gap", _record)
+    monkeypatch.setattr(config, "MAIN_BURST_GAP_S", 25)
+    monkeypatch.setattr(config, "AUTH_BURST_GAP_S", 10)
+    monkeypatch.setattr(check, "perform_check", _fail("render"))
+    monkeypatch.setattr(check, "render_only_probe", _fail("render"))
+    monkeypatch.setattr(check, "pulse_only_probe", _pass_pulse)
+
+    asyncio.run(main.run_cycle(conn, [], auth_enabled=False))
+
+    assert gaps, "the burst must have waited at least once"
+    assert set(gaps) == {25}, f"the main burst must use MAIN_BURST_GAP_S, got {gaps}"
