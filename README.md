@@ -28,18 +28,53 @@ along the way, and CLAUDE.md's Stages section for what's still open (Stage 7's V
 
 ## Requirements
 
-- Python 3.12
-- Real Chrome installed for [Playwright](https://playwright.dev/python/)/[patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python)
+**Python 3.12.** Verified on CPython 3.12.2 (253/253 tests green). The code uses no
+3.12-only syntax, but 3.12 is what the pinned `curl_cffi` / `playwright` / `patchright`
+wheels have been exercised on against the live target — treat 3.13 as unverified, and
+re-run `pytest` plus a live sign-in drill before provisioning it.
+
+**Python packages** — pinned in [requirements.txt](requirements.txt), which is the
+authoritative list. Direct dependencies are pinned with `==`; transitive ones are left to
+the resolver, so a genuinely reproducible deploy should `pip freeze > requirements.lock.txt`
+off a known-good box and install from that.
+
+| Package | Why it's needed |
+|---|---|
+| `fastapi`, `uvicorn[standard]` | the dashboard + `/api/*` routes, served from the same process as the check loop |
+| `curl_cffi` | the pulse probe. Impersonates Chrome's TLS/HTTP2 fingerprint — `httpx` was retired after a TLS-fingerprint 403 and must not be reintroduced here |
+| `playwright` | the render probe (headless login-page check) |
+| `patchright` | the sign-in journey and authed check (headed, see xvfb below) |
+| `pyotp` | generates the TOTP code for the MFA step |
+| `python-dotenv` | loads `.env` in `config.py` |
+| `twilio` | **optional** — only imported when `ALERT_CHANNELS` includes `sms`. Email alerting is stdlib `smtplib` and needs nothing extra |
+| `tzdata` | **not optional on Linux/containers** — every timestamp is presented `America/New_York`, and `zoneinfo` raises without a tz database. macOS/most desktop distros have a system one, so a missing `tzdata` fails only on the slim host you deploy to |
+| `pytest` | the test suite |
+
+**Non-pip prerequisites:**
+
+- **Real, branded Chrome** for [Playwright](https://playwright.dev/python/)/[patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python)
   (`playwright install chrome`) — the sign-in journey specifically needs branded Chrome,
   not the bundled Chromium, to reliably clear Cloudflare's bot challenge
+- **`xvfb`, on any headless Linux host.** The sign-in journey and authed check always launch
+  `headless=False` (CLAUDE.md Rule 14's v3.3 exception — headless patchright could not clear
+  the real target's Cloudflare challenge). Nothing in the code starts a display server, so on
+  a box with no `DISPLAY` the whole process must run under `xvfb-run`. Without it, every
+  authed check fails at browser launch.
+- **Chrome's shared libraries**, on a fresh Linux box: `playwright install-deps chrome`
+  (needs root) before `playwright install chrome`.
 
 ## Setup
 
 ```bash
-python -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chrome
+
+# Headless Linux host only:
+#   sudo playwright install-deps chrome
+#   sudo apt-get install -y xvfb
+# ...then run the monitor under `xvfb-run` — see "Running" below.
 
 cp .env.example .env
 # Fill in .env. The file is in two parts: a block of bare variable assignments,
@@ -60,6 +95,9 @@ cp .env.example .env
 
 ```bash
 python -m monitor.main
+
+# On a headless Linux host, the auth track needs a display:
+xvfb-run -a python -m monitor.main
 ```
 
 This starts both the unified check loop (pulse + render + auth) and the dashboard

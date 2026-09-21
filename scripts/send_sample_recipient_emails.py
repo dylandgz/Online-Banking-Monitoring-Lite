@@ -7,11 +7,13 @@ marked TEST SCREENSHOT, so a recipient can never mistake a sample for a real
 outage artifact. Temporary files are cleaned up afterwards.
 
 Usage:
-    python -m scripts.send_sample_recipient_emails
+    .venv/bin/python -m scripts.send_sample_recipient_emails
 
 Requirements:
     - RECIPIENTS_EMAIL must be configured in .env
     - GMAIL_USER and GMAIL_APP_PASSWORD must be configured
+    - Run it with the project venv -- the placeholder needs Playwright's Chromium, and
+      another interpreter on PATH will not have it.
 """
 import sys
 import tempfile
@@ -22,13 +24,9 @@ from monitor.channels.email_gmail import EmailGmailChannel
 from monitor.state import DownEvent, RecoveryEvent
 
 
-# Fallback if Chromium is unavailable: a 1x1 red PNG, so the script can still demonstrate
-# the email even on a host where `playwright install` has not been run.
-MINIMAL_PNG = (
-    b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01'
-    b'\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00'
-    b'\x00\x01\x01\x00\x05\x1b\xf1\xde\x00\x00\x00\x00IEND\xaeB`\x82'
-)
+# A real 1280x800 placeholder PNG measures ~33KB; anything near zero is a stand-in or a
+# capture that produced nothing, and must not reach an inbox as a sample attachment.
+_MIN_PLACEHOLDER_BYTES = 1024
 
 # The placeholder is rendered by Playwright rather than drawn by hand: Playwright already
 # takes every real screenshot this monitor attaches, so the sample lands in the inbox as
@@ -46,7 +44,16 @@ justify-content:center;background:#f4f4f5;font-family:Helvetica,Arial,sans-serif
 
 
 def _create_temp_screenshot() -> str:
-    """Render the TEST SCREENSHOT placeholder to a temporary PNG and return its path."""
+    """Render the TEST SCREENSHOT placeholder to a temporary PNG and return its path.
+
+    Aborts rather than substituting a stand-in image. This used to fall back to a 1x1 red
+    PNG when Playwright could not be imported -- most easily by running the script with an
+    interpreter that is not this project's venv -- and the warning scrolled past while the
+    email still went out. Recipients then received a DOWN alert carrying a blank
+    attachment, which is precisely the thing the sample exists to show them and is
+    indistinguishable from the monitor capturing a broken screenshot during a real outage.
+    The attachment IS the deliverable here, so an unrenderable placeholder is a failed run.
+    """
     path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
     try:
         from playwright.sync_api import sync_playwright
@@ -60,9 +67,22 @@ def _create_temp_screenshot() -> str:
             finally:
                 browser.close()
     except Exception as exc:
-        # Never let the placeholder block the thing being demonstrated -- the emails.
-        print(f"     ! could not render placeholder ({exc}); falling back to a 1x1 PNG")
-        Path(path).write_bytes(MINIMAL_PNG)
+        Path(path).unlink(missing_ok=True)
+        print(f"[sample-emails] could not render the placeholder screenshot: {exc}",
+              file=sys.stderr)
+        print("No email was sent -- a sample DOWN alert without its attachment would "
+              "misrepresent the real one.", file=sys.stderr)
+        print("Run it with this project's venv, e.g. "
+              "`.venv/bin/python -m scripts.send_sample_recipient_emails`, and make sure "
+              "`playwright install chromium` has been run there.", file=sys.stderr)
+        sys.exit(1)
+
+    if Path(path).stat().st_size < _MIN_PLACEHOLDER_BYTES:
+        Path(path).unlink(missing_ok=True)
+        print("[sample-emails] the rendered placeholder is implausibly small -- refusing "
+              "to send a blank attachment.", file=sys.stderr)
+        sys.exit(1)
+
     return path
 
 

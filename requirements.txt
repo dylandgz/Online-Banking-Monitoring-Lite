@@ -1,11 +1,47 @@
-fastapi
-uvicorn[standard]
-curl_cffi
-playwright
-patchright
-pyotp
-python-dotenv
-twilio
-pytest
-pytest-asyncio
-tzdata
+# Online Banking Uptime Monitoring Lite -- runtime + test dependencies.
+#
+# Python 3.12 required. Verified green on CPython 3.12.2 (253/253 tests).
+# The code itself uses no 3.12-only syntax; the constraint comes from the pinned
+# binary wheels below (curl_cffi, playwright, patchright), which are what have
+# actually been exercised against the live target. Do not provision 3.13 without
+# re-running the suite and a live drill first.
+#
+# Versions are pinned so a second machine gets the stack this one was soaked on.
+# Transitive deps are deliberately left unpinned -- see README "Requirements".
+#
+#   pip install -r requirements.txt
+#   playwright install chrome          # branded Chrome, not bundled Chromium
+#
+# Non-pip prerequisites (Chrome, xvfb on a headless Linux host) are in README.md.
+
+# --- web / dashboard ---------------------------------------------------------
+fastapi==0.141.1
+uvicorn[standard]==0.52.0          # [standard] pulls uvloop, httptools, watchfiles, websockets
+
+# --- probes ------------------------------------------------------------------
+curl_cffi==0.16.0                  # pulse probe. Impersonates Chrome's TLS/HTTP2 fingerprint.
+                                   # httpx is NOT a substitute here -- it was retired after a
+                                   # TLS-fingerprint 403 incident. Do not reintroduce it.
+playwright==1.61.0                 # render probe (headless login-page check)
+patchright==1.61.2                 # sign-in journey + authed check (headed under xvfb)
+
+# --- auth / config -----------------------------------------------------------
+pyotp==2.10.0                      # TOTP codes for the MFA step
+python-dotenv==1.2.2               # .env loading in config.py
+
+# --- alerting ----------------------------------------------------------------
+# Email (smtplib) is stdlib. Twilio is only imported when ALERT_CHANNELS includes
+# "sms"; sms_twilio.py imports it lazily and raises a clear error if absent. Drop
+# this line if you only ever alert by email.
+twilio==9.11.0
+
+# --- platform ----------------------------------------------------------------
+tzdata==2026.2                     # zoneinfo("America/New_York") on hosts with no system
+                                   # tz database (slim containers, Windows). Every timestamp
+                                   # is presented Eastern, so this is not optional.
+
+# --- tests -------------------------------------------------------------------
+pytest==9.1.1
+pytest-asyncio==1.4.0              # currently unused: the suite drives coroutines with
+                                   # asyncio.run() directly, no @pytest.mark.asyncio and no
+                                   # asyncio_mode set. Kept for the next async test; safe to drop.
