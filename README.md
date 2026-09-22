@@ -22,7 +22,7 @@ Sessions 1–3, Stage 4 (shareable/channels), Stage 5 (fast detection), Stage 6 
 journey — live end-to-end against the real test site), Stage 8's session-reuse mechanism,
 and Stage R (the "one platform, one verdict" realignment: unified main+auth verdict,
 per-minute cycles, cross-track alert suppression) are all built and live-tested against
-the real target. See [PROGRESS.md](PROGRESS.md) for the full build log and decisions made
+the real target. The full build log and decisions live in `personal/PROGRESS.md`, which is kept out of this repo
 along the way, and CLAUDE.md's Stages section for what's still open (Stage 7's VM deploy
 + stress soak, a captured `TOTP_SECRET`, and a few smaller deferred items).
 
@@ -170,7 +170,7 @@ pytest -q
 `monitor/state.py` and `monitor/verdict.py` are pure and unit tested independently of
 everything else — no network, no DB, no browser. `journey.py` and the web layer don't have
 automated coverage yet (both verified via live drills and manual smoke checks instead — see
-PROGRESS.md).
+`personal/PROGRESS.md`).
 
 ## Layout
 

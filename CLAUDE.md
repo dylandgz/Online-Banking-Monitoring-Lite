@@ -6,11 +6,11 @@ A monitor that answers ONE question every 60 seconds: **is the online banking pl
 
 **UP** = the authenticated area behind login returns HTTP 200 **and renders the expected content.**
 
-The public pulse and login-page render checks are *precursor* evidence for that same question — not a separate product. This replaces a Selenium tool that false-positived on DOM changes, so **low false positives outrank everything else**, and no alert ever fires on fewer than **two** failed probes. **[2026-09-15]** That floor was three, as an executive commitment; the online-banking team lowered the auth track to two because a customer-visible failure behind login is a true positive even at two minutes, and a floor of four could not catch one. The main track is unchanged at four. See PROGRESS.md 2026-09-15.
+The public pulse and login-page render checks are *precursor* evidence for that same question — not a separate product. This replaces a Selenium tool that false-positived on DOM changes, so **low false positives outrank everything else**, and no alert ever fires on fewer than **two** failed probes. **[2026-09-15]** That floor was three, as an executive commitment; the online-banking team lowered the auth track to two because a customer-visible failure behind login is a true positive even at two minutes, and a floor of four could not catch one. The main track is unchanged at four. See `personal/PROGRESS.md` 2026-09-15.
 
 Results go to SQLite (audit-grade — every probe writes a row, pass or fail). Email alerts fire on state transitions only. A FastAPI dashboard reads the same data.
 
-> History, amendment logs, live-drill notes and per-session decisions live in **PROGRESS.md**. This file is the spec: what the system does now, why, and what it must never do. Keep it that way — do not append changelogs here.
+> History, amendment logs, live-drill notes and per-session decisions live in **`personal/PROGRESS.md`**, which is gitignored and stays out of this public repo. This file is the spec: what the system does now, why, and what it must never do. Keep it that way — do not append changelogs here.
 
 ## What this is not
 
@@ -478,6 +478,6 @@ Backlog, not scope: a distinct non-paging `BLIND` status · maintenance windows 
 
 ## How we work
 
-Stages in order, acceptance test + human sign-off before the next. Explain before building. Update **PROGRESS.md** after every session. Stop and ask before adding a dependency or service. `LEARNING.md` on request.
+Stages in order, acceptance test + human sign-off before the next. Explain before building. Update **`personal/PROGRESS.md`** after every session. Stop and ask before adding a dependency or service. `LEARNING.md` on request.
 
 **Where things stand:** the pulse/render monitor, the sign-in journey, session reuse, the unified one-verdict cycle and the hardening pass are all built. The **DOWN decision was rebuilt on 2026-08-30** (B37/B38/B39/B7) after simulation showed the burst-window design missing 48% of real outages while 42% of its pages were false — that work is landed and unit-tested but **has not yet run against the live target**, which is the next thing to do. Also outstanding: the Stage 6 closeout drills (wrong-password → `auth_rejected`, masked-screenshot review, TOTP cross-check), **B42** (a blocking alert send held the cycle lock for 13.5 hours on 2026-08-30 and the monitor reported UP throughout — the standing P0), and the Azure deploy + multi-day soak. A soak is not clean if it contains any unexplained `DEGRADED`/`internal_error` cycle.
