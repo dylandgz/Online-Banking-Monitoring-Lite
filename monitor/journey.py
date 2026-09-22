@@ -69,7 +69,8 @@ async def open_journey_browser(
         browser = await playwright.chromium.launch(
             channel=browser_channel, headless=False, timeout=browser_timeout_ms
         )
-        context_kwargs: dict = {"no_viewport": True}
+        #context_kwargs: dict = {"no_viewport": True}
+        context_kwargs: dict = {"viewport": {"width":1920,"height":1080}}
         if storage_state_path and Path(storage_state_path).exists():
             context_kwargs["storage_state"] = storage_state_path
         context = await browser.new_context(**context_kwargs)
