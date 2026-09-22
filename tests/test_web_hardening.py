@@ -191,19 +191,25 @@ def test_count_export_rows_rejects_a_table_not_on_the_allowlist(seeded_db):
 
 
 @pytest.mark.parametrize("table", ["cycles", "checks"])
-def test_streamed_export_is_byte_identical_to_the_materialised_path(seeded_db, table):
-    """Rule 15 "every probe writes a checks row": the export stays row-for-row faithful. Streaming is an implementation
-    change, so it must produce exactly the bytes the old fetchall+join produced."""
+def test_streamed_export_is_byte_identical_to_a_plain_select(seeded_db, table):
+    """Rule 15 "every probe writes a checks row": the export stays row-for-row faithful.
+
+    The oracle is a plain SELECT rather than db.export_cycles/export_checks, which this
+    asserted against until they were removed on 2026-09-22. That is a strengthening, not a
+    substitution: those were siblings of iter_export inside the module under test, sharing
+    its helpers, so a defect in the shared part could have moved both sides of the
+    comparison together. Rows straight off the connection cannot."""
     conn, _ = seeded_db
-    materialised = "".join(web_app._csv_lines(
-        table,
-        db.export_cycles(conn, None, None) if table == "cycles" else db.export_checks(conn, None, None),
-    )).encode()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM cycles ORDER BY ts ASC" if table == "cycles"
+        else "SELECT * FROM checks ORDER BY id ASC"
+    )]
+    expected = "".join(web_app._csv_lines(table, rows)).encode()
 
     status, streamed = _call(f"/api/export?table={table}", auth=("user", "pass"))
 
     assert status == 200
-    assert streamed == materialised
+    assert streamed == expected
     assert streamed.count(b"\n") == 31  # header + 30 rows
 
 
@@ -270,10 +276,10 @@ def test_ts_window_bounds_select_the_same_rows_on_every_query_path(
     so nothing in the UI would have shown this."""
     conn, _ = seeded_db
 
-    assert len(db.export_cycles(conn, ts_from, ts_to)) == expected
-    assert len(db.export_checks(conn, ts_from, ts_to)) == expected
     assert len(list(db.iter_export(conn, "cycles", ts_from, ts_to))) == expected
+    assert len(list(db.iter_export(conn, "checks", ts_from, ts_to))) == expected
     assert db.count_export_rows(conn, "cycles", ts_from, ts_to) == expected
+    assert db.count_export_rows(conn, "checks", ts_from, ts_to) == expected
 
     _, total = db.query_cycles(conn, ts_from, ts_to, page=1, page_size=500)
     assert total == expected

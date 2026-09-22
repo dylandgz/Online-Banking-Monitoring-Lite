@@ -565,13 +565,9 @@ def _range_bounds(ts_from: str | None, ts_to: str | None) -> tuple[str | None, s
     return (ts_from or None, ts_to or None)
 
 
-def export_checks(conn: sqlite3.Connection, ts_from: str | None, ts_to: str | None) -> list[dict]:
-    rows = conn.execute(
-        "SELECT * FROM checks WHERE ts >= COALESCE(?, '') AND ts <= COALESCE(?, '9999') "
-        "ORDER BY id ASC",
-        _range_bounds(ts_from, ts_to),
-    ).fetchall()
-    return [dict(r) for r in rows]
+# export_checks() lived here until 2026-09-22. Removed: `iter_export(conn, "checks", ...)`
+# is the only path the route uses, and this materialising twin had no caller outside the
+# test that used it as its own oracle. See export_cycles' note below.
 
 
 # --- cycles [v3.8 / Stage R]: one row per minute, the primary audit view -----------------
@@ -634,13 +630,18 @@ def query_cycles(
     return [dict(r) for r in rows], total
 
 
-def export_cycles(conn: sqlite3.Connection, ts_from: str | None, ts_to: str | None) -> list[dict]:
-    rows = conn.execute(
-        "SELECT * FROM cycles WHERE ts >= COALESCE(?, '') AND ts <= COALESCE(?, '9999') "
-        "ORDER BY ts ASC",
-        _range_bounds(ts_from, ts_to),
-    ).fetchall()
-    return [dict(r) for r in rows]
+# export_cycles() lived here until 2026-09-22, alongside export_checks above.
+#
+# Both were kept "for the bounded callers and the tests" (PROGRESS.md, P1.4) when
+# iter_export superseded them. The bounded callers never existed: get_checks_for_cycle,
+# named in iter_export's docstring as the reason, runs its own `WHERE cycle_id = ?` query
+# and never called either function. What remained was two materialising exports whose only
+# callers were the tests that used them as an oracle -- dead weight on the audit-export
+# path, and two of the seven locations in the 2026-09-22 AppScan report.
+#
+# The byte-identity test they anchored still exists and still guards Rule 15's row-for-row
+# faithfulness; it now builds its expected bytes from a plain SELECT, which is a stronger
+# oracle than a sibling function in the module under test.
 
 
 # The exportable tables. Each name maps to a complete, constant query -- a table name is
@@ -665,7 +666,7 @@ EXPORTABLE_TABLES = ("cycles", "checks")
 def iter_export(
     conn: sqlite3.Connection, table: str, ts_from: str | None, ts_to: str | None
 ) -> Iterator[dict]:
-    """[v3.9 / Stage H P1] Lazy row-at-a-time twin of export_cycles/export_checks.
+    """[v3.9 / Stage H P1] Streams an export table row-at-a-time. The only export path.
 
     Why this exists: the export route used to .fetchall() the whole table into a list of
     dicts and then "".join() the entire CSV into one string, inside the monitor's own
@@ -682,8 +683,9 @@ def iter_export(
     come from a live cursor, not a materialised list. sqlite3 cursors are iterable and
     fetch in batches, so this holds one batch in memory, not the result set.
 
-    export_cycles/export_checks are intentionally left in place: get_checks_for_cycle and
-    the tests want a concrete list, and a small bounded read is clearer as a list.
+    This superseded the materialising export_cycles/export_checks, which were removed on
+    2026-09-22 -- see the note where they used to live. This docstring previously justified
+    keeping them by naming get_checks_for_cycle as a caller; it never was one.
 
     Raises ValueError on a table that is not exportable. That used to be a bare KeyError off
     the allowlist dict, which was correct but landed badly: this is a generator consumed
