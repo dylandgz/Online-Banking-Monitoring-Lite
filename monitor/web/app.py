@@ -32,6 +32,52 @@ from monitor.verdict import layer_wording, severity, unified_verdict
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 security = HTTPBasic()
 
+
+# [AppScan XSS findings, 2026-09-22] A second wall behind dashboard.js's esc(). The escaping
+# is the fix; this bounds what a miss could do, and the two fail differently -- esc() is
+# per-interpolation and can be forgotten at one call site, while this applies to the whole
+# document or not at all.
+#
+# 'self' with NO 'unsafe-inline' is only possible because the dashboard has no inline script,
+# no inline <style>, no style="" attribute and no on*="" handler -- verified before adding
+# this, and `tr.onclick = fn` in dashboard.js is a JS property assignment, which CSP does not
+# govern. Fonts are self-hosted under /static. **If you add an inline handler, a CDN, or a
+# style attribute, this header will silently stop the page working** -- move the code to
+# dashboard.js/.css rather than weakening the policy back to 'unsafe-inline', which would
+# forfeit the entire benefit for XSS.
+#
+# frame-ancestors 'none' also closes clickjacking on the dashboard (and replaces the older
+# X-Frame-Options, which it supersedes). object-src/base-uri 'none' remove two injection
+# sinks the page has no use for.
+_SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self'; "
+        "img-src 'self'; "
+        "font-src 'self'; "
+        "connect-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'none'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'"
+    ),
+    # Stops a browser from re-interpreting an /api/artifact PNG or a CSV as HTML.
+    "X-Content-Type-Options": "nosniff",
+    # The dashboard URL can carry a cycle_id; don't leak it to anything the operator clicks.
+    "Referrer-Policy": "no-referrer",
+}
+
+
+@app.middleware("http")
+async def add_security_headers(request, call_next):
+    """Applied to every response, /healthz included -- a header cannot be forgotten per-route
+    the way an escaping call can be, and that uniformity is the point of having it."""
+    response = await call_next(request)
+    for header, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+    return response
+
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 _STATIC_DIR = Path(__file__).parent / "static"
 

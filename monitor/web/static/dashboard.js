@@ -15,6 +15,49 @@ const STATUS_PRESENTATION = {
   DEGRADED:     { label: "Degraded",        cls: "warn" },
 };
 
+// --- HTML escaping [AppScan XSS findings, 2026-09-22] -------------------------------
+//
+// THE RULE, and it has exactly two cases. Inside any template literal that reaches
+// `innerHTML`:
+//
+//   * a value from the API  -> MUST be wrapped in esc(...)
+//   * a call to a helper that RETURNS MARKUP (layerBadge, sessionBadge, probeStatus,
+//     probeLatency, probeLayer, verdictClass) -> MUST NOT be wrapped; escaping it would
+//     render the tags as visible text. Those helpers own the escaping of anything they
+//     interpolate, which is why probeLayer escapes p.layer itself.
+//
+// Why this exists. AppScan flagged the four innerHTML assignments as Critical reflected
+// XSS. Reflected is the wrong word -- no request input reaches these sinks -- and nothing
+// rendered today is attacker-controlled, so it was not exploitable. But that safety was a
+// coincidence: it held only because every field that happened to be rendered happened to
+// contain no markup, maintained by hand with nothing enforcing it.
+//
+// The trap was one token deep. /api/cycle/{id} already ships the full `checks` row, so
+// `p.page_url` and `p.evidence_text` sit inside the probe-detail template right now,
+// unrendered. evidence_text is the live text of the monitored bank's role="alert" banner
+// (journey.py `_visible_alert_text`, added by B63 so a diagnosis does not require opening a
+// screenshot) -- i.e. verbatim remote content, already in the payload. Writing
+// `${p.evidence_text}` to show it would have been a reasonable-looking one-line diagnostic
+// improvement, and genuine stored XSS against an authenticated operator, with nothing in
+// the file to warn whoever made it. escaping-by-default removes the trap rather than
+// relying on nobody stepping in it.
+//
+// Text and quoted-attribute contexts are both covered: every attribute in this file is
+// double-quoted, and &quot;/&#39; close both. There is no URL-context interpolation (the
+// one href built from data uses inc.id, a server-generated integer) and no interpolation
+// inside a <script> or style attribute, so this single escaper is sufficient here. If a
+// value ever has to go into an href/src, this is NOT enough -- javascript: survives it.
+// tests/test_dashboard_escaping.py enforces the rule above; read it before adding a sink.
+function esc(v) {
+  if (v === null || v === undefined) return "";
+  return String(v)
+    .replace(/&/g, "&amp;")   // must be first, or it double-escapes the entities below
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 // Timestamps arrive as "2026-08-18 15:45:14 EDT (UTC-04:00)". Tables show the form without
 // the offset -- EDT/EST already conveys the zone, and the suffix was wrapping cells onto a
 // second line -- with the full string kept on the title attribute, and in the CSV export
@@ -64,19 +107,19 @@ async function loadStatus() {
   const uptimeEl = document.getElementById("uptime");
   uptimeEl.innerHTML = ["24h", "7d", "30d"].map(k => {
     const v = data.uptime_pct[k];
-    return `<div><strong>${k}</strong><span class="uptime-value">${v == null ? "n/a" : v + "%"}</span></div>`;
+    return `<div><strong>${esc(k)}</strong><span class="uptime-value">${esc(v == null ? "n/a" : v + "%")}</span></div>`;
   }).join("");
 
   const tbody = document.querySelector("#incidents-table tbody");
   tbody.innerHTML = data.incidents.map(inc => `
     <tr>
-      <td>${inc.track ?? "main"}</td>
-      <td>${inc.trigger_layer ?? "-"}</td>
-      <td class="ts" title="${inc.started_at ?? ""}">${compactTs(inc.started_at)}</td>
-      <td class="ts" title="${inc.ended_at ?? ""}">${inc.ended_at ? compactTs(inc.ended_at) : "(ongoing)"}</td>
-      <td>${fmtDuration(inc.duration_s)}</td>
-      <td>${inc.checks_failed ?? "-"}</td>
-      <td>${inc.screenshot_path ? `<a href="/api/artifact/${inc.id}" target="_blank">view</a>` : "-"}</td>
+      <td>${esc(inc.track ?? "main")}</td>
+      <td>${esc(inc.trigger_layer ?? "-")}</td>
+      <td class="ts" title="${esc(inc.started_at ?? "")}">${esc(compactTs(inc.started_at))}</td>
+      <td class="ts" title="${esc(inc.ended_at ?? "")}">${esc(inc.ended_at ? compactTs(inc.ended_at) : "(ongoing)")}</td>
+      <td>${esc(fmtDuration(inc.duration_s))}</td>
+      <td>${esc(inc.checks_failed ?? "-")}</td>
+      <td>${inc.screenshot_path ? `<a href="/api/artifact/${esc(inc.id)}" target="_blank">view</a>` : "-"}</td>
     </tr>
   `).join("");
 }
@@ -123,17 +166,27 @@ function sessionBadge(r) {
 // that as a blank leaves a line whose middle is missing, which reads as a rendering bug
 // rather than as missing data -- say "unknown" instead. (The `auth`/`authed` spelling split
 // is normalised server-side, in _split_main_probe's caller.)
+//
+// Returns markup, so its callers must NOT esc() it -- which makes escaping p.layer here
+// this function's own responsibility. It is the only markup-returning helper that passes a
+// server value through; the others interpolate code-defined literals only.
 function probeLayer(p) {
-  return p.layer ? p.layer : `<span class="badge-muted">unknown</span>`;
+  return p.layer ? esc(p.layer) : `<span class="badge-muted">unknown</span>`;
 }
 
 // Three states, not two. The pulse line reads its ok from cycles.pulse_ok, which is NULL on
 // any cycle predating that column -- and `null ? "OK" : "FAIL"` would print FAIL for a probe
 // that was never recorded either way. Matches layerBadge()'s handling in the row above.
 // Values arrive as SQLite 1/0/null, not JS booleans.
+//
+// The esc() calls below are no-ops -- both interpolations pick between two literals defined
+// right here. They are written anyway so the rule at the top of this file holds without
+// exception: inside a template, a value is esc()'d or it is a markup helper, full stop. An
+// invariant with a list of "safe because I checked" exemptions is one nobody can apply
+// without re-deriving the analysis, which is how the original four sinks got written.
 function probeStatus(p) {
   if (p.ok === null || p.ok === undefined) return `<span class="badge-muted">n/a</span>`;
-  return `<span class="${p.ok ? "ok" : "fail"}">${p.ok ? "OK" : "FAIL"}</span>`;
+  return `<span class="${esc(p.ok ? "ok" : "fail")}">${esc(p.ok ? "OK" : "FAIL")}</span>`;
 }
 
 // [B25] A latency of exactly 0 is never a measurement. It is the old hardcoded
@@ -143,7 +196,7 @@ function probeStatus(p) {
 // render_only_probe now measures itself, so new burst rows carry real values.
 function probeLatency(p) {
   if (p.latency_ms == null || p.latency_ms === 0) return ` — <span class="badge-muted">—</span>`;
-  return ` — ${Math.round(p.latency_ms)}ms`;
+  return ` — ${esc(Math.round(p.latency_ms))}ms`;
 }
 
 async function toggleProbes(cycleId, row) {
@@ -155,13 +208,15 @@ async function toggleProbes(cycleId, row) {
   const detail = document.createElement("tr");
   detail.id = "probes-" + cycleId;
   detail.className = "probe-detail";
+  // probeLayer/probeStatus/probeLatency return markup and are deliberately un-esc()'d --
+  // see the rule at the top of this file. Everything else here is a server value.
   detail.innerHTML = `<td colspan="7">` + data.rows.map(p => `
     <div>
-      <span title="${p.ts}">${compactTs(p.ts)}</span> — <strong>${probeLayer(p)}</strong> —
+      <span title="${esc(p.ts)}">${esc(compactTs(p.ts))}</span> — <strong>${probeLayer(p)}</strong> —
       ${probeStatus(p)}
-      ${p.fail_reason ? ` (${p.fail_reason})` : ""}
+      ${p.fail_reason ? ` (${esc(p.fail_reason)})` : ""}
       ${probeLatency(p)}
-      ${p.burst_id ? `<span class="badge-burst">burst</span><span class="burst-id">${p.burst_id.slice(0, 8)}</span>` : ""}
+      ${p.burst_id ? `<span class="badge-burst">burst</span><span class="burst-id">${esc(String(p.burst_id).slice(0, 8))}</span>` : ""}
     </div>
   `).join("") + `</td>`;
   row.after(detail);
@@ -183,14 +238,16 @@ async function loadHistory() {
   data.rows.forEach(r => {
     const tr = document.createElement("tr");
     tr.className = "cycle-row" + (r.burst_id ? " burst-row" : "");
+    // layerBadge/verdictClass/sessionBadge return markup or a code-defined class name and
+    // are deliberately un-esc()'d -- see the rule at the top of this file.
     tr.innerHTML = `
-      <td class="ts" title="${r.ts}">${compactTs(r.ts)}</td>
+      <td class="ts" title="${esc(r.ts)}">${esc(compactTs(r.ts))}</td>
       <td>${layerBadge(r.pulse_ok)}</td>
       <td>${layerBadge(r.render_ok)}</td>
       <td>${layerBadge(r.authed_ok)}</td>
-      <td class="${verdictClass(r.verdict)}">${r.verdict}</td>
+      <td class="${verdictClass(r.verdict)}">${esc(r.verdict)}</td>
       <td>${sessionBadge(r)}</td>
-      <td>${r.burst_id ? `<span class="badge-burst">burst</span><span class="burst-id">${r.burst_id.slice(0, 8)}</span>` : "-"}</td>
+      <td>${r.burst_id ? `<span class="badge-burst">burst</span><span class="burst-id">${esc(String(r.burst_id).slice(0, 8))}</span>` : "-"}</td>
     `;
     tr.onclick = () => toggleProbes(r.cycle_id, tr);
     tbody.appendChild(tr);
