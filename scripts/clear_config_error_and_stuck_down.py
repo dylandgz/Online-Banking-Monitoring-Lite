@@ -92,12 +92,22 @@ def _suggest_ended_at(conn, track: str, started_at: str, recovery_passes: int):
     Deliberately counts passes across all of the track's layers rather than the cause layer
     alone: a DOWN that needs this script is usually one whose cause layer cannot pass at all,
     so restricting to it would always return nothing. The derivation is printed rather than
-    trusted silently -- this is a suggestion for a human, not an authority."""
+    trusted silently -- this is a suggestion for a human, not an authority.
+
+    [AppScan SQLi finding, 2026-09-22] The IN clause is fixed at two placeholders rather
+    than joined to match len(layers). Both _TRACK_LAYERS entries are 2-tuples, so nothing
+    was gained by generating it -- and this is the one flagged site with a genuine taint
+    source rather than an assumed one: argparse reads sys.argv, which AppScan tracks, and it
+    cannot see that `choices=("auth","main")` constrains `track` or that the dict lookup
+    discards the value and keeps only the arity. The guard below is what the generated
+    placeholders used to provide implicitly: a third layer on a track must fail loudly here
+    instead of silently mismatching the parameter count."""
     layers = _TRACK_LAYERS.get(track, ())
-    placeholders = ",".join("?" for _ in layers)
+    if len(layers) != 2:
+        raise ValueError(f"track {track!r} does not have exactly two layers: {layers!r}")
     rows = conn.execute(
-        f"SELECT ts, ok, fail_reason FROM checks "
-        f"WHERE ts > ? AND layer IN ({placeholders}) ORDER BY id ASC",
+        "SELECT ts, ok, fail_reason FROM checks "
+        "WHERE ts > ? AND layer IN (?, ?) ORDER BY id ASC",
         (started_at, *layers),
     ).fetchall()
 

@@ -525,22 +525,52 @@ def get_recent_incidents(conn: sqlite3.Connection, limit: int = 20) -> list[dict
     return [dict(r) for r in rows]
 
 
-def _range_clause(ts_from: str | None, ts_to: str | None) -> tuple[str, list]:
-    where = []
-    params: list = []
-    if ts_from:
-        where.append("ts >= ?")
-        params.append(ts_from)
-    if ts_to:
-        where.append("ts <= ?")
-        params.append(ts_to)
-    clause = ("WHERE " + " AND ".join(where)) if where else ""
-    return clause, params
+# --- ts range filtering [AppScan SQLi findings, 2026-09-22] ---------------------------
+#
+# Every query below states its ts window as sentinel bounds inside ONE string literal,
+# rather than assembling a WHERE clause at runtime. The bounds are always present and
+# always parameterised, so no query text anywhere in this module is built from a variable.
+#
+# What this replaced. `_range_clause()` appended "ts >= ?" / "ts <= ?" to a list, joined
+# them, and f-strung the result into the query. Values were bound the whole time, so it was
+# never injectable -- but a static analyser cannot prove that. Constant propagation does not
+# survive list mutation plus str.join, so the clause arrived at the sink as an unknown
+# string and HCL AppScan reported SQL injection against all four callers. The fix is not a
+# security fix; it is making an existing guarantee visible to the tools that audit it.
+#
+# Why COALESCE and not "(? IS NULL OR ts >= ?)". COALESCE(?, <const>) folds before the
+# scan, so the ts indexes still apply -- measured on 20k rows, both bounds NULL:
+#   SEARCH TABLE cycles USING COVERING INDEX idx_cycles_ts (ts>? AND ts<?)
+# The IS NULL form is not sargable and degrades to a full table scan, which at the
+# one-year projection in iter_export's docstring (525k cycles / 1.05M checks) is the
+# difference between an indexed walk and reading the table.
+#
+# The sentinels assume stored timestamps stay UTC ISO-8601 from timeutil.now_iso()
+# ('2026-09-22T14:32:15.123456+00:00'), which orders lexicographically: '' sorts below every
+# stamp, '9999' above any year with a four-digit prefix. A stored format that is not
+# lexicographically ordered would break these bounds silently -- if that ever changes, this
+# is the comment that should stop you.
+#
+def _range_bounds(ts_from: str | None, ts_to: str | None) -> tuple[str | None, str | None]:
+    """Normalise a ts window to the two values the queries bind. Values only -- this never
+    returns SQL, which is the whole point of the rewrite above.
+
+    Falsy means "no bound", reproducing the `if ts_from:` / `if ts_to:` tests that
+    `_range_clause` used to apply. That is load-bearing rather than tidiness: COALESCE only
+    substitutes on NULL, so an empty string would bind as a real bound and `ts <= ''`
+    matches nothing. `/api/export?table=cycles&to=` would then return a zero-row CSV and
+    HTTP 200 -- a silent truncation of an audit export, which Rule 15 requires be a refusal
+    instead. The dashboard guards this with `if (to)` before building the query string, so
+    the hole is only reachable from curl or a script, which is not a reason to leave it."""
+    return (ts_from or None, ts_to or None)
 
 
 def export_checks(conn: sqlite3.Connection, ts_from: str | None, ts_to: str | None) -> list[dict]:
-    clause, params = _range_clause(ts_from, ts_to)
-    rows = conn.execute(f"SELECT * FROM checks {clause} ORDER BY id ASC", params).fetchall()
+    rows = conn.execute(
+        "SELECT * FROM checks WHERE ts >= COALESCE(?, '') AND ts <= COALESCE(?, '9999') "
+        "ORDER BY id ASC",
+        _range_bounds(ts_from, ts_to),
+    ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -590,26 +620,46 @@ def query_cycles(
     page: int,
     page_size: int,
 ) -> tuple[list[dict], int]:
-    clause, params = _range_clause(ts_from, ts_to)
-    total = conn.execute(f"SELECT COUNT(*) c FROM cycles {clause}", params).fetchone()["c"]
+    total = conn.execute(
+        "SELECT COUNT(*) c FROM cycles WHERE ts >= COALESCE(?, '') AND ts <= COALESCE(?, '9999')",
+        _range_bounds(ts_from, ts_to),
+    ).fetchone()["c"]
     offset = (page - 1) * page_size
     # cycles has no autoincrement id (cycle_id is a UUID text PK) -- order by ts instead.
     rows = conn.execute(
-        f"SELECT * FROM cycles {clause} ORDER BY ts DESC LIMIT ? OFFSET ?",
-        params + [page_size, offset],
+        "SELECT * FROM cycles WHERE ts >= COALESCE(?, '') AND ts <= COALESCE(?, '9999') "
+        "ORDER BY ts DESC LIMIT ? OFFSET ?",
+        (*_range_bounds(ts_from, ts_to), page_size, offset),
     ).fetchall()
     return [dict(r) for r in rows], total
 
 
 def export_cycles(conn: sqlite3.Connection, ts_from: str | None, ts_to: str | None) -> list[dict]:
-    clause, params = _range_clause(ts_from, ts_to)
-    rows = conn.execute(f"SELECT * FROM cycles {clause} ORDER BY ts ASC", params).fetchall()
+    rows = conn.execute(
+        "SELECT * FROM cycles WHERE ts >= COALESCE(?, '') AND ts <= COALESCE(?, '9999') "
+        "ORDER BY ts ASC",
+        _range_bounds(ts_from, ts_to),
+    ).fetchall()
     return [dict(r) for r in rows]
 
 
-# Table -> ORDER BY column for the streaming export below. Doubles as the allowlist: a
-# table name reaches SQL only by being a key here, never from the request.
-_EXPORT_ORDER = {"cycles": "ts", "checks": "id"}
+# The exportable tables. Each name maps to a complete, constant query -- a table name is
+# SELECTED by comparison here, never interpolated into SQL text.
+#
+# [AppScan SQLi findings, 2026-09-22] This replaced a {"cycles": "ts", "checks": "id"} map
+# whose value was f-strung in as the ORDER BY column alongside f-strung {table}. An
+# identifier cannot be parameterised, so that was the one construct in this module a static
+# analyser was right to be suspicious of, even though `table` was allowlisted on the way in
+# (dict lookup here, and a regex on the route's Query()).
+#
+# Deliberately if/elif rather than a dict of query strings. A dict subscripted by a
+# request-derived key is the construct that loses static analysers in the first place --
+# several propagate taint through the subscript even when every stored value is a constant.
+# An equality branch leaves a literal in every execute() call, which nothing has to infer.
+#
+# Public (no underscore) because monitor/web/app.py iterates it to build the table=all zip:
+# the branches below and the zip's members must not be able to drift apart.
+EXPORTABLE_TABLES = ("cycles", "checks")
 
 
 def iter_export(
@@ -633,10 +683,27 @@ def iter_export(
     fetch in batches, so this holds one batch in memory, not the result set.
 
     export_cycles/export_checks are intentionally left in place: get_checks_for_cycle and
-    the tests want a concrete list, and a small bounded read is clearer as a list."""
-    order_by = _EXPORT_ORDER[table]  # KeyError on anything not allowlisted, by design
-    clause, params = _range_clause(ts_from, ts_to)
-    cursor = conn.execute(f"SELECT * FROM {table} {clause} ORDER BY {order_by} ASC", params)
+    the tests want a concrete list, and a small bounded read is clearer as a list.
+
+    Raises ValueError on a table that is not exportable. That used to be a bare KeyError off
+    the allowlist dict, which was correct but landed badly: this is a generator consumed
+    inside a StreamingResponse, so the lookup did not run until the route was already
+    streaming, turning a bad `table` into a truncated download rather than a clean error."""
+    if table == "cycles":
+        cursor = conn.execute(
+            "SELECT * FROM cycles WHERE ts >= COALESCE(?, '') AND ts <= COALESCE(?, '9999') "
+            "ORDER BY ts ASC",
+            _range_bounds(ts_from, ts_to),
+        )
+    elif table == "checks":
+        # checks has an autoincrement id; ordering by it keeps probes within one ts stable.
+        cursor = conn.execute(
+            "SELECT * FROM checks WHERE ts >= COALESCE(?, '') AND ts <= COALESCE(?, '9999') "
+            "ORDER BY id ASC",
+            _range_bounds(ts_from, ts_to),
+        )
+    else:
+        raise ValueError(f"table not exportable: {table!r}")
     for row in cursor:
         yield dict(row)
 
@@ -645,10 +712,20 @@ def count_export_rows(
     conn: sqlite3.Connection, table: str, ts_from: str | None, ts_to: str | None
 ) -> int:
     """Row count for the same window iter_export would return -- lets the route refuse an
-    unreasonably large zip before doing the work, rather than discovering it by dying."""
-    _ = _EXPORT_ORDER[table]  # same allowlist gate
-    clause, params = _range_clause(ts_from, ts_to)
-    return conn.execute(f"SELECT COUNT(*) c FROM {table} {clause}", params).fetchone()["c"]
+    unreasonably large zip before doing the work, rather than discovering it by dying.
+
+    Same table gate, and same ValueError, as iter_export."""
+    if table == "cycles":
+        return conn.execute(
+            "SELECT COUNT(*) c FROM cycles WHERE ts >= COALESCE(?, '') AND ts <= COALESCE(?, '9999')",
+            _range_bounds(ts_from, ts_to),
+        ).fetchone()["c"]
+    if table == "checks":
+        return conn.execute(
+            "SELECT COUNT(*) c FROM checks WHERE ts >= COALESCE(?, '') AND ts <= COALESCE(?, '9999')",
+            _range_bounds(ts_from, ts_to),
+        ).fetchone()["c"]
+    raise ValueError(f"table not exportable: {table!r}")
 
 
 def get_checks_for_cycle(conn: sqlite3.Connection, cycle_id: str) -> list[dict]:

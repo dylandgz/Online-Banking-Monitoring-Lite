@@ -172,10 +172,22 @@ def test_iter_export_is_lazy(seeded_db):
 
 
 def test_iter_export_rejects_a_table_not_on_the_allowlist(seeded_db):
-    """Table names reach SQL by dict lookup only; anything else must not build a query."""
+    """A table name selects a constant query by comparison; anything else must not run SQL.
+
+    ValueError, not the KeyError this asserted before the 2026-09-22 AppScan pass: the
+    lookup happened inside the generator, so the rejection only surfaced once the route was
+    already streaming a response."""
     conn, _ = seeded_db
-    with pytest.raises(KeyError):
+    with pytest.raises(ValueError):
         next(db.iter_export(conn, "incidents; DROP TABLE checks", None, None))
+
+
+def test_count_export_rows_rejects_a_table_not_on_the_allowlist(seeded_db):
+    """The zip's pre-flight count shares iter_export's gate, so it must share its refusal --
+    it runs first, and a gap here would build SQL before the streaming path ever checked."""
+    conn, _ = seeded_db
+    with pytest.raises(ValueError):
+        db.count_export_rows(conn, "incidents; DROP TABLE checks", None, None)
 
 
 @pytest.mark.parametrize("table", ["cycles", "checks"])
@@ -229,6 +241,42 @@ def test_single_table_export_is_not_subject_to_the_zip_cap(seeded_db, monkeypatc
 
     assert status == 200
     assert body.count(b"\n") == 31
+
+
+# The fixture seeds 30 rows at 2026-08-24T10:00 .. T10:29, one per minute.
+_T = "2026-08-24T10:%02d:00.000000+00:00"
+
+@pytest.mark.parametrize("ts_from, ts_to, expected", [
+    (None,      None,      30),  # no window at all
+    (_T % 10,   None,      20),  # lower bound only  -> minutes 10..29
+    (None,      _T % 9,    10),  # upper bound only  -> minutes 00..09
+    (_T % 10,   _T % 19,   10),  # both bounds
+    ("",        "",        30),  # see the regression note below
+    ("",        None,      30),
+    (None,      "",        30),
+])
+def test_ts_window_bounds_select_the_same_rows_on_every_query_path(
+    seeded_db, ts_from, ts_to, expected
+):
+    """[AppScan SQLi pass, 2026-09-22] The sentinel bounds must window exactly as the old
+    runtime-assembled WHERE clause did, on all four query paths at once.
+
+    The empty-string rows are the regression guard, and they caught a real defect during
+    this rewrite. `_range_clause` tested `if ts_to:`, so '' meant "no bound"; COALESCE only
+    substitutes on NULL, so binding '' directly makes `ts <= ''` match nothing. Before
+    `_range_bounds` normalised it, `/api/export?table=cycles&to=` returned a zero-row CSV
+    with HTTP 200 -- a silent truncation of an audit export, which Rule 15 requires be a
+    refusal. The dashboard never sends a bare `to=` (dashboard.js guards with `if (to)`),
+    so nothing in the UI would have shown this."""
+    conn, _ = seeded_db
+
+    assert len(db.export_cycles(conn, ts_from, ts_to)) == expected
+    assert len(db.export_checks(conn, ts_from, ts_to)) == expected
+    assert len(list(db.iter_export(conn, "cycles", ts_from, ts_to))) == expected
+    assert db.count_export_rows(conn, "cycles", ts_from, ts_to) == expected
+
+    _, total = db.query_cycles(conn, ts_from, ts_to, page=1, page_size=500)
+    assert total == expected
 
 
 def test_export_still_honours_the_date_filter(seeded_db):

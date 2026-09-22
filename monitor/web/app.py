@@ -374,7 +374,7 @@ _MAX_ZIP_ROWS_PER_TABLE = 200_000
 def _export_zip(from_: str | None, to: str | None) -> Response:
     conn = db.get_connection(config.DB_PATH)
     try:
-        for table in ("cycles", "checks"):
+        for table in db.EXPORTABLE_TABLES:
             count = db.count_export_rows(conn, table, from_, to)
             if count > _MAX_ZIP_ROWS_PER_TABLE:
                 raise HTTPException(
@@ -389,7 +389,7 @@ def _export_zip(from_: str | None, to: str | None) -> Response:
 
         archive = io.BytesIO()
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
-            for table in ("cycles", "checks"):
+            for table in db.EXPORTABLE_TABLES:
                 # bundle.open(...,'w') writes incrementally, so the member's full CSV text
                 # never exists as one string the way "".join(...) forced it to.
                 with bundle.open(f"{table}.csv", "w") as member:
