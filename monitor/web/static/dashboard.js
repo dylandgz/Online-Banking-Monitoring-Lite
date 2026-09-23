@@ -267,7 +267,8 @@ async function toggleProbes(cycleId, row) {
   if (!CYCLE_ID.test(id)) {
     // Loud rather than silent: a bad shape here means the id format changed upstream, and a
     // drill-down that just stops opening is the hardest version of that to diagnose.
-    console.warn("dashboard: refusing to request a cycle id of an unexpected shape:", id);
+    console.warn("dashboard: refusing to request a cycle id of an unexpected shape");
+
     return;
   }
   const res = await fetch("/api/cycle/" + encodeURIComponent(id));
