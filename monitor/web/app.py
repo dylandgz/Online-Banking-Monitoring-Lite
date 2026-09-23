@@ -33,10 +33,12 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 security = HTTPBasic()
 
 
-# [AppScan XSS findings, 2026-09-22] A second wall behind dashboard.js's esc(). The escaping
-# is the fix; this bounds what a miss could do, and the two fail differently -- esc() is
-# per-interpolation and can be forgotten at one call site, while this applies to the whole
-# document or not at all.
+# [AppScan XSS findings, 2026-09-22; revised 2026-09-23] A second wall behind dashboard.js's
+# DOM building. That file creates every element with createElement/textContent and assembles
+# no HTML from strings at all, which is the fix; this bounds what a lapse could do, and the
+# two fail differently -- a sink can be reintroduced at one call site (the lint in
+# tests/test_dashboard_escaping.py exists to make that loud), while this header applies to
+# the whole document or not at all.
 #
 # 'self' with NO 'unsafe-inline' is only possible because the dashboard has no inline script,
 # no inline <style>, no style="" attribute and no on*="" handler -- verified before adding
@@ -72,7 +74,7 @@ _SECURITY_HEADERS = {
 @app.middleware("http")
 async def add_security_headers(request, call_next):
     """Applied to every response, /healthz included -- a header cannot be forgotten per-route
-    the way an escaping call can be, and that uniformity is the point of having it."""
+    the way a rendering call can be, and that uniformity is the point of having it."""
     response = await call_next(request)
     for header, value in _SECURITY_HEADERS.items():
         response.headers.setdefault(header, value)
