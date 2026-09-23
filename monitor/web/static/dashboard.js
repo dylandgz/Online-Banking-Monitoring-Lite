@@ -15,47 +15,69 @@ const STATUS_PRESENTATION = {
   DEGRADED:     { label: "Degraded",        cls: "warn" },
 };
 
-// --- HTML escaping [AppScan XSS findings, 2026-09-22] -------------------------------
+// --- DOM building [AppScan XSS findings, 2026-09-22; rewritten 2026-09-23] -----------
 //
-// THE RULE, and it has exactly two cases. Inside any template literal that reaches
-// `innerHTML`:
+// THE RULE, and it has no exceptions: **this file never builds HTML from a string.** No
+// `innerHTML`, no `outerHTML`, no `insertAdjacentHTML`, no `document.write`. Every element
+// is created with `el()` below, and every value from the API is inserted as *text*, which
+// the browser stores as character data and never parses as markup. There is nothing to
+// escape because there is no markup parser on the path.
 //
-//   * a value from the API  -> MUST be wrapped in esc(...)
-//   * a call to a helper that RETURNS MARKUP (layerBadge, sessionBadge, probeStatus,
-//     probeLatency, probeLayer, verdictClass) -> MUST NOT be wrapped; escaping it would
-//     render the tags as visible text. Those helpers own the escaping of anything they
-//     interpolate, which is why probeLayer escapes p.layer itself.
+// Why it is written this way rather than escaped. AppScan rated the four `innerHTML`
+// assignments this file used to have as Critical reflected XSS. "Reflected" was the wrong
+// word -- no request input reaches them -- and the previous version escaped every
+// interpolation with a hand-written esc(), so it was not exploitable either. Two problems
+// with that answer. A static scanner cannot verify that a human escaped every field, so it
+// flags the sink regardless and the finding never clears. And the safety depended on a
+// convention: one forgotten esc() at one call site, and it was gone.
 //
-// Why this exists. AppScan flagged the four innerHTML assignments as Critical reflected
-// XSS. Reflected is the wrong word -- no request input reaches these sinks -- and nothing
-// rendered today is attacker-controlled, so it was not exploitable. But that safety was a
-// coincidence: it held only because every field that happened to be rendered happened to
-// contain no markup, maintained by hand with nothing enforcing it.
+// The trap was one token deep. /api/cycle/{id} ships the full `checks` row, so `p.page_url`
+// and `p.evidence_text` are in the probe-detail payload right now, unrendered.
+// evidence_text is the live text of the monitored bank's role="alert" banner (journey.py
+// `_visible_alert_text`, added by B63 so a diagnosis does not require opening a screenshot)
+// -- i.e. verbatim remote content. Rendering it with `${p.evidence_text}` would have looked
+// like a one-line diagnostic improvement and been genuine stored XSS against an
+// authenticated operator. Under textContent that same edit is simply safe.
 //
-// The trap was one token deep. /api/cycle/{id} already ships the full `checks` row, so
-// `p.page_url` and `p.evidence_text` sit inside the probe-detail template right now,
-// unrendered. evidence_text is the live text of the monitored bank's role="alert" banner
-// (journey.py `_visible_alert_text`, added by B63 so a diagnosis does not require opening a
-// screenshot) -- i.e. verbatim remote content, already in the payload. Writing
-// `${p.evidence_text}` to show it would have been a reasonable-looking one-line diagnostic
-// improvement, and genuine stored XSS against an authenticated operator, with nothing in
-// the file to warn whoever made it. escaping-by-default removes the trap rather than
-// relying on nobody stepping in it.
+// THE ONE THING THIS DOES NOT COVER: urls. `textContent` protects text and `el()` protects
+// attribute *values*, but a `javascript:` url in an href or src executes no matter how it
+// got there. So urls are built from a code-literal prefix plus a server-generated id, and
+// nothing remote-influenced (page_url, evidence_text, screenshot_path) may ever reach one.
+// tests/test_dashboard_escaping.py enforces both halves of this -- read it before adding a
+// sink, and do not reintroduce an HTML string to save a few lines.
+
+// Appends children to a node: a string (or number) becomes a text node, a node or fragment
+// is appended as-is, an array is flattened. null/undefined/false/"" are skipped, which is
+// what lets the callers below keep their `cond ? x : null` shape inline. Note 0 is NOT
+// skipped -- `checks_failed` of 0 is a real value that must render as "0".
+function append(parent, children) {
+  for (const child of children) {
+    if (child === null || child === undefined || child === false || child === "") continue;
+    if (Array.isArray(child)) { append(parent, child); continue; }
+    parent.appendChild(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return parent;
+}
+
+// el("td", { className: "ts", title: ts }, "text", childNode, cond ? "x" : null)
 //
-// Text and quoted-attribute contexts are both covered: every attribute in this file is
-// double-quoted, and &quot;/&#39; close both. There is no URL-context interpolation (the
-// one href built from data uses inc.id, a server-generated integer) and no interpolation
-// inside a <script> or style attribute, so this single escaper is sufficient here. If a
-// value ever has to go into an href/src, this is NOT enough -- javascript: survives it.
-// tests/test_dashboard_escaping.py enforces the rule above; read it before adding a sink.
-function esc(v) {
-  if (v === null || v === undefined) return "";
-  return String(v)
-    .replace(/&/g, "&amp;")   // must be first, or it double-escapes the entities below
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+// Attributes are set as DOM *properties* (className, title, id, href, colSpan), not through
+// setAttribute with a variable name -- a property assignment cannot invent an attribute like
+// `onclick` out of a data value. Remember the href rule in the header comment: the value
+// must start with a literal path, never a bare server string.
+function el(tag, attrs, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (value === null || value === undefined) continue;
+    node[key] = value;
+  }
+  return append(node, children);
+}
+
+// For the places that need several siblings with no wrapper element around them -- adding a
+// wrapper would change what dashboard.css's descendant selectors match.
+function frag(...children) {
+  return append(document.createDocumentFragment(), children);
 }
 
 // Timestamps arrive as "2026-08-18 15:45:14 EDT (UTC-04:00)". Tables show the form without
@@ -104,28 +126,40 @@ async function loadStatus() {
   detailEl.textContent = detail;
   detailEl.title = data.since_ts || "";
 
-  const uptimeEl = document.getElementById("uptime");
-  uptimeEl.innerHTML = ["24h", "7d", "30d"].map(k => {
-    const v = data.uptime_pct[k];
-    return `<div><strong>${esc(k)}</strong><span class="uptime-value">${esc(v == null ? "n/a" : v + "%")}</span></div>`;
-  }).join("");
+  // The div/strong/span shape is load-bearing: dashboard.css selects `.uptime div` and
+  // `.uptime strong` by tag name, not by class.
+  document.getElementById("uptime").replaceChildren(
+    ...["24h", "7d", "30d"].map(k => {
+      const v = data.uptime_pct[k];
+      return el("div", null,
+        el("strong", null, k),
+        el("span", { className: "uptime-value" }, v == null ? "n/a" : v + "%"),
+      );
+    })
+  );
 
   const tbody = document.querySelector("#incidents-table tbody");
-  tbody.innerHTML = data.incidents.map(inc => `
-    <tr>
-      <td>${esc(inc.track ?? "main")}</td>
-      <td>${esc(inc.trigger_layer ?? "-")}</td>
-      <td class="ts" title="${esc(inc.started_at ?? "")}">${esc(compactTs(inc.started_at))}</td>
-      <td class="ts" title="${esc(inc.ended_at ?? "")}">${esc(inc.ended_at ? compactTs(inc.ended_at) : "(ongoing)")}</td>
-      <td>${esc(fmtDuration(inc.duration_s))}</td>
-      <td>${esc(inc.checks_failed ?? "-")}</td>
-      <td>${inc.screenshot_path ? `<a href="/api/artifact/${esc(inc.id)}" target="_blank">view</a>` : "-"}</td>
-    </tr>
-  `).join("");
+  tbody.replaceChildren(
+    ...data.incidents.map(inc => el("tr", null,
+      el("td", null, inc.track ?? "main"),
+      el("td", null, inc.trigger_layer ?? "-"),
+      el("td", { className: "ts", title: inc.started_at ?? "" }, compactTs(inc.started_at)),
+      el("td", { className: "ts", title: inc.ended_at ?? "" },
+        inc.ended_at ? compactTs(inc.ended_at) : "(ongoing)"),
+      el("td", null, fmtDuration(inc.duration_s)),
+      el("td", null, inc.checks_failed ?? "-"),
+      // Literal path + a server-generated integer id, encoded as one path segment. This is
+      // the only data-derived url in the file; see the header comment's url rule.
+      el("td", null, inc.screenshot_path
+        ? el("a", { href: "/api/artifact/" + encodeURIComponent(inc.id), target: "_blank" }, "view")
+        : "-"),
+    ))
+  );
 }
 
 // Same three-way split as the banner: DOWN is red, UP is teal, and anything that doesn't
 // page (CONFIG_ERROR, DEGRADED) is gold rather than being lumped in with a real outage.
+// Returns a class name, not a node -- it is the one helper here that stays a string.
 function verdictClass(verdict) {
   if (verdict === "UP") return "ok";
   if (verdict === "DOWN") return "fail";
@@ -133,8 +167,18 @@ function verdictClass(verdict) {
 }
 
 function layerBadge(ok) {
-  if (ok === null || ok === undefined) return `<span class="layer-badge na">-</span>`;
-  return ok ? `<span class="layer-badge ok">OK</span>` : `<span class="layer-badge fail">FAIL</span>`;
+  if (ok === null || ok === undefined) return el("span", { className: "layer-badge na" }, "-");
+  return el("span", { className: ok ? "layer-badge ok" : "layer-badge fail" }, ok ? "OK" : "FAIL");
+}
+
+// Both places that show a burst_id show it the same way: the gold chip, then the first 8
+// characters of the id. String() first -- burst_id is not reliably a string (it arrives
+// straight out of SQLite), and .slice() on a number throws.
+function burstBadge(burstId) {
+  return frag(
+    el("span", { className: "badge-burst" }, "burst"),
+    el("span", { className: "burst-id" }, String(burstId).slice(0, 8)),
+  );
 }
 
 // The Session column has to say four different things, because cycles.session_reused is
@@ -152,14 +196,18 @@ function layerBadge(ok) {
 // was actually spent on a failing cycle is not recorded anywhere on the cycles row, and
 // guessing would put a claim in the audit view that the data does not support.
 function sessionBadge(r) {
-  if (r.session_reused) return `<span class="badge-reused">reused</span>`;
+  if (r.session_reused) return el("span", { className: "badge-reused" }, "reused");
   if (r.authed_ok === null || r.authed_ok === undefined) {
-    return `<span class="badge-muted" title="Auth track did not run this cycle">not checked</span>`;
+    return el("span", { className: "badge-muted", title: "Auth track did not run this cycle" },
+      "not checked");
   }
   if (!r.authed_ok) {
-    return `<span class="badge-muted" title="Authed check failed -- whether a login was spent is not recorded on the cycle row">n/a</span>`;
+    return el("span", {
+      className: "badge-muted",
+      title: "Authed check failed -- whether a login was spent is not recorded on the cycle row",
+    }, "n/a");
   }
-  return `<span class="badge-login">new login</span>`;
+  return el("span", { className: "badge-login" }, "new login");
 }
 
 // [B25] 461 early rows were written before `layer` existed and carry NULL/empty. Rendering
@@ -167,26 +215,19 @@ function sessionBadge(r) {
 // rather than as missing data -- say "unknown" instead. (The `auth`/`authed` spelling split
 // is normalised server-side, in _split_main_probe's caller.)
 //
-// Returns markup, so its callers must NOT esc() it -- which makes escaping p.layer here
-// this function's own responsibility. It is the only markup-returning helper that passes a
-// server value through; the others interpolate code-defined literals only.
+// Returns the layer name as plain text, or the muted chip. Its caller wraps the result in
+// <strong> either way, which is what the previous template did.
 function probeLayer(p) {
-  return p.layer ? esc(p.layer) : `<span class="badge-muted">unknown</span>`;
+  return p.layer ? String(p.layer) : el("span", { className: "badge-muted" }, "unknown");
 }
 
 // Three states, not two. The pulse line reads its ok from cycles.pulse_ok, which is NULL on
 // any cycle predating that column -- and `null ? "OK" : "FAIL"` would print FAIL for a probe
 // that was never recorded either way. Matches layerBadge()'s handling in the row above.
 // Values arrive as SQLite 1/0/null, not JS booleans.
-//
-// The esc() calls below are no-ops -- both interpolations pick between two literals defined
-// right here. They are written anyway so the rule at the top of this file holds without
-// exception: inside a template, a value is esc()'d or it is a markup helper, full stop. An
-// invariant with a list of "safe because I checked" exemptions is one nobody can apply
-// without re-deriving the analysis, which is how the original four sinks got written.
 function probeStatus(p) {
-  if (p.ok === null || p.ok === undefined) return `<span class="badge-muted">n/a</span>`;
-  return `<span class="${esc(p.ok ? "ok" : "fail")}">${esc(p.ok ? "OK" : "FAIL")}</span>`;
+  if (p.ok === null || p.ok === undefined) return el("span", { className: "badge-muted" }, "n/a");
+  return el("span", { className: p.ok ? "ok" : "fail" }, p.ok ? "OK" : "FAIL");
 }
 
 // [B25] A latency of exactly 0 is never a measurement. It is the old hardcoded
@@ -194,9 +235,15 @@ function probeStatus(p) {
 // session_expired result, which records that the monitor wanted to look and could not.
 // Both mean "not timed", and "0ms" reads as "instant" -- the opposite. Show an em dash.
 // render_only_probe now measures itself, so new burst rows carry real values.
+//
+// A fragment, not an element: this contributes the " — " separator *and* the value as
+// siblings of the probe line, exactly as the old template's text did. Wrapping them in a
+// span would add a box dashboard.css has no rule for.
 function probeLatency(p) {
-  if (p.latency_ms == null || p.latency_ms === 0) return ` — <span class="badge-muted">—</span>`;
-  return ` — ${esc(Math.round(p.latency_ms))}ms`;
+  if (p.latency_ms == null || p.latency_ms === 0) {
+    return frag(" — ", el("span", { className: "badge-muted" }, "—"));
+  }
+  return frag(" — " + Math.round(p.latency_ms) + "ms");
 }
 
 async function toggleProbes(cycleId, row) {
@@ -205,20 +252,23 @@ async function toggleProbes(cycleId, row) {
 
   const res = await fetch("/api/cycle/" + cycleId);
   const data = await res.json();
-  const detail = document.createElement("tr");
-  detail.id = "probes-" + cycleId;
-  detail.className = "probe-detail";
-  // probeLayer/probeStatus/probeLatency return markup and are deliberately un-esc()'d --
-  // see the rule at the top of this file. Everything else here is a server value.
-  detail.innerHTML = `<td colspan="7">` + data.rows.map(p => `
-    <div>
-      <span title="${esc(p.ts)}">${esc(compactTs(p.ts))}</span> — <strong>${probeLayer(p)}</strong> —
-      ${probeStatus(p)}
-      ${p.fail_reason ? ` (${esc(p.fail_reason)})` : ""}
-      ${probeLatency(p)}
-      ${p.burst_id ? `<span class="badge-burst">burst</span><span class="burst-id">${esc(String(p.burst_id).slice(0, 8))}</span>` : ""}
-    </div>
-  `).join("") + `</td>`;
+  // colSpan 7 matches both tables' seven columns (dashboard.html), and dashboard.css styles
+  // this row via `tr.probe-detail td`, so the tr > td shape has to stay.
+  const detail = el("tr", { id: "probes-" + cycleId, className: "probe-detail" },
+    el("td", { colSpan: 7 },
+      ...data.rows.map(p => el("div", null,
+        el("span", { title: p.ts ?? "" }, compactTs(p.ts)),
+        " — ",
+        el("strong", null, probeLayer(p)),
+        " — ",
+        probeStatus(p),
+        p.fail_reason ? " (" + p.fail_reason + ")" : null,
+        probeLatency(p),
+        p.burst_id ? " " : null,
+        p.burst_id ? burstBadge(p.burst_id) : null,
+      ))
+    )
+  );
   row.after(detail);
 }
 
@@ -234,21 +284,17 @@ async function loadHistory() {
   state.total = data.total;
 
   const tbody = document.querySelector("#history-table tbody");
-  tbody.innerHTML = "";
+  tbody.replaceChildren();
   data.rows.forEach(r => {
-    const tr = document.createElement("tr");
-    tr.className = "cycle-row" + (r.burst_id ? " burst-row" : "");
-    // layerBadge/verdictClass/sessionBadge return markup or a code-defined class name and
-    // are deliberately un-esc()'d -- see the rule at the top of this file.
-    tr.innerHTML = `
-      <td class="ts" title="${esc(r.ts)}">${esc(compactTs(r.ts))}</td>
-      <td>${layerBadge(r.pulse_ok)}</td>
-      <td>${layerBadge(r.render_ok)}</td>
-      <td>${layerBadge(r.authed_ok)}</td>
-      <td class="${verdictClass(r.verdict)}">${esc(r.verdict)}</td>
-      <td>${sessionBadge(r)}</td>
-      <td>${r.burst_id ? `<span class="badge-burst">burst</span><span class="burst-id">${esc(String(r.burst_id).slice(0, 8))}</span>` : "-"}</td>
-    `;
+    const tr = el("tr", { className: "cycle-row" + (r.burst_id ? " burst-row" : "") },
+      el("td", { className: "ts", title: r.ts ?? "" }, compactTs(r.ts)),
+      el("td", null, layerBadge(r.pulse_ok)),
+      el("td", null, layerBadge(r.render_ok)),
+      el("td", null, layerBadge(r.authed_ok)),
+      el("td", { className: verdictClass(r.verdict) }, r.verdict),
+      el("td", null, sessionBadge(r)),
+      el("td", null, r.burst_id ? burstBadge(r.burst_id) : "-"),
+    );
     tr.onclick = () => toggleProbes(r.cycle_id, tr);
     tbody.appendChild(tr);
   });
