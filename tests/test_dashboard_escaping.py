@@ -90,10 +90,11 @@ def test_dashboard_js_contains_no_html_string_sink(sink):
 
 
 def test_attributes_are_set_as_properties_not_by_computed_name():
-    """`el()` assigns `node[key] = value`. A `setAttribute(name, value)` with a variable name
-    is the one way a data value could name its own attribute (`onclick`, `href`), so the file
-    does not use it at all. If a future attribute genuinely needs setAttribute -- `colspan`
-    does not, `colSpan` is the property -- it must take a literal name."""
+    """`el()` assigns through SETTERS, one literal property name per entry. A
+    `setAttribute(name, value)` with a variable name is the other way a data value could name
+    its own attribute (`onclick`, `href`), so the file does not use it at all. If a future
+    attribute genuinely needs setAttribute -- `colspan` does not, `colSpan` is the property --
+    it must take a literal name."""
     offenders = [f"  dashboard.js:{n}  {line.strip()}"
                  for n, line in _code_lines() if "setAttribute" in line]
     assert not offenders, (
@@ -103,13 +104,94 @@ def test_attributes_are_set_as_properties_not_by_computed_name():
     )
 
 
+def _setters_block_lines() -> set[int]:
+    """Line numbers of the SETTERS map.
+
+    The url lint below has to skip them: `["href", (node, value) => { node.href = value; }]`
+    is the *mechanism* of assignment, and the rule it would otherwise trip is about where the
+    value is CHOSEN. That happens at the el() call site -- `href: "/api/artifact/" + id` --
+    which the lint still checks."""
+    src = _strip_comments(DASHBOARD_JS.read_text())
+    start = src.index("const SETTERS = new Map([")
+    end = src.index("]);", start)
+    return set(range(src.count("\n", 0, start) + 1, src.count("\n", 0, end) + 2))
+
+
+def _el_attr_keys(src: str) -> list[tuple[int, str]]:
+    """Every attribute key passed to an el(...) call, as (line, key).
+
+    Brace-matched from the `{` after the tag, so multi-line attrs objects are covered. Keys
+    are the identifiers that follow `{` or `,` -- a ternary's `:` follows a value, never a
+    separator, so `{ className: ok ? "a" : "b" }` yields just `className`."""
+    out = []
+    for m in re.finditer(r"\bel\(", src):
+        i = src.find(",", m.end())
+        if i == -1:
+            continue
+        j = i + 1
+        while j < len(src) and src[j] in " \n\t":
+            j += 1
+        if j >= len(src) or src[j] != "{":
+            continue                     # `null`, or a call spread across a shape we skip
+        depth, k = 1, j + 1
+        while k < len(src) and depth:
+            if src[k] == "{":
+                depth += 1
+            elif src[k] == "}":
+                depth -= 1
+            k += 1
+        obj = src[j:k]
+        for key in re.findall(r"(?:^|[{,])\s*([A-Za-z_$][\w$]*)\s*:", obj):
+            out.append((src.count("\n", 0, j) + 1, key))
+    return out
+
+
+def test_no_property_is_written_under_a_name_held_in_a_variable():
+    """[AppScan prototype-pollution finding, 2026-09-23] `obj[key] = value` with a variable
+    key is the shape of a prototype-pollution bug: a key of "__proto__" or "constructor"
+    writes to the object everything else inherits from. el() used to do exactly that, with
+    keys that were always literals -- safe, but only by inspection of every call site.
+
+    Now every assignment names its property in full, in SETTERS. This asserts there is no
+    line capable of writing a name that is not spelled out in the source."""
+    offenders = [f"  dashboard.js:{n}  {line.strip()}" for n, line in _code_lines()
+                 if re.search(r"\[\s*[A-Za-z_$][\w$]*\s*\]\s*=(?!=)", line)]
+    assert not offenders, (
+        "dashboard.js assigns to a computed property name:\n" + "\n".join(offenders) + "\n\n"
+        "Add a literal setter to SETTERS instead. A write whose property name comes from a "
+        "variable cannot be shown safe by reading the line it is on."
+    )
+
+
+def test_every_attribute_el_is_asked_to_set_has_a_literal_setter():
+    """The other half: SETTERS skips a key it does not know, so a typo would silently drop an
+    attribute and the page would render subtly wrong with nothing raised. That is deliberate
+    -- a throw would blank the dashboard over a typo, and a console warning is its own scanner
+    finding -- so the check lives here, where it fails at build time and names the key."""
+    src = _strip_comments(DASHBOARD_JS.read_text())
+    block = src.split("const SETTERS = new Map([", 1)[1].split("]);", 1)[0]
+    known = set(re.findall(r'\["([A-Za-z_$][\w$]*)"', block))
+    assert known, "SETTERS is empty or its shape changed"
+
+    unknown = sorted({f"{key} (dashboard.js:{n})" for n, key in _el_attr_keys(src)
+                      if key not in known})
+    assert not unknown, (
+        "el() is passed attributes with no setter, so they are silently dropped:\n  "
+        + "\n  ".join(unknown)
+        + f"\n\nKnown: {sorted(known)}. Add a literal setter for it, or fix the typo."
+    )
+
+
 def test_every_url_is_built_from_a_literal_path():
     """textContent protects text; it does nothing for urls. A `javascript:` href executes no
     matter how it was assigned, so every href/src in this file must begin with a string
     literal starting `/` -- a same-origin path -- with anything dynamic appended after it."""
     pattern = re.compile(r"\b(href|src)\s*[:=]\s*(.+)$")
+    skip = _setters_block_lines()
     offenders = []
     for n, line in _code_lines():
+        if n in skip:
+            continue
         m = pattern.search(line)
         if not m:
             continue

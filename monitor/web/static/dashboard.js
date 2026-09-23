@@ -59,17 +59,46 @@ function append(parent, children) {
   return parent;
 }
 
-// el("td", { className: "ts", title: ts }, "text", childNode, cond ? "x" : null)
+// The complete set of properties el() can set, one literal assignment each.
 //
-// Attributes are set as DOM *properties* (className, title, id, href, colSpan), not through
-// setAttribute with a variable name -- a property assignment cannot invent an attribute like
-// `onclick` out of a data value. Remember the href rule in the header comment: the value
-// must start with a literal path, never a bare server string.
+// [AppScan prototype-pollution finding, dashboard.js:72 -- 2026-09-23] This used to be a
+// single `node[key] = value` inside el(). Writing to a property whose NAME comes from a
+// variable is the shape of a prototype-pollution bug: if the name can ever be "__proto__" or
+// "constructor", the write lands on the object every other object inherits from instead of on
+// this one. It could not happen here -- every key in this file is a literal in an object
+// written a few lines below, there are five of them, and none comes from the API, the url or
+// any other input -- and the target is a DOM element, so even "__proto__" would have swapped
+// one node's prototype rather than polluting Object.prototype. But a scanner cannot see where
+// a variable key came from, and neither can the next person, so there is no longer a line
+// capable of writing a name that is not spelled out here.
+//
+// A Map, not an object literal: `SETTERS["toString"]` on a plain object hands back an
+// inherited function, which is the same class of mistake this is closing. Map.get returns
+// undefined for anything not explicitly put in.
+//
+// An unknown key is skipped rather than thrown or logged: it can only ever be a typo in this
+// file (the keys are literals), a throw would blank the dashboard over one, and a console
+// call is its own scanner finding. tests/test_dashboard_escaping.py fails instead, at build
+// time, listing the key -- which is where a code-only mistake belongs.
+//
+// href stays subject to the url rule in the header comment: a literal path, never a bare
+// server value.
+const SETTERS = new Map([
+  ["className", (node, value) => { node.className = value; }],
+  ["title",     (node, value) => { node.title = value; }],
+  ["id",        (node, value) => { node.id = value; }],
+  ["href",      (node, value) => { node.href = value; }],
+  ["target",    (node, value) => { node.target = value; }],
+  ["colSpan",   (node, value) => { node.colSpan = value; }],
+]);
+
+// el("td", { className: "ts", title: ts }, "text", childNode, cond ? "x" : null)
 function el(tag, attrs, ...children) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs || {})) {
     if (value === null || value === undefined) continue;
-    node[key] = value;
+    const set = SETTERS.get(key);
+    if (set) set(node, value);
   }
   return append(node, children);
 }
