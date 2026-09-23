@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Path as PathParam
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
@@ -313,8 +314,31 @@ def _split_main_probe(row: dict, cycle: dict) -> list[dict]:
     return [pulse_line, render_line]
 
 
+# [AppScan "SSRF" finding against dashboard.js, 2026-09-23] The label is wrong twice over.
+# SSRF means the *server* fetches an attacker-controlled url; the call that was flagged is the
+# *browser* fetching a relative, same-origin path, and nothing on this side makes an outbound
+# request with the value -- cycle_id goes into a bound SQL parameter and nowhere else. The id
+# is also not user input: main.py generates it as str(uuid.uuid4()) and it travels
+# monitor -> DB -> /api/history -> browser -> here.
+#
+# What WAS true is that this was the only path parameter in the app with no constraint on it
+# at all (incident_id is an int, /static/{filename} is an allowlist lookup). So it is now
+# validated at the boundary, which is the half of the fix a client cannot bypass: a malformed
+# id is a 422 instead of an empty 200.
+#
+# The pattern is a CHARACTER allowlist, deliberately not a UUID shape. Every character that
+# could change what a url means -- / ? # % : @ \ and whitespace -- is excluded, which is the
+# entire security requirement. A value that is merely an unexpected *format* still works.
+# Nothing enforces the UUID shape at write time (main.py picks it; this suite's own fixtures
+# write "cycle-000"), so pinning the shape here would couple the route to an assumption that
+# lives in another module, and its failure mode would be a drill-down that silently does
+# nothing. Observed 2026-09-23: all 28,952 rows in the production DB carry 36-char UUIDs.
+CYCLE_ID_PATTERN = r"^[A-Za-z0-9_.-]{1,64}$"
+
+
 @app.get("/api/cycle/{cycle_id}", dependencies=[Depends(require_auth)])
-def api_cycle_probes(cycle_id: str, conn=Depends(get_conn)):
+def api_cycle_probes(cycle_id: str = PathParam(pattern=CYCLE_ID_PATTERN),
+                     conn=Depends(get_conn)):
     """Expandable probe-level detail for one cycle row -- bursts are first-class,
     unhideable evidence (CLAUDE.md), surfaced here on drill-down.
 

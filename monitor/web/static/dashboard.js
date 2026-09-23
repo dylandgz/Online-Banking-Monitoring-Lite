@@ -246,11 +246,31 @@ function probeLatency(p) {
   return frag(" — " + Math.round(p.latency_ms) + "ms");
 }
 
+// [AppScan "SSRF" finding, dashboard.js:153 -- 2026-09-23] The id this guards is a uuid4 the
+// monitor generated (main.py), delivered by /api/history and handed straight back to
+// /api/cycle on the same origin, so the scanner's reading -- a request whose destination an
+// attacker could steer -- does not describe anything here. It is still worth validating: this
+// is the file's only url built from a value rather than written out in full, and a check at
+// the point of use costs one line and settles the question for good.
+//
+// A character allowlist, not a uuid shape, and the same one monitor/web/app.py enforces on
+// the route. Everything that could change what the url MEANS is excluded (/ ? # % : @ \ and
+// whitespace); an id in an unexpected format still works. The server's copy is the one that
+// counts -- a browser check is advisory, since the browser is what an attacker controls.
+const CYCLE_ID = /^[A-Za-z0-9_.-]{1,64}$/;
+
 async function toggleProbes(cycleId, row) {
   const existing = document.getElementById("probes-" + cycleId);
   if (existing) { existing.remove(); return; }
 
-  const res = await fetch("/api/cycle/" + cycleId);
+  const id = String(cycleId);
+  if (!CYCLE_ID.test(id)) {
+    // Loud rather than silent: a bad shape here means the id format changed upstream, and a
+    // drill-down that just stops opening is the hardest version of that to diagnose.
+    console.warn("dashboard: refusing to request a cycle id of an unexpected shape:", id);
+    return;
+  }
+  const res = await fetch("/api/cycle/" + encodeURIComponent(id));
   const data = await res.json();
   // colSpan 7 matches both tables' seven columns (dashboard.html), and dashboard.css styles
   // this row via `tr.probe-detail td`, so the tr > td shape has to stay.

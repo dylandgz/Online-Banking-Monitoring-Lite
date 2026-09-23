@@ -125,6 +125,44 @@ def test_every_url_is_built_from_a_literal_path():
     )
 
 
+def test_every_fetch_url_is_a_literal_path_with_an_encoded_dynamic_part():
+    """[AppScan "SSRF" finding, 2026-09-23] The scanner flags any fetch whose url is built by
+    concatenation rather than written out in full, because it cannot see where the appended
+    value came from. Same rule as href/src, one step stricter: the literal path has to come
+    first, and anything appended to it has to be encoded -- encodeURIComponent for a path
+    segment, URLSearchParams.toString() for a query string. Both are sanitizers a reader (and
+    a scanner) can recognise without tracing the value back to its source."""
+    offenders = []
+    for n, line in _code_lines():
+        if "fetch(" not in line:
+            continue
+        arg = line.split("fetch(", 1)[1].strip()
+        if not re.match(r"""^["']/""", arg):
+            offenders.append(f"  dashboard.js:{n}  fetch({arg}  <- url does not start with a literal path")
+        elif "+" in arg and not ("encodeURIComponent(" in arg or ".toString()" in arg):
+            offenders.append(f"  dashboard.js:{n}  fetch({arg}  <- appends an unencoded value")
+
+    assert not offenders, (
+        "fetch url not built safely:\n" + "\n".join(offenders) + "\n\n"
+        "Write the path as a literal and append only encodeURIComponent(x) or a "
+        "URLSearchParams."
+    )
+
+
+def test_the_cycle_id_is_validated_before_it_is_used():
+    """The check has to happen *before* the fetch, not inside it -- a guard placed after the
+    request has already been made would satisfy a careless reading of the finding and none of
+    its substance. Asserted by position, since that is the whole property."""
+    src = _strip_comments(DASHBOARD_JS.read_text())
+    assert "const CYCLE_ID = /" in src, "the cycle id pattern is gone"
+
+    body = src.split("async function toggleProbes(", 1)[1].split("\nasync function", 1)[0]
+    assert "CYCLE_ID.test(" in body, "toggleProbes does not validate the id it is given"
+    assert body.index("CYCLE_ID.test(") < body.index("fetch("), (
+        "the id is validated after the request is already sent"
+    )
+
+
 @pytest.mark.parametrize("field", ["page_url", "evidence_text", "screenshot_path"])
 def test_the_remote_influenced_fields_never_reach_a_url(field):
     """These three ship in the /api/cycle and /api/status payloads and are the fields an

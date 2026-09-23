@@ -294,3 +294,45 @@ def test_export_still_honours_the_date_filter(seeded_db):
     assert status == 200
     lines = body.count(b"\n")
     assert 1 < lines < 31
+
+
+# --- 5: the cycle_id path parameter is constrained ----------------------------------
+#
+# [AppScan "SSRF" finding against dashboard.js, 2026-09-23] The finding itself is mislabelled
+# -- the flagged call is the browser fetching a relative same-origin path, and this route
+# makes no outbound request with the value; it binds it into a SQL parameter. But cycle_id
+# was the only path parameter in the app with no constraint on it (incident_id is an int,
+# /static/{filename} is an allowlist lookup), and the browser-side guard in dashboard.js is
+# advisory -- the browser is what an attacker controls. This is the half that cannot be
+# bypassed, so it is the half worth pinning.
+#
+# The pattern is a character allowlist rather than a uuid shape, deliberately: see the
+# comment on the route. These tests therefore assert what it must REFUSE (anything that could
+# change what a url means) and that an ordinary id still works -- note the fixture writes
+# "cycle-000", not a uuid, which is exactly the format drift the looser pattern tolerates.
+
+def test_the_cycle_drilldown_still_serves_an_ordinary_id(seeded_db):
+    status, body = _call("/api/cycle/cycle-000", auth=("user", "pass"))
+    assert status == 200
+    assert b'"layer"' in body, "the drill-down returned no probe rows"
+
+
+@pytest.mark.parametrize("bad", [
+    "..%2f..%2fetc%2fpasswd",   # traversal, percent-encoded so it survives to the route
+    "javascript:alert(1)",      # a scheme
+    "http:%2f%2fevil.example",  # an absolute url
+    "id with spaces",
+    "a" * 65,                   # longer than any id this app generates
+])
+def test_a_malformed_cycle_id_is_refused_at_the_boundary(seeded_db, bad):
+    """422, not an empty 200. The old behaviour ran the query and returned {"rows": []},
+    which is indistinguishable from a cycle that genuinely has no probes."""
+    status, _ = _call(f"/api/cycle/{bad}", auth=("user", "pass"))
+    assert status == 422, f"{bad!r} was not rejected"
+
+
+def test_validation_does_not_run_ahead_of_authentication(seeded_db):
+    """An unauthenticated caller must get 401 whatever they put in the path -- otherwise the
+    new pattern would be a free oracle for probing the route without credentials."""
+    assert _call("/api/cycle/javascript:alert(1)")[0] == 401
+    assert _call("/api/cycle/cycle-000")[0] == 401
